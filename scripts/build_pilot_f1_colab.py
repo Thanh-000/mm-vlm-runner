@@ -61,6 +61,8 @@ def build() -> None:
             #@title Configuration { display-mode: "form" }
             RUN_CLIP_P4 = True  # @param {type:"boolean"}
             RUN_SIGLIP_P4 = True  # @param {type:"boolean"}
+            MOUNT_DRIVE = False  # @param {type:"boolean"}
+            DRIVE_CONTRACTS_PATH = ""  # @param {type:"string"}
             A2Z_INPUTS_URL = ""  # @param {type:"string"}
             CRISISMMA_TAR_URL = ""  # @param {type:"string"}
             AUTO_DOWNLOAD = True  # @param {type:"boolean"}
@@ -91,7 +93,7 @@ def build() -> None:
             with zipfile.ZipFile(io.BytesIO(raw_zip)) as zf:
                 zf.extractall(CODE_DIR)
 
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "transformers==4.57.6", "datasets==3.2.0", "PyYAML", "scipy", "pillow", "huggingface_hub", "pytest", "wheel"], check=True)
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "transformers==4.57.6", "datasets==3.2.0", "PyYAML", "scipy", "pillow", "huggingface_hub", "pytest", "wheel", "gdown"], check=True)
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-build-isolation", "--no-deps", "-e", str(CODE_DIR)], check=True)
             site.addsitedir(str(CODE_DIR / "src"))
             importlib.invalidate_caches()
@@ -104,7 +106,7 @@ def build() -> None:
         ),
         _cell(
             f"""
-            import concurrent.futures, importlib, json, site, subprocess, tarfile, time, urllib.parse
+            import concurrent.futures, importlib, json, site, subprocess, sys, tarfile, time, urllib.parse, zipfile
             from pathlib import Path
             import requests
             from google.colab import files as colab_files
@@ -117,17 +119,61 @@ def build() -> None:
             importlib.invalidate_caches()
             from mnarm.data import extract_contracts_from_a2z_zip
 
-            A2Z_ZIP = Path("/content/JCMIL_A2Z_INPUTS.zip")
-            if not A2Z_ZIP.is_file():
-                if str(A2Z_INPUTS_URL).strip():
-                    subprocess.run(["curl", "-fL", str(A2Z_INPUTS_URL).strip(), "-o", str(A2Z_ZIP)], check=True)
-                else:
-                    print("Upload JCMIL_A2Z_INPUTS.zip (contract manifest + splits):")
-                    up = colab_files.upload()
-                    nm, blob = next(iter(up.items()))
-                    A2Z_ZIP.write_bytes(blob)
+            LOCAL_CANDIDATES = [
+                Path("/content/crisismmd_p1_p4_contracts.zip"),
+                Path("/content/JCMIL_A2Z_INPUTS.zip"),
+                Path("/content/crisismmd_contracts_dl.zip"),
+            ]
+            for cand in LOCAL_CANDIDATES:
+                if cand.is_file() and not zipfile.is_zipfile(cand):
+                    print(f"[WARN] Removing invalid/corrupt cached file {{cand}} (size={{cand.stat().st_size}} B)", flush=True)
+                    cand.unlink()
 
-            SEQ_DIR = extract_contracts_from_a2z_zip(A2Z_ZIP, WS / "crisismmd_seq_inputs")
+            CONTRACTS_ZIP = next((p for p in LOCAL_CANDIDATES if p.is_file() and zipfile.is_zipfile(p)), None)
+            if CONTRACTS_ZIP is None and MOUNT_DRIVE:
+                from google.colab import drive as colab_drive
+                colab_drive.mount("/content/drive")
+                drive_cands = []
+                if str(DRIVE_CONTRACTS_PATH).strip():
+                    drive_cands.append(Path(str(DRIVE_CONTRACTS_PATH).strip()))
+                drive_cands.extend([
+                    Path("/content/drive/MyDrive/jcmil_benchmark_v1/JCMIL_A2Z_INPUTS.zip"),
+                    Path("/content/drive/MyDrive/crisismmd_p1_p4_contracts.zip"),
+                ])
+                CONTRACTS_ZIP = next((p for p in drive_cands if p.is_file() and zipfile.is_zipfile(p)), None)
+
+            if CONTRACTS_ZIP is None and str(A2Z_INPUTS_URL).strip():
+                url_in = str(A2Z_INPUTS_URL).strip()
+                dst_dl = Path("/content/crisismmd_contracts_dl.zip")
+                host_in = urllib.parse.urlparse(url_in).netloc.lower()
+                if "drive" in host_in and host_in.endswith("google.com"):
+                    subprocess.run([sys.executable, "-m", "gdown", "--fuzzy", url_in, "-O", str(dst_dl)], check=True)
+                else:
+                    subprocess.run(["curl", "-fL", url_in, "-o", str(dst_dl)], check=True)
+                CONTRACTS_ZIP = dst_dl
+
+            if CONTRACTS_ZIP is None:
+                print("Upload lightweight crisismmd_p1_p4_contracts.zip (~5.8 MB) or full JCMIL_A2Z_INPUTS.zip:")
+                up = colab_files.upload()
+                if not up:
+                    raise RuntimeError("No contract ZIP uploaded.")
+                nm, blob = next(iter(up.items()))
+                dst_up = Path("/content") / Path(nm).name
+                dst_up.write_bytes(blob)
+                CONTRACTS_ZIP = dst_up
+
+            if not CONTRACTS_ZIP.is_file() or not zipfile.is_zipfile(CONTRACTS_ZIP):
+                sz = CONTRACTS_ZIP.stat().st_size if CONTRACTS_ZIP.is_file() else 0
+                head = b""
+                if CONTRACTS_ZIP.is_file():
+                    with CONTRACTS_ZIP.open("rb") as fh:
+                        head = fh.read(120)
+                    if CONTRACTS_ZIP.parent == Path("/content"):
+                        CONTRACTS_ZIP.unlink()
+                print(f"[ERROR] Invalid ZIP {{CONTRACTS_ZIP}}: size={{sz}} B, head={{head!r}}", flush=True)
+                raise RuntimeError("Contracts file is not a valid ZIP; upload crisismmd_p1_p4_contracts.zip (~5.8 MB) or set MOUNT_DRIVE=True.")
+
+            SEQ_DIR = extract_contracts_from_a2z_zip(CONTRACTS_ZIP, WS / "crisismmd_seq_inputs")
             manifest = json.loads((SEQ_DIR / "manifest.json").read_bytes())
             # Fetch ONLY train and dev images (strict zero test touch in Pilot F1)
             req_set = {{r["image"] for sp in ("train", "dev") for r in manifest["rows"][sp]}}

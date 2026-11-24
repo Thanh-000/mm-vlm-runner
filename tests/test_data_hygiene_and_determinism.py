@@ -187,3 +187,54 @@ def test_grad_accum_optimizer_steps_and_report_render(tmp_path: Path) -> None:
     rep = tmp_path / "PILOT_F1_REPORT.md"
     _render_report(sample_res, rep)
     assert "$" not in rep.read_text(encoding="utf8")
+
+
+def test_extract_contracts_from_a2z_zip_supports_lite_a2z_and_rejects_html(tmp_path: Path) -> None:
+    from mnarm.core import sha256_bytes
+    from mnarm.data import extract_contracts_from_a2z_zip
+
+    payloads = {
+        "manifest.json": b'{"rows":{"train":[],"dev":[],"test":[]}}',
+        "PLANS.json": b'{"P4":[]}',
+        "partition_contract.json": b'{"protocols":{}}',
+        "splits.zip": b"PK\x05\x06" + b"\x00" * 18,
+    }
+    shas = {k: sha256_bytes(v) for k, v in payloads.items()}
+
+    # 1) Lightweight flat contract ZIP with CONTRACT_SHA256.json
+    lite_zip = tmp_path / "lite.zip"
+    with zipfile.ZipFile(lite_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("CONTRACT_SHA256.json", json.dumps(shas))
+        for k, v in payloads.items():
+            zf.writestr(k, v)
+    out_lite = extract_contracts_from_a2z_zip(lite_zip, tmp_path / "out_lite")
+    for k, v in payloads.items():
+        assert (out_lite / k).read_bytes() == v
+
+    # Tampered SHA inside lite ZIP must raise ValueError
+    tampered_zip = tmp_path / "tampered_lite.zip"
+    bad_shas = {**shas, "PLANS.json": "0" * 64}
+    with zipfile.ZipFile(tampered_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("CONTRACT_SHA256.json", json.dumps(bad_shas))
+        for k, v in payloads.items():
+            zf.writestr(k, v)
+    with pytest.raises(ValueError, match="SHA mismatch"):
+        extract_contracts_from_a2z_zip(tampered_zip, tmp_path / "out_tampered")
+
+    # 2) Legacy BUNDLE_MANIFEST.json + blobs/<sha> A2Z ZIP
+    a2z_zip = tmp_path / "a2z.zip"
+    bm = {"files": {f"dense_bundle/kit/inputs/{k}": {"sha256": shas[k]} for k in payloads}}
+    with zipfile.ZipFile(a2z_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("BUNDLE_MANIFEST.json", json.dumps(bm))
+        for k, v in payloads.items():
+            zf.writestr(f"blobs/{shas[k]}", v)
+    out_a2z = extract_contracts_from_a2z_zip(a2z_zip, tmp_path / "out_a2z")
+    for k, v in payloads.items():
+        assert (out_a2z / k).read_bytes() == v
+
+    # 3) HTML page saved as .zip must raise BadZipFile mentioning HTML page
+    html_zip = tmp_path / "bad_drive.zip"
+    html_zip.write_bytes(b"<!DOCTYPE html><html><head><title>Google Drive</title></head></html>")
+    with pytest.raises(zipfile.BadZipFile, match="HTML page"):
+        extract_contracts_from_a2z_zip(html_zip, tmp_path / "out_html")
+
