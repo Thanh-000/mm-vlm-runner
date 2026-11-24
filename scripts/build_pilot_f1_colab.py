@@ -62,13 +62,14 @@ def build() -> None:
             RUN_CLIP_P4 = True  # @param {type:"boolean"}
             RUN_SIGLIP_P4 = True  # @param {type:"boolean"}
             A2Z_INPUTS_URL = ""  # @param {type:"string"}
+            CRISISMMA_TAR_URL = ""  # @param {type:"string"}
             AUTO_DOWNLOAD = True  # @param {type:"boolean"}
             """,
             cid="pf1-cell-1",
         ),
         _cell(
             f"""
-            import base64, hashlib, io, os, subprocess, sys, zipfile
+            import base64, hashlib, importlib, io, os, site, subprocess, sys, zipfile
             from pathlib import Path
             import torch
 
@@ -92,6 +93,10 @@ def build() -> None:
 
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "transformers==4.57.6", "datasets==3.2.0", "PyYAML", "scipy", "pillow", "huggingface_hub", "pytest", "wheel"], check=True)
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-build-isolation", "--no-deps", "-e", str(CODE_DIR)], check=True)
+            site.addsitedir(str(CODE_DIR / "src"))
+            importlib.invalidate_caches()
+            import mnarm
+            print("[IMPORT OK]", mnarm.__file__, flush=True)
             print("[PREFLIGHT] Running pytest gate before any GPU experiment...", flush=True)
             subprocess.run([sys.executable, "-m", "pytest", "-v"], cwd=str(CODE_DIR), check=True)
             """,
@@ -99,8 +104,17 @@ def build() -> None:
         ),
         _cell(
             f"""
-            import concurrent.futures, json, requests, urllib.parse
+            import concurrent.futures, importlib, json, site, subprocess, tarfile, time, urllib.parse
+            from pathlib import Path
+            import requests
             from google.colab import files as colab_files
+
+            WS = Path("/content/mnarm_ws")
+            CODE_DIR = WS / "repo"
+            IMG_DIR = Path("/dev/shm/crisismmd_v2") if Path("/dev/shm").exists() else (WS / "crisismmd_v2")
+            IMG_DIR.mkdir(parents=True, exist_ok=True)
+            site.addsitedir(str(CODE_DIR / "src"))
+            importlib.invalidate_caches()
             from mnarm.data import extract_contracts_from_a2z_zip
 
             A2Z_ZIP = Path("/content/JCMIL_A2Z_INPUTS.zip")
@@ -116,25 +130,81 @@ def build() -> None:
             SEQ_DIR = extract_contracts_from_a2z_zip(A2Z_ZIP, WS / "crisismmd_seq_inputs")
             manifest = json.loads((SEQ_DIR / "manifest.json").read_bytes())
             # Fetch ONLY train and dev images (strict zero test touch in Pilot F1)
-            req_imgs = sorted({{r["image"] for sp in ("train", "dev") for r in manifest["rows"][sp] if not (IMG_DIR / r["image"]).is_file()}})
+            req_set = {{r["image"] for sp in ("train", "dev") for r in manifest["rows"][sp]}}
+            tar_path = Path("/content/CrisisMMD_v2.0.tar.gz")
+            if not tar_path.is_file() and str(CRISISMMA_TAR_URL).strip():
+                subprocess.run(["curl", "-fL", str(CRISISMMA_TAR_URL).strip(), "-o", str(tar_path)], check=True)
+            if tar_path.is_file():
+                missing_tar = {{p for p in req_set if not (IMG_DIR / p).is_file()}}
+                if missing_tar:
+                    print(f"[TAR EXTRACT] Extracting up to {{len(missing_tar)}} train/dev images from {{tar_path}}...", flush=True)
+                    extracted = 0
+                    with tarfile.open(tar_path, "r:gz") as tf:
+                        for member in tf:
+                            if not member.isfile():
+                                continue
+                            norm = member.name[2:] if member.name.startswith("./") else member.name.lstrip("/")
+                            if norm.startswith("CrisisMMD_v2.0/"):
+                                norm = norm[len("CrisisMMD_v2.0/"):]
+                            if norm in missing_tar:
+                                dst = IMG_DIR / norm
+                                dst.parent.mkdir(parents=True, exist_ok=True)
+                                src_f = tf.extractfile(member)
+                                if src_f is not None:
+                                    tmp = dst.with_name(dst.name + ".partial")
+                                    tmp.write_bytes(src_f.read())
+                                    tmp.replace(dst)
+                                    extracted += 1
+                    print(f"[TAR EXTRACT] Extracted {{extracted}} train/dev images.", flush=True)
+
+            req_imgs = sorted(p for p in req_set if not (IMG_DIR / p).is_file())
             if req_imgs:
                 print(f"[HF DOWNLOAD] Fetching {{len(req_imgs)}} train/dev CrisisMMD images from pinned QCRI/CrisisMMD commit...", flush=True)
+                session = requests.Session()
+                adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16)
+                session.mount("https://", adapter)
+                session.mount("http://", adapter)
+
                 def _fetch(rel_p):
                     dst = IMG_DIR / rel_p
                     dst.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = dst.with_name(dst.name + ".partial")
                     url = "https://huggingface.co/datasets/QCRI/CrisisMMD/resolve/{CRISISMMA_HF_REV}/" + urllib.parse.quote(rel_p, safe="/")
-                    r = requests.get(url, timeout=30)
-                    r.raise_for_status()
-                    dst.write_bytes(r.content)
-                with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
-                    list(pool.map(_fetch, req_imgs))
+                    for attempt in range(5):
+                        try:
+                            r = session.get(url, timeout=(20, 60))
+                            if r.status_code == 429 or r.status_code >= 500:
+                                if attempt == 4:
+                                    r.raise_for_status()
+                                delay = r.headers.get("Retry-After", "")
+                                time.sleep(min(60, max(2, int(delay) if delay.isdigit() else 2 * (2 ** attempt))))
+                                continue
+                            r.raise_for_status()
+                            tmp.write_bytes(r.content)
+                            tmp.replace(dst)
+                            return
+                        except (requests.Timeout, requests.ConnectionError):
+                            if attempt == 4:
+                                raise
+                            time.sleep(min(60, 2 * (2 ** attempt)))
+                    raise RuntimeError(f"Exhausted retries downloading {{rel_p}}")
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                    futures = [pool.submit(_fetch, p) for p in req_imgs]
+                    for idx, fut in enumerate(concurrent.futures.as_completed(futures), 1):
+                        fut.result()
+                        if idx % 500 == 0 or idx == len(futures):
+                            print(f"[HF DOWNLOAD] {{idx}}/{{len(futures)}} train/dev images ready", flush=True)
             print("[DATA READY] train/dev images verified:", len(manifest["rows"]["train"]) + len(manifest["rows"]["dev"]))
             """,
             cid="pf1-cell-3",
         ),
         _cell(
             """
+            import os
             from IPython.display import Markdown, display
+
+            run_env = {**os.environ, "PYTHONPATH": str(CODE_DIR / "src") + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")}
 
             if RUN_CLIP_P4:
                 subprocess.run([
@@ -142,7 +212,7 @@ def build() -> None:
                     "--config", str(CODE_DIR / "configs/pilot_f1_clip_p4.yaml"),
                     "--seq-inputs", str(SEQ_DIR), "--images", str(IMG_DIR),
                     "--out", str(OUT_DIR / "clip_p4"),
-                ], check=True)
+                ], env=run_env, check=True)
                 display(Markdown((OUT_DIR / "clip_p4/PILOT_F1_REPORT.md").read_text(encoding="utf8")))
 
             if RUN_SIGLIP_P4:
@@ -151,7 +221,7 @@ def build() -> None:
                     "--config", str(CODE_DIR / "configs/pilot_f1_siglip_p4.yaml"),
                     "--seq-inputs", str(SEQ_DIR), "--images", str(IMG_DIR),
                     "--out", str(OUT_DIR / "siglip_p4"),
-                ], check=True)
+                ], env=run_env, check=True)
                 display(Markdown((OUT_DIR / "siglip_p4/PILOT_F1_REPORT.md").read_text(encoding="utf8")))
 
             RES_ZIP = Path("/content/PILOT_F1_RESULTS.zip")
