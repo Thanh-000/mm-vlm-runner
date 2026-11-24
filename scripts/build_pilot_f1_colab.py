@@ -71,7 +71,7 @@ def build() -> None:
         ),
         _cell(
             f"""
-            import base64, hashlib, importlib, io, os, site, subprocess, sys, zipfile
+            import base64, concurrent.futures, hashlib, importlib, io, os, shutil, site, subprocess, sys, zipfile
             from pathlib import Path
             import torch
 
@@ -93,12 +93,25 @@ def build() -> None:
             with zipfile.ZipFile(io.BytesIO(raw_zip)) as zf:
                 zf.extractall(CODE_DIR)
 
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "transformers==4.57.6", "datasets==3.2.0", "PyYAML", "scipy", "pillow", "huggingface_hub", "pytest", "wheel", "gdown"], check=True)
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-build-isolation", "--no-deps", "-e", str(CODE_DIR)], check=True)
+            def _pip_deps():
+                subprocess.run([sys.executable, "-m", "pip", "install", "-q", "transformers==4.57.6", "datasets==3.2.0", "PyYAML", "scipy", "pillow", "huggingface_hub", "pytest", "wheel", "gdown"], check=True)
+                subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-build-isolation", "--no-deps", "-e", str(CODE_DIR)], check=True)
+
+            def _apt_deps():
+                if shutil.which("aria2c") is None and shutil.which("apt-get"):
+                    subprocess.run(["apt-get", "-qq", "update"], check=False)
+                    subprocess.run(["apt-get", "-qq", "install", "-y", "aria2", "pigz"], check=False)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                f1 = pool.submit(_pip_deps)
+                f2 = pool.submit(_apt_deps)
+                f1.result()
+                f2.result()
+
             site.addsitedir(str(CODE_DIR / "src"))
             importlib.invalidate_caches()
             import mnarm
-            print("[IMPORT OK]", mnarm.__file__, flush=True)
+            print("[IMPORT OK]", mnarm.__file__, "| aria2c=", shutil.which("aria2c"), "| pigz=", shutil.which("pigz"), flush=True)
             print("[PREFLIGHT] Running pytest gate before any GPU experiment...", flush=True)
             subprocess.run([sys.executable, "-m", "pytest", "-v"], cwd=str(CODE_DIR), check=True)
             """,
@@ -106,7 +119,7 @@ def build() -> None:
         ),
         _cell(
             f"""
-            import concurrent.futures, importlib, json, site, subprocess, sys, tarfile, time, urllib.parse, zipfile
+            import concurrent.futures, importlib, json, shutil, site, subprocess, sys, time, urllib.parse, zipfile
             from pathlib import Path
             import requests
             from google.colab import files as colab_files
@@ -146,10 +159,16 @@ def build() -> None:
                 url_in = str(A2Z_INPUTS_URL).strip()
                 dst_dl = Path("/content/crisismmd_contracts_dl.zip")
                 host_in = urllib.parse.urlparse(url_in).netloc.lower()
-                if "drive" in host_in and host_in.endswith("google.com"):
-                    subprocess.run([sys.executable, "-m", "gdown", "--fuzzy", url_in, "-O", str(dst_dl)], check=True)
-                else:
-                    subprocess.run(["curl", "-fL", url_in, "-o", str(dst_dl)], check=True)
+                is_drive = "drive" in host_in and host_in.endswith("google.com")
+                is_direct_drive = is_drive and "confirm=t" in url_in
+                if (is_direct_drive or not is_drive) and shutil.which("aria2c"):
+                    subprocess.run(["aria2c", "-x16", "-s16", "-k1M", "--allow-overwrite=true", url_in, "-d", "/content", "-o", dst_dl.name], check=False)
+                if not dst_dl.is_file() or not zipfile.is_zipfile(dst_dl):
+                    dst_dl.unlink(missing_ok=True)
+                    if is_drive:
+                        subprocess.run([sys.executable, "-m", "gdown", "--fuzzy", url_in, "-O", str(dst_dl)], check=True)
+                    else:
+                        subprocess.run(["curl", "-fL", url_in, "-o", str(dst_dl)], check=True)
                 CONTRACTS_ZIP = dst_dl
 
             if CONTRACTS_ZIP is None:
@@ -176,32 +195,63 @@ def build() -> None:
             SEQ_DIR = extract_contracts_from_a2z_zip(CONTRACTS_ZIP, WS / "crisismmd_seq_inputs")
             manifest = json.loads((SEQ_DIR / "manifest.json").read_bytes())
             # Fetch ONLY train and dev images (strict zero test touch in Pilot F1)
+            if not (IMG_DIR / "data_image").is_dir() and (IMG_DIR / "CrisisMMD_v2.0" / "data_image").is_dir():
+                IMG_DIR = IMG_DIR / "CrisisMMD_v2.0"
+
             req_set = {{r["image"] for sp in ("train", "dev") for r in manifest["rows"][sp]}}
-            tar_path = Path("/content/CrisisMMD_v2.0.tar.gz")
-            if not tar_path.is_file() and str(CRISISMMA_TAR_URL).strip():
-                subprocess.run(["curl", "-fL", str(CRISISMMA_TAR_URL).strip(), "-o", str(tar_path)], check=True)
-            if tar_path.is_file():
-                missing_tar = {{p for p in req_set if not (IMG_DIR / p).is_file()}}
-                if missing_tar:
-                    print(f"[TAR EXTRACT] Extracting up to {{len(missing_tar)}} train/dev images from {{tar_path}}...", flush=True)
-                    extracted = 0
-                    with tarfile.open(tar_path, "r:gz") as tf:
-                        for member in tf:
-                            if not member.isfile():
-                                continue
-                            norm = member.name[2:] if member.name.startswith("./") else member.name.lstrip("/")
-                            if norm.startswith("CrisisMMD_v2.0/"):
-                                norm = norm[len("CrisisMMD_v2.0/"):]
-                            if norm in missing_tar:
-                                dst = IMG_DIR / norm
-                                dst.parent.mkdir(parents=True, exist_ok=True)
-                                src_f = tf.extractfile(member)
-                                if src_f is not None:
-                                    tmp = dst.with_name(dst.name + ".partial")
-                                    tmp.write_bytes(src_f.read())
-                                    tmp.replace(dst)
-                                    extracted += 1
-                    print(f"[TAR EXTRACT] Extracted {{extracted}} train/dev images.", flush=True)
+            need_tar = any(not (IMG_DIR / p).is_file() for p in req_set)
+            if need_tar:
+                tar_cands = [Path("/content/CrisisMMD_v2.0.tar.gz")]
+                for p in tar_cands:
+                    if p.is_file() and p.stat().st_size <= 100_000_000:
+                        p.unlink(missing_ok=True)
+                if MOUNT_DRIVE:
+                    from google.colab import drive as colab_drive
+                    colab_drive.mount("/content/drive")
+                    tar_cands.extend([
+                        Path("/content/drive/MyDrive/CrisisMMD_v2.0.tar.gz"),
+                        Path("/content/drive/MyDrive/jcmil_benchmark_v1/CrisisMMD_v2.0.tar.gz"),
+                    ])
+                tar_path = next((p for p in tar_cands if p.is_file() and p.stat().st_size > 100_000_000), None)
+                tar_url = str(CRISISMMA_TAR_URL).strip()
+                if tar_path is None and tar_url:
+                    if shutil.which("aria2c") is None and shutil.which("apt-get"):
+                        subprocess.run(["apt-get", "-qq", "update"], check=False)
+                        subprocess.run(["apt-get", "-qq", "install", "-y", "aria2", "pigz"], check=False)
+                    dl_tar = Path("/content/CrisisMMD_v2.0.tar.gz")
+                    print("[ARIA2] Downloading CrisisMMD_v2.0.tar.gz (16 streams)...", flush=True)
+                    if shutil.which("aria2c"):
+                        subprocess.run(["aria2c", "-x16", "-s16", "-k1M", "--allow-overwrite=true", tar_url, "-d", "/content", "-o", dl_tar.name], check=False)
+                    if not dl_tar.is_file() or dl_tar.stat().st_size <= 100_000_000:
+                        dl_tar.unlink(missing_ok=True)
+                        host_t = urllib.parse.urlparse(tar_url).netloc.lower()
+                        if "drive" in host_t and host_t.endswith("google.com"):
+                            subprocess.run([sys.executable, "-m", "gdown", "--fuzzy", tar_url, "-O", str(dl_tar)], check=True)
+                        else:
+                            subprocess.run(["curl", "-fL", tar_url, "-o", str(dl_tar)], check=True)
+                    if dl_tar.is_file() and dl_tar.stat().st_size > 100_000_000:
+                        tar_path = dl_tar
+
+                if tar_path is not None:
+                    print(f"[EXTRACT] Extracting {{tar_path}} -> {{IMG_DIR}}...", flush=True)
+                    if shutil.which("pigz"):
+                        subprocess.run(["tar", "-I", "pigz", "-xf", str(tar_path), "-C", str(IMG_DIR)], check=True)
+                    else:
+                        subprocess.run(["tar", "-xzf", str(tar_path), "-C", str(IMG_DIR)], check=True)
+                    if tar_path.parent == Path("/content"):
+                        tar_path.unlink(missing_ok=True)
+                    if not (IMG_DIR / "data_image").is_dir() and (IMG_DIR / "CrisisMMD_v2.0" / "data_image").is_dir():
+                        IMG_DIR = IMG_DIR / "CrisisMMD_v2.0"
+
+            test_only = {{r["image"] for r in manifest["rows"]["test"]}} - req_set
+            removed_test = 0
+            for rel_t in test_only:
+                tp = IMG_DIR / rel_t
+                if tp.is_file():
+                    tp.unlink()
+                    removed_test += 1
+            if removed_test:
+                print(f"[ISOLATION] Removed {{removed_test}} test-only image files from disk for strict dev-only Pilot F1.", flush=True)
 
             req_imgs = sorted(p for p in req_set if not (IMG_DIR / p).is_file())
             if req_imgs:
