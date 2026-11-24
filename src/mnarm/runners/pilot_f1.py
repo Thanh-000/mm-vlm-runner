@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +36,7 @@ def _evaluate_arm(
     early_classes: list[int],
     late_classes: list[int],
     dev_rows: list[dict[str, Any]],
-    dev_cache: dict[tuple[str, str], torch.Tensor],
+    dev_cache: dict[tuple[str, ...], torch.Tensor],
     dev0_t: torch.Tensor,
     dev0_i: torch.Tensor,
     train_recs: list[dict[str, Any]],
@@ -171,11 +172,14 @@ def run_pilot_f1(config: dict[str, Any], seq_inputs: Path, images_dir: Path, out
     st4 = ds["stages"][-1]
     seen = st4["seen_classes"]
     dev_rows = [r for r in ds["dev"] if int(r["label"]) in set(seen)]
-    dev_cache: dict[tuple[str, str], torch.Tensor] = {}
+    dev_labels = [int(r["label"]) for r in dev_rows]
+    t0 = time.perf_counter()
+    dev_cache: dict[tuple[str, ...], torch.Tensor] = {}
     dev0_t, dev0_i, dev_y = extract_paired_features_cached(
         vlm=vlm, kind="lora", payload={}, records=dev_rows, tensor_store=store,
         batch_size=int(config["eval_batch_size"]), cache=dev_cache, use_amp=use_amp,
     )
+    print(f"[INIT] {config['backbone']} {config['protocol']} ready on {device} ({time.perf_counter() - t0:.1f}s) | dev={len(dev_rows)}", flush=True)
 
     arms_out: dict[str, Any] = {}
     boot_logits: dict[str, torch.Tensor] = {}
@@ -216,21 +220,19 @@ def run_pilot_f1(config: dict[str, Any], seq_inputs: Path, images_dir: Path, out
                 weight_decay=float(config["weight_decay"]), seed=seed + 2000 + (0 if obj == "std_ce" else 5000),
                 use_amp=use_amp, tensor_store=store,
             )
-            st_dev_rows = [r for r in ds["dev"] if int(r["label"]) in set(st["seen_classes"])]
-            dt_s, di_s, dy_s = extract_paired_features_cached(
-                vlm=vlm, kind="lora", payload=rep_state, records=st_dev_rows,
+            seen_set = set(st["seen_classes"])
+            keep_idx = torch.tensor([i for i, yv in enumerate(dev_labels) if yv in seen_set], dtype=torch.long)
+            dt_all, di_all, dy_all = extract_paired_features_cached(
+                vlm=vlm, kind="lora", payload=rep_state, records=dev_rows,
                 tensor_store=store, batch_size=int(config["eval_batch_size"]), cache=dev_cache, use_amp=use_amp,
             )
-            st_z = {
-                "text": proto_logits(dt_s, protos_full, st["seen_classes"], vlm.logit_scale),
-                "image": proto_logits(di_s, protos_full, st["seen_classes"], vlm.logit_scale),
-            }
+            dt_s, di_s, dy_s = dt_all.index_select(0, keep_idx), di_all.index_select(0, keep_idx), dy_all.index_select(0, keep_idx)
+            st_z = {"text": proto_logits(dt_s, protos_full, st["seen_classes"], vlm.logit_scale), "image": proto_logits(di_s, protos_full, st["seen_classes"], vlm.logit_scale)}
             st_z["paired"] = 0.5 * (st_z["text"] + st_z["image"])
-            traj[f"{obj}_seq_replay"].append({
-                "stage": t,
-                "raw_paired_f1": eval_view_suite(st_z, dy_s, st["seen_classes"])["paired"]["macro_f1"],
-                "theta_t_deg": measure_cone_drift(dt_s, dev0_t[: len(st_dev_rows)])["theta_deg"],
-            })
+            st_f1 = eval_view_suite(st_z, dy_s, st["seen_classes"])["paired"]["macro_f1"]
+            st_th = measure_cone_drift(dt_s, dev0_t.index_select(0, keep_idx))["theta_deg"]
+            traj[f"{obj}_seq_replay"].append({"stage": t, "raw_paired_f1": st_f1, "theta_t_deg": st_th})
+            print(f"[{obj} stage {t}/4] seq_replay raw_paired={st_f1*100:.2f}% | theta_T={st_th:.2f} deg ({time.perf_counter() - t0:.1f}s)", flush=True)
 
         joint_recs = st4["fit"] + st4["joint_before"]
         joint_state, _ = train_lora_stage(
@@ -241,6 +243,7 @@ def run_pilot_f1(config: dict[str, Any], seq_inputs: Path, images_dir: Path, out
             weight_decay=float(config["weight_decay"]), seed=seed + 4000 + (0 if obj == "std_ce" else 5000),
             use_amp=use_amp, tensor_store=store,
         )
+        print(f"[{obj} joint] finished ({time.perf_counter() - t0:.1f}s)", flush=True)
         arm_specs = [
             (f"{obj}_tsvm", "merge", "delta", merge_task_deltas(exp_deltas, "tsvm"), [], bank),
             (f"{obj}_ta_sum", "merge", "delta", merge_task_deltas(exp_deltas, "ta_sum"), [], bank),
@@ -260,6 +263,8 @@ def run_pilot_f1(config: dict[str, Any], seq_inputs: Path, images_dir: Path, out
             arms_out[aname] = arec
             for vk, lg in alogits.items():
                 boot_logits[f"{aname}:{vk}"] = lg
+            best_v_f1 = max(v["paired"]["macro_f1"] for v in arec["variants"].values())
+            print(f"[EVAL {aname}] best_paired={best_v_f1*100:.2f}% | theta_T={arec['cone_drift']['text']['theta_deg']:.2f} deg ({time.perf_counter() - t0:.1f}s)", flush=True)
 
     best_arm, best_var, best_p, best_3m = None, None, -1.0, -1.0
     boot_vs_ce: dict[str, Any] = {}

@@ -61,6 +61,7 @@ def build() -> None:
             #@title Configuration { display-mode: "form" }
             RUN_CLIP_P4 = True  # @param {type:"boolean"}
             RUN_SIGLIP_P4 = True  # @param {type:"boolean"}
+            PARALLEL_BACKBONES = True  # @param {type:"boolean"}
             MOUNT_DRIVE = False  # @param {type:"boolean"}
             DRIVE_CONTRACTS_PATH = ""  # @param {type:"string"}
             A2Z_INPUTS_URL = ""  # @param {type:"string"}
@@ -297,28 +298,56 @@ def build() -> None:
         ),
         _cell(
             """
-            import os
+            import concurrent.futures, os, threading
+            from collections import deque
+            import torch
             from IPython.display import Markdown, display
 
             run_env = {**os.environ, "PYTHONPATH": str(CODE_DIR / "src") + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")}
+            print_lock = threading.Lock()
 
+            def _run_job(tag, cfg_rel, out_sub):
+                out_path = OUT_DIR / out_sub
+                out_path.mkdir(parents=True, exist_ok=True)
+                log_path = OUT_DIR / f"{out_sub}.log"
+                cmd = [
+                    sys.executable, "-u", "-m", "mnarm.runners.pilot_f1",
+                    "--config", str(CODE_DIR / cfg_rel),
+                    "--seq-inputs", str(SEQ_DIR), "--images", str(IMG_DIR),
+                    "--out", str(out_path),
+                ]
+                tail = deque(maxlen=40)
+                with log_path.open("w", encoding="utf8") as lf:
+                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=run_env)
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        lf.write(line)
+                        tail.append(line.rstrip("\\n"))
+                        with print_lock:
+                            print(f"[{tag}] {line}", end="", flush=True)
+                    rc = proc.wait()
+                if rc != 0:
+                    raise RuntimeError(f"{tag} failed (exit={rc}). Last 40 log lines:\\n" + "\\n".join(tail))
+                return out_sub
+
+            jobs = []
             if RUN_CLIP_P4:
-                subprocess.run([
-                    sys.executable, "-u", "-m", "mnarm.runners.pilot_f1",
-                    "--config", str(CODE_DIR / "configs/pilot_f1_clip_p4.yaml"),
-                    "--seq-inputs", str(SEQ_DIR), "--images", str(IMG_DIR),
-                    "--out", str(OUT_DIR / "clip_p4"),
-                ], env=run_env, check=True)
-                display(Markdown((OUT_DIR / "clip_p4/PILOT_F1_REPORT.md").read_text(encoding="utf8")))
-
+                jobs.append(("CLIP_P4", "configs/pilot_f1_clip_p4.yaml", "clip_p4"))
             if RUN_SIGLIP_P4:
-                subprocess.run([
-                    sys.executable, "-u", "-m", "mnarm.runners.pilot_f1",
-                    "--config", str(CODE_DIR / "configs/pilot_f1_siglip_p4.yaml"),
-                    "--seq-inputs", str(SEQ_DIR), "--images", str(IMG_DIR),
-                    "--out", str(OUT_DIR / "siglip_p4"),
-                ], env=run_env, check=True)
-                display(Markdown((OUT_DIR / "siglip_p4/PILOT_F1_REPORT.md").read_text(encoding="utf8")))
+                jobs.append(("SIGLIP_P4", "configs/pilot_f1_siglip_p4.yaml", "siglip_p4"))
+
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+            if PARALLEL_BACKBONES and len(jobs) > 1 and vram_gb >= 23.0:
+                print(f"[PARALLEL] Running {', '.join(j[0] for j in jobs)} concurrently on {vram_gb:.1f} GB GPU", flush=True)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+                    for fut in [pool.submit(_run_job, *j) for j in jobs]:
+                        fut.result()
+            else:
+                for j in jobs:
+                    _run_job(*j)
+
+            for _, _, out_sub in jobs:
+                display(Markdown((OUT_DIR / out_sub / "PILOT_F1_REPORT.md").read_text(encoding="utf8")))
 
             RES_ZIP = Path("/content/PILOT_F1_RESULTS.zip")
             with zipfile.ZipFile(RES_ZIP, "w", compression=zipfile.ZIP_DEFLATED) as zout:

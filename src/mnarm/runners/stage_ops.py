@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import random
 from typing import Any
 
@@ -56,6 +57,7 @@ def train_lora_stage(
     rng = random.Random(int(seed) + stage_idx * 101)
     amp_on = bool(use_amp and vlm.device == "cuda")
     amp_dtype = torch.bfloat16 if (amp_on and torch.cuda.is_bf16_supported()) else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp_on and amp_dtype == torch.float16))
 
     vlm.clip.train()
     optimizer_steps = 0
@@ -79,17 +81,18 @@ def train_lora_stage(
                         feats["text"] = vlm.encode_text(dev_inp)
                     if "image" in views:
                         feats["image"] = vlm.encode_image(dev_inp)
-                    if objective == "l_mnar":
-                        loss = compute_multimodal_lmnar_loss(
-                            feats, protos_full, vlm.logit_scale, y_global, seen_classes, graph_info
-                        )
-                    else:
-                        loss = compute_standard_ce_loss(
-                            feats, protos_full, vlm.logit_scale, y_global, seen_classes
-                        )
-                    scaled_loss = loss / denom
-                scaled_loss.backward()
-            opt.step()
+                if objective == "l_mnar":
+                    loss = compute_multimodal_lmnar_loss(
+                        feats, protos_full, vlm.logit_scale, y_global, seen_classes, graph_info
+                    )
+                else:
+                    loss = compute_standard_ce_loss(
+                        feats, protos_full, vlm.logit_scale, y_global, seen_classes
+                    )
+                scaled_loss = loss / denom
+                scaler.scale(scaled_loss).backward()
+            scaler.step(opt)
+            scaler.update()
             optimizer_steps += 1
 
     vlm.clip.eval()
@@ -114,14 +117,18 @@ def extract_paired_features_cached(
     records: list[dict[str, Any]],
     tensor_store: PreprocessedTensorStore,
     batch_size: int,
-    cache: dict[tuple[str, str], torch.Tensor],
+    cache: dict[tuple[str, ...], torch.Tensor],
     use_amp: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Encode paired evaluation records using collision-free blake2b tower digests."""
     specs = tensor_store.make_batch_specs(records, batch_size=batch_size, shuffle=False)
     labels = torch.tensor([int(r["label"]) for _, recs in specs for r in recs], dtype=torch.long)
+    uid_sig = hashlib.blake2b(
+        "|".join(str(r["uid"]) for _, recs in specs for r in recs).encode("utf8"),
+        digest_size=8,
+    ).hexdigest()
     sigs = {tw: vlm.tower_digest(tw, kind, payload) for tw in ("text", "image")}
-    if any((tw, sigs[tw]) not in cache for tw in ("text", "image")):
+    if any((tw, sigs[tw], uid_sig) not in cache for tw in ("text", "image")):
         if kind == "lora":
             vlm.restore_base_weights()
             vlm.load_lora_state(payload)
@@ -133,7 +140,7 @@ def extract_paired_features_cached(
     vlm.clip.eval()
 
     for tw in ("text", "image"):
-        ck = (tw, sigs[tw])
+        ck = (tw, sigs[tw], uid_sig)
         if ck in cache:
             continue
         chunks: list[torch.Tensor] = []
@@ -147,7 +154,7 @@ def extract_paired_features_cached(
             chunks.append(feat.float().cpu())
         cache[ck] = torch.cat(chunks, dim=0) if chunks else torch.empty((0, vlm.embed_dim))
 
-    return cache[("text", sigs["text"])], cache[("image", sigs["image"])], labels
+    return cache[("text", sigs["text"], uid_sig)], cache[("image", sigs["image"], uid_sig)], labels
 
 
 @torch.inference_mode()

@@ -238,3 +238,195 @@ def test_extract_contracts_from_a2z_zip_supports_lite_a2z_and_rejects_html(tmp_p
     with pytest.raises(zipfile.BadZipFile, match="HTML page"):
         extract_contracts_from_a2z_zip(html_zip, tmp_path / "out_html")
 
+
+def test_run_pilot_f1_end_to_end_p4_mock_vlm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise all 4 stages of P4 end-to-end (including image-only Stage 1 base_zero cache check)."""
+    from torch import nn
+    from mnarm.core import sha256_bytes
+    from mnarm.models.vlm import attach_qv_lora, tower_digest
+    from mnarm.runners import pilot_f1 as pf1_mod
+
+    seq_dir = tmp_path / "seq"
+    img_dir = tmp_path / "imgs"
+    out_dir = tmp_path / "out"
+    seq_dir.mkdir()
+    img_dir.mkdir()
+
+    def _mk_row(idx: int, label: int, prefix: str, write_img: bool = True) -> dict[str, object]:
+        tw, im_id, txt = f"tw{idx}", f"im{idx}", f"cls_{label} {prefix} {idx}"
+        uid = uid_hash(tw, im_id)
+        rel = f"data_image/{prefix}_{label}_{idx}.png"
+        if write_img:
+            p = img_dir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            color = ((label * 31 + 17) % 250, (label * 67 + 43) % 250, (label * 97 + 71) % 250)
+            Image.new("RGB", (8, 8), color=color).save(p)
+        return {
+            "sample_id": uid, "label": label, "image": rel,
+            "text_sha256": sha256_bytes(txt.encode("utf8")),
+            "tweet_id": tw, "image_id": im_id, "tweet_text": txt,
+        }
+
+    train_rows, dev_rows, test_rows = [], [], []
+    by_cls_tr: dict[int, list[str]] = {c: [] for c in range(8)}
+    seq_id = 0
+    for c in range(8):
+        for _ in range(4):
+            r = _mk_row(seq_id, c, "tr")
+            train_rows.append(r)
+            by_cls_tr[c].append(str(r["sample_id"]))
+            seq_id += 1
+        for _ in range(2):
+            dev_rows.append(_mk_row(seq_id, c, "dv"))
+            seq_id += 1
+        test_rows.append(_mk_row(seq_id, c, "te", write_img=False))
+        seq_id += 1
+
+    manifest = {"rows": {"train": train_rows, "dev": dev_rows, "test": test_rows}}
+    (seq_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf8")
+
+    # CrisisMMD P4 schedule: St1 image-only [0,1], St2 image-only [4,5], St3 paired [2,3], St4 paired [6,7]
+    stages_cls = [([0, 1], ["image"]), ([4, 5], ["image"]), ([2, 3], ["text", "image"]), ([6, 7], ["text", "image"])]
+    seen_acc: list[int] = []
+    plans_p4, pc_p4 = [], []
+    for st_i, (new_c, mods) in enumerate(stages_cls, 1):
+        seen_acc = sorted(seen_acc + new_c)
+        t_ids = [uid for c in new_c for uid in by_cls_tr[c]]
+        buf_rows = [{"uid": by_cls_tr[c][0], "label": c, "mask": ["image" if c in (0, 1, 4, 5) else "text", "image"] if c not in (0, 1, 4, 5) else ["image"]} for c in seen_acc]
+        plans_p4.append({"stage": st_i, "seen_classes": list(seen_acc), "buffer": buf_rows, "calibration_latest_views": []})
+        pc_p4.append({"stage": st_i, "modalities": mods, "train_ids": t_ids})
+
+    (seq_dir / "PLANS.json").write_text(json.dumps({"P4": plans_p4}), encoding="utf8")
+    (seq_dir / "partition_contract.json").write_text(json.dumps({"protocols": {"P4": pc_p4}}), encoding="utf8")
+    with zipfile.ZipFile(seq_dir / "splits.zip", "w") as zf:
+        for sp, rlist in (("train", train_rows), ("dev", dev_rows)):
+            lines = ["tweet_id\timage_id\ttweet_text"] + [f"{r['tweet_id']}\t{r['image_id']}\t{r['tweet_text']}" for r in rlist]
+            zf.writestr(f"task_humanitarian_text_img_{sp}.tsv", "\n".join(lines))
+
+    class _MockClipNet(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.text_model = nn.Module()
+            self.text_model.l0 = nn.Module()
+            self.text_model.l0.q_proj = nn.Linear(16, 16, bias=False)
+            self.vision_model = nn.Module()
+            self.vision_model.l0 = nn.Module()
+            self.vision_model.l0.q_proj = nn.Linear(16, 16, bias=False)
+            with torch.no_grad():
+                nn.init.eye_(self.text_model.l0.q_proj.weight)
+                nn.init.eye_(self.vision_model.l0.q_proj.weight)
+
+    class _MockVLM:
+        def __init__(self, backbone_key: str, model_path: str, device: str = "cpu", rank: int = 4, alpha: int = 8, **_kw: object) -> None:
+            self.backbone_key = backbone_key
+            self.device = "cpu"
+            self.rank = rank
+            self.alpha = alpha
+            self.embed_dim = 16
+            self.logit_scale = 12.0
+            self.clip = _MockClipNet()
+            self.qv_modules = attach_qv_lora(self.clip, rank=rank, alpha=alpha)
+            self.base_qv_weights = {n: mod.base.weight.detach().clone() for n, mod in self.qv_modules.items()}
+
+        @staticmethod
+        def _vec_for_cls(c: int) -> torch.Tensor:
+            v = torch.zeros(16, dtype=torch.float32)
+            v[c % 8] = 1.0
+            v[8 + (c % 8)] = 0.5
+            return v / v.norm()
+
+        def tokenize_texts(self, texts: list[str], **_kw: object) -> dict[str, torch.Tensor]:
+            rows = []
+            for txt in texts:
+                cls_id = int(txt.split("_", 1)[1].split(" ", 1)[0])
+                rows.append(self._vec_for_cls(cls_id))
+            return {"input_ids": torch.stack(rows, dim=0)}
+
+        def processor(self, images: list[Image.Image], return_tensors: str = "pt") -> dict[str, torch.Tensor]:
+            del return_tensors
+            rows = []
+            for im in images:
+                r0, g0, b0 = im.getpixel((0, 0))
+                cls_id = min(range(8), key=lambda c: abs(r0 - (c * 31 + 17) % 250) + abs(g0 - (c * 67 + 43) % 250) + abs(b0 - (c * 97 + 71) % 250))
+                pv = self._vec_for_cls(cls_id).view(1, 4, 4).repeat(3, 1, 1)
+                rows.append(pv)
+            return {"pixel_values": torch.stack(rows, dim=0)}
+
+        def encode_text(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+            return self.clip.text_model.l0.q_proj(inputs["input_ids"].float())
+
+        def encode_image(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+            x = inputs["pixel_values"].float()[:, 0, :, :].reshape(inputs["pixel_values"].shape[0], 16)
+            return self.clip.vision_model.l0.q_proj(x)
+
+        @torch.no_grad()
+        def encode_prompts(self, prompts: list[str]) -> torch.Tensor:
+            return torch.stack([self._vec_for_cls(i) for i in range(len(prompts))], dim=0)
+
+        def lora_parameters(self) -> list[nn.Parameter]:
+            return [p for m in self.qv_modules.values() for p in (m.lora_a, m.lora_b)]
+
+        def lora_state(self) -> dict[str, torch.Tensor]:
+            return {f"{n}.{p}": getattr(m, p).detach().cpu().clone() for n, m in self.qv_modules.items() for p in ("lora_a", "lora_b")}
+
+        def load_lora_state(self, state: dict[str, torch.Tensor]) -> None:
+            if not state:
+                self.zero_lora()
+                return
+            with torch.no_grad():
+                for n, m in self.qv_modules.items():
+                    m.lora_a.data.copy_(state[f"{n}.lora_a"])
+                    m.lora_b.data.copy_(state[f"{n}.lora_b"])
+
+        def zero_lora(self) -> None:
+            with torch.no_grad():
+                for m in self.qv_modules.values():
+                    m.lora_b.zero_()
+
+        def reset_lora(self) -> None:
+            self.restore_base_weights()
+            with torch.no_grad():
+                for m in self.qv_modules.values():
+                    torch.nn.init.kaiming_uniform_(m.lora_a, a=2.0)
+                    m.lora_b.zero_()
+
+        def restore_base_weights(self) -> None:
+            with torch.no_grad():
+                for n, m in self.qv_modules.items():
+                    m.base.weight.data.copy_(self.base_qv_weights[n])
+
+        def apply_dense_delta(self, delta: dict[str, torch.Tensor]) -> None:
+            with torch.no_grad():
+                self.zero_lora()
+                for n, m in self.qv_modules.items():
+                    w0 = self.base_qv_weights[n]
+                    m.base.weight.data.copy_(w0 + delta[n] if n in delta else w0)
+
+        def extract_lora_delta(self, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            sc = float(self.alpha) / float(self.rank)
+            return {n: sc * (state[f"{n}.lora_b"].float() @ state[f"{n}.lora_a"].float()).cpu() for n in self.qv_modules}
+
+        def tower_digest(self, tower: str, kind: str, payload: dict[str, torch.Tensor]) -> str:
+            return tower_digest(tower, kind, payload)
+
+    monkeypatch.setattr(pf1_mod, "MultimodalVLM", _MockVLM)
+    cfg = {
+        "schema": "mnarm-config-v1", "experiment": "test_p4", "dataset": "crisismmd", "protocol": "P4",
+        "allow_test": False, "backbone": "clip_b16", "model_id": "mock", "seed": 11, "deterministic": True,
+        "device": "cpu", "use_amp": False, "lora_rank": 4, "lora_alpha": 8, "epochs": 1,
+        "effective_batch_size": 4, "micro_batch_size": 4, "eval_batch_size": 8, "lr": 1e-3,
+        "weight_decay": 0.0, "max_cached_images": 100, "workers": 1, "shrinkage": None,
+        "gates": {"max_theta_deg": 15.0, "min_paired_f1": 0.5, "min_view3_mean_f1": 0.5},
+    }
+    res = pf1_mod.run_pilot_f1(cfg, seq_dir, img_dir, out_dir)
+    assert (out_dir / "PILOT_F1_DEV_RESULTS.json").is_file()
+    assert (out_dir / "PILOT_F1_REPORT.md").is_file()
+    assert (out_dir / "RUN_LOCK.json").is_file()
+    assert "$" not in (out_dir / "PILOT_F1_REPORT.md").read_text(encoding="utf8")
+    expected_arms = {f"{obj}_{suf}" for obj in ("std_ce", "l_mnar") for suf in ("tsvm", "ta_sum", "seq_replay", "joint")}
+    assert set(res["arms"].keys()) == expected_arms
+    assert len(res["stage_trajectory"]["std_ce_seq_replay"]) == 4
+    assert len(res["stage_trajectory"]["l_mnar_seq_replay"]) == 4
+    assert res["verdict"]["best_paired_f1"] > 0.7
+
+
