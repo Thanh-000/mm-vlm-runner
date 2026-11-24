@@ -196,7 +196,7 @@ def build() -> None:
             SEQ_DIR = extract_contracts_from_a2z_zip(CONTRACTS_ZIP, WS / "crisismmd_seq_inputs")
             manifest = json.loads((SEQ_DIR / "manifest.json").read_bytes())
             # Fetch ONLY train and dev images (strict zero test touch in Pilot F1)
-            if not (IMG_DIR / "data_image").is_dir() and (IMG_DIR / "CrisisMMD_v2.0" / "data_image").is_dir():
+            if (IMG_DIR / "CrisisMMD_v2.0" / "data_image").is_dir():
                 IMG_DIR = IMG_DIR / "CrisisMMD_v2.0"
 
             req_set = {{r["image"] for sp in ("train", "dev") for r in manifest["rows"][sp]}}
@@ -232,6 +232,8 @@ def build() -> None:
                             subprocess.run(["curl", "-fL", tar_url, "-o", str(dl_tar)], check=True)
                     if dl_tar.is_file() and dl_tar.stat().st_size > 100_000_000:
                         tar_path = dl_tar
+                elif tar_path is None and not tar_url:
+                    print("[INFO] CRISISMMA_TAR_URL is empty -> falling back to HF per-file download. Set CRISISMMA_TAR_URL in Cell 1 and re-run Cell 1 for ~25s aria2c download.", flush=True)
 
                 if tar_path is not None:
                     print(f"[EXTRACT] Extracting {{tar_path}} -> {{IMG_DIR}}...", flush=True)
@@ -241,7 +243,7 @@ def build() -> None:
                         subprocess.run(["tar", "-xzf", str(tar_path), "-C", str(IMG_DIR)], check=True)
                     if tar_path.parent == Path("/content"):
                         tar_path.unlink(missing_ok=True)
-                    if not (IMG_DIR / "data_image").is_dir() and (IMG_DIR / "CrisisMMD_v2.0" / "data_image").is_dir():
+                    if (IMG_DIR / "CrisisMMD_v2.0" / "data_image").is_dir():
                         IMG_DIR = IMG_DIR / "CrisisMMD_v2.0"
 
             test_only = {{r["image"] for r in manifest["rows"]["test"]}} - req_set
