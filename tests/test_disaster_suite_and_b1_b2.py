@@ -251,3 +251,68 @@ def test_tar_archive_unpacking_traversal_guard_and_wrapper_unwrap(tmp_path: Path
         tf.add(m3_src, arcname="DisasterM3_Bench")
     m3_unpacked = prepare_disaster_m3(tmp_path / "m3_ext", archive_path=m3_tar)
     assert load_benchmark_contracts("disaster_m3", m3_unpacked, m3_unpacked, "P4", allow_test=False)["num_classes"] == 8
+
+
+def test_contiguous_tensor_bank_palette_and_mgclip_batch_invariance(tmp_path: Path) -> None:
+    import warnings
+    from mnarm.methods.vlm_cl_sota import _measure_mean_neg_by_mask
+
+    class _MiniProc:
+        def __call__(self, text=None, images=None, return_tensors="pt", **_kw):
+            if text is not None:
+                ids = torch.tensor([[len(t), len(t) % 7] for t in text], dtype=torch.long)
+                return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+            arrs = [torch.full((3, 16, 16), float(im.getpixel((0, 0))[0]) / 255.0) for im in images]
+            return {"pixel_values": torch.stack(arrs, dim=0)}
+
+    class _MiniVLM:
+        device = "cpu"
+        embed_dim = 8
+        logit_scale = 10.0
+        tok_kwargs = {}
+        _text_fwd_params = {"input_ids", "attention_mask"}
+        processor = _MiniProc()
+        clip = type("_C", (), {"eval": lambda self: None})()
+
+        def tokenize_texts(self, texts):
+            return self.processor(text=texts)
+
+        def encode_text(self, inp):
+            x = inp["input_ids"].float()
+            return F.normalize(torch.cat([x, x + 1.0, x + 2.0, x + 3.0], dim=-1), dim=-1)
+
+        def encode_image(self, inp):
+            m = inp["pixel_values"].float().mean(dim=(2, 3))
+            return F.normalize(torch.cat([m, m * 2.0, torch.ones(m.shape[0], 2)], dim=-1), dim=-1)
+
+    lookup = {}
+    recs = []
+    for i in range(5):
+        p = tmp_path / f"img_{i}.png"
+        if i == 0:
+            pal = Image.new("P", (16, 16), color=i)
+            pal.info["transparency"] = 0
+            pal.save(p)
+        else:
+            _write_rgb(p, (20 * i, 40, 80))
+        uid = f"u{i}"
+        lookup[uid] = {"uid": uid, "label": i % 2, "text": f"text_{i}" + "x" * i, "image": p}
+        recs.append({"uid": uid, "label": i % 2, "mask": ["text", "image"]})
+
+    store = PreprocessedTensorStore(lookup, _MiniVLM(), max_cached_images=3, workers=1, gpu_cache=False)
+    with warnings.catch_warnings(record=True) as ws:
+        warnings.simplefilter("always", UserWarning)
+        specs_s = store.make_batch_specs(recs, batch_size=2, shuffle=False)
+        specs_l = store.make_batch_specs(recs, batch_size=5, shuffle=False)
+        for vw, chk in specs_l:
+            b = store.collate_chunk(vw, chk)
+            assert b["pixel_values"].shape == (5, 3, 16, 16)
+            assert b["input_ids"].shape == (5, 2)
+        assert not [w for w in ws if "Palette" in str(w.message)]
+    assert len(store._img_slot) == 3 and store._img_bank is not None and store._img_bank.shape == (3, 3, 16, 16)
+
+    p_ord = F.normalize(torch.randn(2, 8), dim=-1)
+    vlm = _MiniVLM()
+    n_small = _measure_mean_neg_by_mask(vlm, specs_s, store, p_ord, {0: 0, 1: 1}, 2, torch.float32, False)
+    n_large = _measure_mean_neg_by_mask(vlm, specs_l, store, p_ord, {0: 0, 1: 1}, 2, torch.float32, False)
+    assert abs(n_small[("image", "text")] - n_large[("image", "text")]) < 1e-5

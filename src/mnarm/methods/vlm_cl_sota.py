@@ -133,7 +133,8 @@ def _measure_mean_neg_by_mask(
     p_ord: torch.Tensor, cls_map: dict[int, int], n_cls: int, amp_dtype: torch.dtype, amp_on: bool,
 ) -> dict[tuple[str, ...], float]:
     vlm.clip.eval()
-    negs: dict[tuple[str, ...], list[torch.Tensor]] = defaultdict(list)
+    neg_sums: dict[tuple[str, ...], float] = defaultdict(float)
+    neg_cnts: dict[tuple[str, ...], int] = defaultdict(int)
     with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_on):
         for views, chunk in specs:
             batch = tensor_store.collate_chunk(views, chunk)
@@ -142,8 +143,9 @@ def _measure_mean_neg_by_mask(
             z = _mean_proto_logits(feats, p_ord, vlm.logit_scale)
             y_loc = torch.tensor([cls_map[int(v)] for v in batch["label"].tolist()], dtype=torch.long, device=vlm.device)
             neg_mask = 1.0 - F.one_hot(y_loc, num_classes=n_cls).float()
-            negs[views].append(((z * neg_mask).sum(dim=1) / neg_mask.sum(dim=1).clamp_min(1.0)).mean().detach().cpu())
-    return {vw: float(torch.stack(lst).mean().item()) for vw, lst in negs.items()}
+            neg_sums[views] += float(((z * neg_mask).sum(dim=1) / neg_mask.sum(dim=1).clamp_min(1.0)).sum().detach().cpu().item())
+            neg_cnts[views] += int(len(chunk))
+    return {vw: float(neg_sums[vw] / max(neg_cnts[vw], 1)) for vw in neg_sums}
 
 
 def train_mg_clip_stage(
@@ -153,6 +155,7 @@ def train_mg_clip_stage(
     stage_idx: int, epochs: int, effective_batch_size: int, micro_batch_size: int, lr: float, weight_decay: float,
     seed: int, use_amp: bool, tensor_store: PreprocessedTensorStore,
     gap_alpha: float = 0.10, mgc_epochs: int = 3, mgc_lr: float = 5e-4, mgc_bs: int = 64,
+    eval_batch_size: int | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, IntraModalCosineClassifier]]:
     """Train MG-CLIP (linlany/MindtheGap@21fb1da0): epoch-level MGP early-stop + MGC cosine heads."""
     vlm.restore_base_weights()
@@ -173,13 +176,15 @@ def train_mg_clip_stage(
     micro_bs = min(eff_bs, max(1, int(micro_batch_size)))
     accum_steps = max(1, eff_bs // micro_bs)
     specs = tensor_store.make_batch_specs(records, micro_bs, shuffle=False, seed=seed + stage_idx * 23)
+    ev_bs = max(micro_bs, int(eval_batch_size or micro_bs))
+    eval_specs = specs if ev_bs == micro_bs else tensor_store.make_batch_specs(records, ev_bs, shuffle=False, seed=seed + stage_idx * 23)
     amp_on = bool(use_amp and vlm.device == "cuda")
     amp_dtype = torch.bfloat16 if (amp_on and torch.cuda.is_bf16_supported()) else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(amp_on and amp_dtype == torch.float16))
 
     saved_state = vlm.lora_state()
     vlm.zero_lora()
-    neg0 = _measure_mean_neg_by_mask(vlm, specs, tensor_store, p_ord, cls_map, len(cls_ord), amp_dtype, amp_on)
+    neg0 = _measure_mean_neg_by_mask(vlm, eval_specs, tensor_store, p_ord, cls_map, len(cls_ord), amp_dtype, amp_on)
     vlm.load_lora_state(saved_state)
 
     opt = torch.optim.Adam(vlm.lora_parameters(), lr=float(lr), weight_decay=float(weight_decay))
@@ -209,7 +214,7 @@ def train_mg_clip_stage(
             scaler.step(opt)
             scaler.update()
         sched.step()
-        neg_ep = _measure_mean_neg_by_mask(vlm, specs, tensor_store, p_ord, cls_map, len(cls_ord), amp_dtype, amp_on)
+        neg_ep = _measure_mean_neg_by_mask(vlm, eval_specs, tensor_store, p_ord, cls_map, len(cls_ord), amp_dtype, amp_on)
         rel_drift = max((abs(neg_ep[vw] - neg0[vw]) / max(abs(neg0[vw]), 1e-6) for vw in neg_ep), default=0.0)
         if ep == 0:
             last_valid = vlm.lora_state()
@@ -232,7 +237,7 @@ def train_mg_clip_stage(
     trained_state = vlm.lora_state()
     feat_bank: dict[str, dict[int, list[torch.Tensor]]] = {"text": defaultdict(list), "image": defaultdict(list)}
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_on):
-        for views, chunk in specs:
+        for views, chunk in eval_specs:
             batch = tensor_store.collate_chunk(views, chunk)
             dev_inp = {k: v.to(vlm.device, non_blocking=True) for k, v in batch.items() if k not in ("label", "sample_id")}
             ys = batch["label"].tolist()

@@ -192,9 +192,9 @@ class MultimodalVLM:
 
     def encode_image(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
         pv = inputs["pixel_values"]
-        clip_dt = getattr(self.clip, "dtype", torch.float32)
-        if pv.dtype != clip_dt:
-            pv = pv.to(dtype=clip_dt)
+        target_dt = torch.get_autocast_gpu_dtype() if (pv.is_cuda and torch.is_autocast_enabled()) else getattr(self.clip, "dtype", torch.float32)
+        if pv.dtype != target_dt:
+            pv = pv.to(dtype=target_dt)
         return _unwrap_tensor(self.clip.get_image_features(pixel_values=pv))
 
     @torch.no_grad()

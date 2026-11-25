@@ -22,12 +22,20 @@ def seed_everything(seed: int, deterministic: bool = True) -> None:
     torch.manual_seed(seed_i)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed_i)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
 
-    if deterministic:
+    turbo = os.environ.get("MNARM_TURBO_KERNELS", "0") == "1"
+    if deterministic and not turbo:
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         torch.use_deterministic_algorithms(True, warn_only=True)
+    else:
+        torch.use_deterministic_algorithms(False)
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
 
 
 def make_generator(seed: int) -> torch.Generator:

@@ -42,7 +42,7 @@ class MaskedRowsDataset(Dataset):
                 im = img_ref.convert("RGB")
             else:
                 with Image.open(img_ref) as raw_im:
-                    im = raw_im.convert("RGB")
+                    im = raw_im.convert("RGBA").convert("RGB") if (raw_im.mode == "P" and "transparency" in raw_im.info) else raw_im.convert("RGB")
             item["pixel_values"] = self.vlm.processor(images=im, return_tensors="pt")["pixel_values"].squeeze(0)
         item["label"] = torch.tensor(int(rec["label"]), dtype=torch.long)
         item["sample_id"] = uid
@@ -56,7 +56,7 @@ def _auto_gpu_cache(vlm: Any) -> bool:
 
 
 class PreprocessedTensorStore:
-    """Caches tokenized text and fp16 images in RAM or high-VRAM CUDA memory for deterministic reuse."""
+    """Caches tokenized text and fp16 images in contiguous RAM/VRAM banks for single-kernel gather."""
 
     def __init__(
         self,
@@ -69,18 +69,20 @@ class PreprocessedTensorStore:
         self.row_lookup = row_lookup
         self.vlm = vlm
         self.max_cached_images = int(max_cached_images)
-        self.workers = min(12, max(4, os.cpu_count() or 4)) if int(workers) <= 0 else max(1, int(workers))
+        self.workers = min(6, max(2, (os.cpu_count() or 4) // 2)) if int(workers) <= 0 else max(1, int(workers))
         self.gpu_cache = _auto_gpu_cache(vlm) if gpu_cache is None else bool(gpu_cache and getattr(vlm, "device", "cpu") == "cuda")
         self.cache_device = getattr(vlm, "device", "cpu") if self.gpu_cache else "cpu"
-        self._img_cache: dict[str, torch.Tensor] = {}
-        self._txt_cache: dict[str, dict[str, torch.Tensor]] = {}
+        self._img_slot: dict[str, int] = {}
+        self._img_bank: torch.Tensor | None = None
+        self._txt_slot: dict[str, int] = {}
+        self._txt_bank: dict[str, torch.Tensor] = {}
         self.decode_count = 0
 
     def _load_pil(self, img_ref: Any) -> Image.Image:
         if isinstance(img_ref, Image.Image):
-            return img_ref.convert("RGB")
+            return img_ref.convert("RGBA").convert("RGB") if (img_ref.mode == "P" and "transparency" in img_ref.info) else img_ref.convert("RGB")
         with Image.open(Path(img_ref)) as im:
-            return im.convert("RGB")
+            return im.convert("RGBA").convert("RGB") if (im.mode == "P" and "transparency" in im.info) else im.convert("RGB")
 
     def _decode_pil_chunk(self, uids: list[str]) -> torch.Tensor:
         if not uids:
@@ -100,26 +102,48 @@ class PreprocessedTensorStore:
         return torch.cat(parts, dim=0)
 
     def ensure_text(self, uids: list[str]) -> None:
-        missing = list(dict.fromkeys(u for u in uids if u not in self._txt_cache))
+        missing = list(dict.fromkeys(u for u in uids if u not in self._txt_slot))
         if not missing:
             return
-        texts = [str(self.row_lookup[u]["text"]) for u in missing]
-        tok = self.vlm.tokenize_texts(texts)
-        keys = list(tok.keys())
-        for idx, uid in enumerate(missing):
-            self._txt_cache[uid] = {k: tok[k][idx].to(self.cache_device) for k in keys}
+        with torch.inference_mode(False), torch.no_grad():
+            tok = self.vlm.tokenize_texts([str(self.row_lookup[u]["text"]) for u in missing])
+            cur = len(self._txt_slot)
+            need = cur + len(missing)
+            for k, val in tok.items():
+                t_dev = val.detach().clone().to(self.cache_device)
+                if k not in self._txt_bank:
+                    cap_t = max(len(self.row_lookup), need, 1)
+                    self._txt_bank[k] = torch.empty((cap_t, *t_dev.shape[1:]), dtype=t_dev.dtype, device=self.cache_device)
+                elif need > self._txt_bank[k].shape[0]:
+                    extra = need - self._txt_bank[k].shape[0]
+                    self._txt_bank[k] = torch.cat([self._txt_bank[k], torch.empty((extra, *t_dev.shape[1:]), dtype=t_dev.dtype, device=self.cache_device)], dim=0)
+                self._txt_bank[k][cur:need].copy_(t_dev)
+            for i, uid in enumerate(missing):
+                self._txt_slot[uid] = cur + i
 
     def ensure_images(self, uids: list[str]) -> None:
-        rem = max(0, self.max_cached_images - len(self._img_cache))
+        rem = max(0, self.max_cached_images - len(self._img_slot))
         if rem == 0:
             return
-        missing = list(dict.fromkeys(u for u in uids if u not in self._img_cache))[:rem]
+        missing = list(dict.fromkeys(u for u in uids if u not in self._img_slot))[:rem]
+        if not missing:
+            return
         chunk_sz = 256 if self.gpu_cache else 128
-        for off in range(0, len(missing), chunk_sz):
-            sub = missing[off : off + chunk_sz]
-            tens = self._decode_pil_chunk(sub)
-            for idx, uid in enumerate(sub):
-                self._img_cache[uid] = tens[idx]
+        with torch.inference_mode(False), torch.no_grad():
+            for off in range(0, len(missing), chunk_sz):
+                sub = missing[off : off + chunk_sz]
+                tens = self._decode_pil_chunk(sub).detach().clone()
+                cur = len(self._img_slot)
+                need = cur + len(sub)
+                if self._img_bank is None:
+                    cap_i = min(max(len(self.row_lookup), need, 1), self.max_cached_images)
+                    self._img_bank = torch.empty((cap_i, *tens.shape[1:]), dtype=torch.float16, device=self.cache_device)
+                elif need > self._img_bank.shape[0]:
+                    extra = need - self._img_bank.shape[0]
+                    self._img_bank = torch.cat([self._img_bank, torch.empty((extra, *tens.shape[1:]), dtype=torch.float16, device=self.cache_device)], dim=0)
+                self._img_bank[cur:need].copy_(tens)
+                for i, uid in enumerate(sub):
+                    self._img_slot[uid] = cur + i
 
     def make_batch_specs(
         self,
@@ -167,19 +191,20 @@ class PreprocessedTensorStore:
         }
         if "text" in views and uids:
             self.ensure_text(uids)
-            t_keys = list(self._txt_cache[uids[0]].keys())
-            for k in t_keys:
-                item[k] = torch.stack([self._txt_cache[u][k] for u in uids], dim=0)
+            idx_t = torch.tensor([self._txt_slot[u] for u in uids], dtype=torch.long, device=self.cache_device)
+            for k, bank_t in self._txt_bank.items():
+                item[k] = bank_t.index_select(0, idx_t)
         if "image" in views and uids:
-            uncached = list(dict.fromkeys(u for u in uids if u not in self._img_cache))
-            dec_map = {}
-            if uncached:
-                dec_t = self._decode_pil_chunk(uncached)
-                dec_map = {u: dec_t[i] for i, u in enumerate(uncached)}
-            item["pixel_values"] = torch.stack(
-                [self._img_cache[u] if u in self._img_cache else dec_map[u] for u in uids],
-                dim=0,
-            )
+            uncached = list(dict.fromkeys(u for u in uids if u not in self._img_slot))
+            if not uncached and self._img_bank is not None:
+                idx_i = torch.tensor([self._img_slot[u] for u in uids], dtype=torch.long, device=self.cache_device)
+                item["pixel_values"] = self._img_bank.index_select(0, idx_i)
+            else:
+                dec_map = {u: t for u, t in zip(uncached, self._decode_pil_chunk(uncached))} if uncached else {}
+                item["pixel_values"] = torch.stack(
+                    [self._img_bank[self._img_slot[u]] if u in self._img_slot and self._img_bank is not None else dec_map[u] for u in uids],
+                    dim=0,
+                )
         return item
 
     def iter_batches(self, records: list[dict[str, Any]], batch_size: int, shuffle: bool = False, seed: int = 11):

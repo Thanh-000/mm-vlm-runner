@@ -406,24 +406,47 @@ def build() -> None:
 
             OUT_DIR = WS / "outputs_iccv_same_bank"
             OUT_DIR.mkdir(parents=True, exist_ok=True)
-            run_env = {**os.environ, "PYTHONPATH": str(CODE_DIR / "src") + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")}
+            run_env = {
+                **os.environ,
+                "USE_TF": "0",
+                "USE_JAX": "0",
+                "TF_CPP_MIN_LOG_LEVEL": "3",
+                "TOKENIZERS_PARALLELISM": "false",
+                "OMP_NUM_THREADS": "2",
+                "MKL_NUM_THREADS": "2",
+                "MNARM_TURBO_KERNELS": "1",
+                "PYTHONPATH": str(CODE_DIR / "src") + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else ""),
+            }
+            try:
+                from huggingface_hub import snapshot_download
+                if RUN_CLIP:
+                    snapshot_download("openai/clip-vit-base-patch16", revision="57c216476eefef5ab752ec549e440a49ae4ae5f3")
+                if RUN_SIGLIP:
+                    snapshot_download("google/siglip-base-patch16-224", revision="7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed")
+            except Exception as exc_hf:
+                print(f"[WARN] HF snapshot pre-warm skipped: {exc_hf}", flush=True)
+
             print_lock = threading.Lock()
             sel_protos = [p for flag, p in ((RUN_P4, "P4"), (RUN_P3, "P3"), (RUN_P2, "P2"), (RUN_P1, "P1")) if flag]
             if not sel_protos or not DATASET_PATHS:
                 raise RuntimeError("Enable at least one dataset and one protocol.")
 
-            def _run_job(tag, cfg_rel, seq_p, img_p, out_sub, bb_name):
+            def _run_job(tag, cfg_rel, seq_p, img_p, out_sub, bb_name, protos_list=None, skip_suite=False):
                 out_path = OUT_DIR / out_sub
                 out_path.mkdir(parents=True, exist_ok=True)
-                log_path = OUT_DIR / (out_sub.replace("/", "_") + ".log")
+                p_args = list(protos_list or sel_protos)
+                log_suffix = ("_" + "_".join(p_args).lower()) if skip_suite else ""
+                log_path = OUT_DIR / (out_sub.replace("/", "_") + log_suffix + ".log")
                 cmd = [
                     sys.executable, "-u", "-m", "mnarm.runners.iccv_same_bank",
                     "--config", str(CODE_DIR / cfg_rel),
                     "--seq-inputs", str(seq_p), "--images", str(img_p),
-                    "--out", str(out_path), "--protocols", *sel_protos,
+                    "--out", str(out_path), "--protocols", *p_args,
                 ]
-                if RESUME_COMPLETED:
+                if RESUME_COMPLETED or not skip_suite:
                     cmd.append("--resume")
+                if skip_suite:
+                    cmd.append("--skip-suite-summary")
                 tail = deque(maxlen=40)
                 with log_path.open("w", encoding="utf8") as lf:
                     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=run_env)
@@ -449,9 +472,31 @@ def build() -> None:
                 if RUN_SIGLIP:
                     sub = "siglip_same_bank" if ds_name == "crisismmd" else f"{ds_name}/siglip_same_bank"
                     ds_jobs.append((f"{ds_name.upper()}:SIGLIP", f"configs/iccv_{ds_name}_siglip.yaml", seq_p, img_p, sub, "siglip_b16"))
-                if PARALLEL_BACKBONES and len(ds_jobs) > 1 and vram_gb >= 22.0 and sys_ram_gb >= 28.0:
+                max_w = 1
+                if PARALLEL_BACKBONES:
+                    if vram_gb >= 85.0 and sys_ram_gb >= 64.0:
+                        max_w = 6 if ds_name == "crisismmd" else 8
+                    elif vram_gb >= 65.0 and sys_ram_gb >= 48.0:
+                        max_w = 6
+                    elif vram_gb >= 38.0 and sys_ram_gb >= 32.0:
+                        max_w = 4
+                    elif vram_gb >= 22.0 and sys_ram_gb >= 24.0:
+                        max_w = 2
+                if max_w >= 4 and len(sel_protos) > 1:
+                    proto_tasks = [
+                        (f"{tag}:{pr}", cfg_rel, seq_p2, img_p2, sub, bb, [pr], True)
+                        for tag, cfg_rel, seq_p2, img_p2, sub, bb in ds_jobs
+                        for pr in sel_protos
+                    ]
+                    print(f"[TURBO-PARALLEL:{ds_name}] Launching {len(proto_tasks)} tasks (max_workers={max_w}) on {gpu_name} ({vram_gb:.1f} GB VRAM)", flush=True)
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as pool:
+                        for fut in [pool.submit(_run_job, *t) for t in proto_tasks]:
+                            fut.result()
+                    for tag, cfg_rel, seq_p2, img_p2, sub, bb in ds_jobs:
+                        _run_job(f"{tag}:SUMMARY", cfg_rel, seq_p2, img_p2, sub, bb, sel_protos, False)
+                elif max_w > 1 and len(ds_jobs) > 1:
                     print(f"[PARALLEL:{ds_name}] Running CLIP + SigLIP ({','.join(sel_protos)}) on {gpu_name} ({vram_gb:.1f} GB VRAM)", flush=True)
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_w, len(ds_jobs))) as pool:
                         for fut in [pool.submit(_run_job, *j) for j in ds_jobs]:
                             fut.result()
                 else:

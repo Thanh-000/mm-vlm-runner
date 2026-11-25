@@ -164,6 +164,7 @@ def run_single_protocol_same_bank(
                 old_classes=old_c, new_classes=new_c, stage_idx=t, epochs=int(config["epochs"]),
                 effective_batch_size=int(config["effective_batch_size"]), micro_batch_size=int(config["micro_batch_size"]),
                 lr=float(config["lr"]), weight_decay=float(config["weight_decay"]), seed=seed + 3000, use_amp=use_amp, tensor_store=store,
+                eval_batch_size=eff_eval_bs,
             )
             tf_mg = collect_train_features_by_modality(vlm=vlm, kind="lora", payload=mg_state, records=st["fit"], tensor_store=store, batch_size=eff_eval_bs, use_amp=use_amp)
             mg_bank.update_stage(u_expert_t=tf_mg["text_x"], u_base_t=tf_b0["text_x"], y_t=tf_mg["text_y"], u_expert_i=tf_mg["image_x"], u_base_i=tf_b0["image_x"], y_i=tf_mg["image_y"], paired_base_t=tf_b0["paired_t"], paired_base_i=tf_b0["paired_i"])
@@ -278,6 +279,7 @@ def run_iccv_same_bank(
     config: dict[str, Any], seq_inputs: Path, images_dir: Path, out_dir: Path,
     protocols: list[str] | tuple[str, ...] | None = None, resume: bool = False,
     model_override: str | None = None, vlm: MultimodalVLM | None = None, store: PreprocessedTensorStore | None = None,
+    write_suite: bool = True,
 ) -> dict[str, Any]:
     """Run unified Same-Bank ICCV evaluation across requested protocols sharing 1 VLM and cache."""
     if bool(config.get("allow_test", False)):
@@ -309,8 +311,11 @@ def run_iccv_same_bank(
         else:
             pcfg = {**config, "protocol": p, "experiment": f"iccv_same_bank_{config.get('dataset', 'crisismmd')}_{backbone}_{p.lower()}"}
             per_proto[p] = run_single_protocol_same_bank(pcfg, seq_inputs, images_dir, p_out, vlm, protos_full, unseen_protos, store, dev_cache, base0_cache=base0_cache)
-        write_same_bank_suite_outputs(config, per_proto, out_dir)
-    return write_same_bank_suite_outputs(config, per_proto, out_dir)
+        if write_suite:
+            write_same_bank_suite_outputs(config, per_proto, out_dir)
+    if write_suite:
+        return write_same_bank_suite_outputs(config, per_proto, out_dir)
+    return {"schema": "mnarm-iccv-same-bank-v2", "backbone": backbone, "allow_test": False, "protocols": list(per_proto.keys())}
 
 
 def main() -> None:
@@ -321,10 +326,12 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--protocols", nargs="+", default=["P4", "P3", "P2", "P1"])
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--skip-suite-summary", action="store_true")
     ap.add_argument("--model-path", type=str, default=None)
     args = ap.parse_args()
-    summary = run_iccv_same_bank(load_yaml(args.config), args.seq_inputs, args.images, args.out, protocols=args.protocols, resume=args.resume, model_override=args.model_path)
-    print(f"[ICCV SAME-BANK DONE] {summary['backbone']} -> {list(summary['protocols'].keys())}")
+    summary = run_iccv_same_bank(load_yaml(args.config), args.seq_inputs, args.images, args.out, protocols=args.protocols, resume=args.resume, model_override=args.model_path, write_suite=not args.skip_suite_summary)
+    p_done = list(summary["protocols"].keys()) if isinstance(summary["protocols"], dict) else list(summary["protocols"])
+    print(f"[ICCV SAME-BANK DONE] {summary['backbone']} -> {p_done}")
 
 
 if __name__ == "__main__":
