@@ -69,6 +69,8 @@ def build() -> None:
             RESUME_COMPLETED = True  # @param {type:"boolean"}
             MOUNT_DRIVE = False  # @param {type:"boolean"}
             DRIVE_CONTRACTS_PATH = ""  # @param {type:"string"}
+            DRIVE_IMAGES_PATH = ""  # @param {type:"string"}
+            DRIVE_SAVE_DIR = "/content/drive/MyDrive/mnarm_iccv_outputs"  # @param {type:"string"}
             A2Z_INPUTS_URL = ""  # @param {type:"string"}
             CRISISMMA_TAR_URL = ""  # @param {type:"string"}
             AUTO_DOWNLOAD = True  # @param {type:"boolean"}
@@ -108,9 +110,10 @@ def build() -> None:
                 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-build-isolation", "--no-deps", "-e", str(CODE_DIR)], check=True)
 
             def _apt_deps():
-                if shutil.which("aria2c") is None and shutil.which("apt-get"):
+                need_bins = [b for b in ("aria2c", "pigz", "unzip") if shutil.which(b) is None]
+                if need_bins and shutil.which("apt-get"):
                     subprocess.run(["apt-get", "-qq", "update"], check=False)
-                    subprocess.run(["apt-get", "-qq", "install", "-y", "aria2", "pigz"], check=False)
+                    subprocess.run(["apt-get", "-qq", "install", "-y", "aria2", "pigz", "unzip"], check=False)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                 f1, f2 = pool.submit(_pip_deps), pool.submit(_apt_deps)
@@ -153,8 +156,9 @@ def build() -> None:
                     cand.unlink()
 
             CONTRACTS_ZIP = next((p for p in LOCAL_CANDIDATES if p.is_file() and zipfile.is_zipfile(p)), None)
-            if CONTRACTS_ZIP is None and MOUNT_DRIVE and colab_drive is not None:
+            if MOUNT_DRIVE and colab_drive is not None and not Path("/content/drive/MyDrive").exists():
                 colab_drive.mount("/content/drive")
+            if CONTRACTS_ZIP is None and MOUNT_DRIVE and Path("/content/drive/MyDrive").exists():
                 drive_cands = [Path(str(DRIVE_CONTRACTS_PATH).strip())] if str(DRIVE_CONTRACTS_PATH).strip() else []
                 drive_cands.extend([Path("/content/drive/MyDrive/jcmil_benchmark_v1/JCMIL_A2Z_INPUTS.zip"), Path("/content/drive/MyDrive/crisismmd_p1_p4_contracts.zip")])
                 CONTRACTS_ZIP = next((p for p in drive_cands if p.is_file() and zipfile.is_zipfile(p)), None)
@@ -188,10 +192,103 @@ def build() -> None:
                 IMG_DIR = IMG_DIR / "CrisisMMD_v2.0"
 
             req_set = {{r["image"] for sp in ("train", "dev") for r in manifest["rows"][sp]}}
+            if any(not (IMG_DIR / p).is_file() for p in req_set):
+                arc_cands = []
+                if str(DRIVE_IMAGES_PATH).strip():
+                    arc_cands.append(Path(str(DRIVE_IMAGES_PATH).strip()))
+                arc_cands.extend([Path("/content/CrisisMMD_v2.0.tar.gz"), Path("/content/CrisisMMD_v2.0.zip")])
+                if Path("/content/drive/MyDrive").exists():
+                    arc_cands.extend([
+                        Path("/content/drive/MyDrive/CrisisMMD_v2.0.tar.gz"),
+                        Path("/content/drive/MyDrive/CrisisMMD_v2.0.zip"),
+                        Path("/content/drive/MyDrive/jcmil_benchmark_v1/CrisisMMD_v2.0.tar.gz"),
+                        Path("/content/drive/MyDrive/jcmil_benchmark_v1/CrisisMMD_v2.0.zip"),
+                    ])
+                archive_path = next((p for p in arc_cands if p.is_file() and p.stat().st_size > 100_000_000), None)
+
+                tar_url = str(CRISISMMA_TAR_URL).strip()
+                if archive_path is None and tar_url:
+                    dl_arc = Path("/content/crisismmd_archive.dl")
+                    dl_arc.unlink(missing_ok=True)
+                    host_t = urllib.parse.urlparse(tar_url).netloc.lower()
+                    is_drive_t = "drive" in host_t and host_t.endswith("google.com")
+                    if not is_drive_t and shutil.which("aria2c"):
+                        print("[ARIA2] Downloading CRISISMMA_TAR_URL (16 connections)...", flush=True)
+                        subprocess.run(["aria2c", "-x16", "-s16", "-k1M", "--allow-overwrite=true", tar_url, "-d", "/content", "-o", dl_arc.name], check=False)
+                    if not dl_arc.is_file() or dl_arc.stat().st_size <= 100_000_000:
+                        dl_arc.unlink(missing_ok=True)
+                        print("[DOWNLOAD] Fetching CRISISMMA_TAR_URL via", "gdown..." if is_drive_t else "curl...", flush=True)
+                        subprocess.run([sys.executable, "-m", "gdown", "--fuzzy", tar_url, "-O", str(dl_arc)] if is_drive_t else ["curl", "-fL", tar_url, "-o", str(dl_arc)], check=True)
+                    if dl_arc.is_file() and dl_arc.stat().st_size > 100_000_000:
+                        archive_path = dl_arc
+                    else:
+                        dl_arc.unlink(missing_ok=True)
+
+                if archive_path is None and shutil.which("aria2c"):
+                    dl_qcri = Path("/content/crisismmd_qcri.tar.gz")
+                    print("[ARIA2] Trying official single-archive mirror (crisisnlp.qcri.org)...", flush=True)
+                    subprocess.run([
+                        "aria2c", "-x16", "-s16", "-k1M", "--connect-timeout=15", "--timeout=30", "--max-tries=2",
+                        "--allow-overwrite=true", "https://crisisnlp.qcri.org/data/crisismmd/CrisisMMD_v2.0.tar.gz",
+                        "-d", "/content", "-o", dl_qcri.name,
+                    ], check=False)
+                    if dl_qcri.is_file() and dl_qcri.stat().st_size > 100_000_000:
+                        archive_path = dl_qcri
+                    else:
+                        dl_qcri.unlink(missing_ok=True)
+
+                if archive_path is not None:
+                    print(f"[EXTRACT] Unpacking {{archive_path}} -> {{IMG_DIR}}...", flush=True)
+                    if zipfile.is_zipfile(archive_path):
+                        if shutil.which("unzip"):
+                            subprocess.run(["unzip", "-q", "-o", str(archive_path), "-d", str(IMG_DIR)], check=True)
+                        else:
+                            with zipfile.ZipFile(archive_path) as zf_arc:
+                                zf_arc.extractall(IMG_DIR)
+                    elif shutil.which("pigz"):
+                        subprocess.run(["tar", "-I", "pigz", "-xf", str(archive_path), "-C", str(IMG_DIR)], check=True)
+                    else:
+                        subprocess.run(["tar", "-xzf", str(archive_path), "-C", str(IMG_DIR)], check=True)
+                    if archive_path.parent == Path("/content"):
+                        archive_path.unlink(missing_ok=True)
+                    if (IMG_DIR / "CrisisMMD_v2.0" / "data_image").is_dir():
+                        IMG_DIR = IMG_DIR / "CrisisMMD_v2.0"
+
+            test_only = {{r["image"] for r in manifest["rows"]["test"]}} - req_set
+            removed_test = sum(1 for rel_t in test_only if (IMG_DIR / rel_t).is_file() and ((IMG_DIR / rel_t).unlink() or True))
+            if removed_test:
+                print(f"[ISOLATION] Removed {{removed_test}} test-only images (strict allow_test=false).", flush=True)
+
             req_imgs = sorted(p for p in req_set if not (IMG_DIR / p).is_file())
             if req_imgs:
-                print(f"[HF DOWNLOAD] Fetching {{len(req_imgs)}} train/dev CrisisMMD images...", flush=True)
+                hf_tok = os.environ.get("HF_TOKEN", "").strip()
+                if not hf_tok:
+                    try:
+                        from google.colab import userdata as colab_userdata
+                        hf_tok = (colab_userdata.get("HF_TOKEN") or "").strip()
+                    except Exception:
+                        hf_tok = ""
+                if shutil.which("aria2c"):
+                    print(f"[ARIA2-HF] Batch-fetching {{len(req_imgs)}} CrisisMMD images...", flush=True)
+                    m_lines = []
+                    for rel_p in req_imgs:
+                        dst = IMG_DIR / rel_p; dst.parent.mkdir(parents=True, exist_ok=True)
+                        url = "https://huggingface.co/datasets/QCRI/CrisisMMD/resolve/{CRISISMMA_HF_REV}/" + urllib.parse.quote(rel_p, safe="/")
+                        m_lines.extend([url, f"  dir={{dst.parent}}", f"  out={{dst.name}}"])
+                    m_file = Path("/content/hf_aria2_manifest.txt")
+                    m_file.write_text("\\n".join(m_lines) + "\\n", encoding="utf8")
+                    aria_cmd = ["aria2c", f"--input-file={{m_file}}", "-j", "16", "-x", "4", "-s", "4", "--retry-wait=5", "--max-tries=8", "--auto-file-renaming=false", "--allow-overwrite=true", "--console-log-level=warn", "--summary-interval=15"]
+                    if hf_tok:
+                        aria_cmd.append(f"--header=Authorization: Bearer {{hf_tok}}")
+                    subprocess.run(aria_cmd, check=False)
+                    m_file.unlink(missing_ok=True)
+
+            req_imgs = sorted(p for p in req_set if not (IMG_DIR / p).is_file())
+            if req_imgs:
+                print(f"[HF RETRY] Fetching {{len(req_imgs)}} remaining images via requests...", flush=True)
                 session = requests.Session()
+                if hf_tok:
+                    session.headers["Authorization"] = f"Bearer {{hf_tok}}"
                 adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16)
                 session.mount("https://", adapter); session.mount("http://", adapter)
 
@@ -210,14 +307,14 @@ def build() -> None:
                     for idx, fut in enumerate(concurrent.futures.as_completed([pool.submit(_fetch, p) for p in req_imgs]), 1):
                         fut.result()
                         if idx % 500 == 0 or idx == len(req_imgs):
-                            print(f"[HF DOWNLOAD] {{idx}}/{{len(req_imgs)}} images ready", flush=True)
-            print("[DATA READY] train/dev images verified:", len(manifest["rows"]["train"]) + len(manifest["rows"]["dev"]))
+                            print(f"[HF RETRY] {{idx}}/{{len(req_imgs)}} images ready", flush=True)
+            print("[DATA READY] train/dev images verified:", len(manifest["rows"]["train"]) + len(manifest["rows"]["dev"]), "at", IMG_DIR)
             """,
             cid="iccv-cell-3",
         ),
         _cell(
             """
-            import concurrent.futures, os, threading
+            import concurrent.futures, os, shutil, threading
             from collections import deque
             import torch
             from IPython.display import Image as IPyImage, Markdown, display
@@ -292,6 +389,11 @@ def build() -> None:
                     if fp.is_file():
                         zout.write(fp, fp.relative_to(OUT_DIR).as_posix())
             print("[PACKAGED]", RES_ZIP, RES_ZIP.stat().st_size, "bytes")
+            if MOUNT_DRIVE and Path("/content/drive/MyDrive").exists() and str(DRIVE_SAVE_DIR).strip():
+                drv_out = Path(str(DRIVE_SAVE_DIR).strip())
+                drv_out.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(RES_ZIP, drv_out / RES_ZIP.name)
+                print("[DRIVE BACKUP]", drv_out / RES_ZIP.name, flush=True)
             if AUTO_DOWNLOAD and colab_files is not None:
                 colab_files.download(str(RES_ZIP))
             """,
