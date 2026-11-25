@@ -177,6 +177,13 @@ def test_run_iccv_same_bank_end_to_end_mock(tmp_path: Path, monkeypatch: pytest.
         def encode_prompts(self, prompts: list[str]) -> torch.Tensor:
             return torch.stack([self._vec(i) for i in range(len(prompts))])
 
+        @torch.no_grad()
+        def encode_prompts_current(self, prompts: list[str]) -> torch.Tensor:
+            tok = self.tokenize_texts(list(prompts)) if all("_" in p for p in prompts) else None
+            if tok is not None:
+                return torch.nn.functional.normalize(self.encode_text(tok).float(), dim=-1)
+            return torch.nn.functional.normalize(self.clip.text_model.l0.q_proj(self.encode_prompts(prompts)), dim=-1)
+
         def lora_parameters(self) -> list[nn.Parameter]:
             return [p for m in self.qv_modules.values() for p in (m.lora_a, m.lora_b)]
 
@@ -222,17 +229,20 @@ def test_run_iccv_same_bank_end_to_end_mock(tmp_path: Path, monkeypatch: pytest.
         "device": "cpu", "use_amp": False, "lora_rank": 4, "lora_alpha": 8, "epochs": 1,
         "effective_batch_size": 4, "micro_batch_size": 4, "eval_batch_size": 8, "lr": 1e-3,
         "weight_decay": 0.0, "max_cached_images": 100, "workers": 1, "shrinkage": None,
+        "include_mg_clip": True,
     }
     res = sb_mod.run_iccv_same_bank(cfg, seq_dir, img_dir, out_dir, protocols=["P4", "P3"])
     assert len(init_calls) == 1
     assert set(res["protocols"].keys()) == {"P4", "P3"}
     for p in ("P4", "P3"):
         p_res = json.loads((out_dir / f"clip_b16_{p.lower()}" / "ICCV_PROTOCOL_RESULTS.json").read_text(encoding="utf8"))
-        assert len(p_res["arms"]) == 12
-        for arm in list(ALL_MERGE_METHODS) + ["seq_ft", "seq_replay256", "joint_oracle"]:
-            assert set(p_res["arms"][arm]["regimes"].keys()) == {"raw", "unlab_center", "zero_mnar", "cal_bias"}
+        assert len(p_res["arms"]) == 16
+        for arm in list(ALL_MERGE_METHODS) + ["seq_ft", "seq_replay256", "mg_clip", "joint_oracle"]:
+            assert set(p_res["arms"][arm]["regimes"].keys()) == {"raw", "gr_clip", "unlab_center", "zero_mnar", "cal_bias"}
             assert "i2t_r1" in p_res["arms"][arm]["encoder_preservation"]["retrieval"]
-        assert "cm_vmf" in p_res["ablation_tsvm"]
+            assert "i2t_r1" in p_res["arms"][arm]["encoder_preservation"]["retrieval_reanchored"]
+        assert "raw" in p_res["arms"]["pal_rls"]["regimes"]
+        assert {"cm_vmf", "css_ct"} <= set(p_res["ablation_tsvm"].keys())
     assert (out_dir / "ICCV_SAME_BANK_clip_b16_TABLE.tex").is_file()
     md_sum = (out_dir / "ICCV_SAME_BANK_clip_b16_SUMMARY.md").read_text(encoding="utf8")
     assert "$" not in md_sum

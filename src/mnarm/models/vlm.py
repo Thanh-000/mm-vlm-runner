@@ -203,6 +203,14 @@ class MultimodalVLM:
         finally:
             self.load_lora_state(saved)
 
+    @torch.no_grad()
+    def encode_prompts_current(self, prompts: list[str]) -> torch.Tensor:
+        """Encode class text prompts under the currently loaded adapter/merged model weights."""
+        self.clip.eval()
+        tok = self.tokenize_texts(list(prompts))
+        tok_dev = {k: v.to(self.device) for k, v in tok.items()}
+        return F.normalize(self.encode_text(tok_dev).float(), dim=-1).cpu()
+
     def lora_parameters(self) -> list[nn.Parameter]:
         return [p for mod in self.qv_modules.values() for p in (mod.lora_a, mod.lora_b)]
 

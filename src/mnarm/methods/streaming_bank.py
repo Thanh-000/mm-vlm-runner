@@ -1,4 +1,4 @@
-"""Exemplar-free streaming class sufficient-statistics bank with canonical base-space transport."""
+"""Exemplar-free streaming class sufficient-statistics bank in O(|Y|d + d^2) memory."""
 
 from __future__ import annotations
 
@@ -7,12 +7,12 @@ from typing import Any
 
 import torch
 
-from mnarm.methods.bayes_transport import _identity_anchored_procrustes
+from mnarm.methods.spherical_stats import _identity_anchored_procrustes
 from mnarm.models.vlm import l2_normalize
 
 
 class StreamingClassBank:
-    """Stores zero-exemplar per-class centroids and pooled within-class scatter in canonical base space."""
+    """Stores zero-exemplar class centroids, within-class scatter, and O(d^2) cross-moments in theta_0."""
 
     def __init__(self) -> None:
         self.class_counts: dict[str, dict[int, int]] = {"text": {}, "image": {}}
@@ -20,8 +20,24 @@ class StreamingClassBank:
         self.within_scatter: dict[str, torch.Tensor | None] = {"text": None, "image": None}
         self.scatter_dof: dict[str, int] = {"text": 0, "image": 0}
         self.total_samples: dict[str, int] = {"text": 0, "image": 0}
-        self.paired_base_t: list[torch.Tensor] = []
-        self.paired_base_i: list[torch.Tensor] = []
+        self.paired_count: int = 0
+        self.paired_sum_t: torch.Tensor | None = None
+        self.paired_sum_i: torch.Tensor | None = None
+        self.paired_cross_ti: torch.Tensor | None = None
+
+    def memory_floats(self) -> int:
+        """Exact count of floating-point scalars stored in bank (strictly O(|Y|d + d^2))."""
+        tot = 0
+        for tw in ("text", "image"):
+            for mu in self.class_centroids[tw].values():
+                tot += int(mu.numel())
+            sc = self.within_scatter[tw]
+            if sc is not None:
+                tot += int(sc.numel())
+        for ten in (self.paired_sum_t, self.paired_sum_i, self.paired_cross_ti):
+            if ten is not None:
+                tot += int(ten.numel())
+        return tot
 
     def update_stage(
         self,
@@ -35,7 +51,7 @@ class StreamingClassBank:
         paired_base_t: torch.Tensor | None = None,
         paired_base_i: torch.Tensor | None = None,
     ) -> None:
-        """Record new-stage centroids & rotated within-class scatter in canonical theta_0 space."""
+        """Record stage centroids, rotated scatter, and O(d^2) paired cross-moments in theta_0."""
         for tw, ue, ub, y in (
             ("text", u_expert_t, u_base_t, y_t),
             ("image", u_expert_i, u_base_i, y_i),
@@ -74,8 +90,15 @@ class StreamingClassBank:
                 self.total_samples[tw] += n_new
 
         if paired_base_t is not None and paired_base_i is not None and paired_base_t.shape[0] > 0:
-            self.paired_base_t.append(l2_normalize(paired_base_t).cpu())
-            self.paired_base_i.append(l2_normalize(paired_base_i).cpu())
+            pt64 = l2_normalize(paired_base_t).to(dtype=torch.float64, device="cpu")
+            pi64 = l2_normalize(paired_base_i).to(dtype=torch.float64, device="cpu")
+            st_sum = pt64.sum(dim=0)
+            si_sum = pi64.sum(dim=0)
+            c_ti = pt64.T @ pi64
+            self.paired_count += int(pt64.shape[0])
+            self.paired_sum_t = st_sum if self.paired_sum_t is None else (self.paired_sum_t + st_sum)
+            self.paired_sum_i = si_sum if self.paired_sum_i is None else (self.paired_sum_i + si_sum)
+            self.paired_cross_ti = c_ti if self.paired_cross_ti is None else (self.paired_cross_ti + c_ti)
 
     def transport_to_target_stats(
         self,
@@ -87,10 +110,15 @@ class StreamingClassBank:
         seen_classes: list[int],
         probe_y_t: torch.Tensor | None = None,
         probe_y_i: torch.Tensor | None = None,
+        protos_0: torch.Tensor | None = None,
+        protos_m: torch.Tensor | None = None,
     ) -> dict[str, Any]:
-        """Transport canonical class centroids & within-class scatter into merged model space."""
+        """Transport canonical centroids, scatter, and O(d^2) cross-moments into target model space."""
+        t0_bridge = bridge_u0_t if (bridge_u0_t is not None and bridge_u0_t.shape[0] >= 2) else protos_0
+        tm_bridge = bridge_um_t if (bridge_um_t is not None and bridge_um_t.shape[0] >= 2) else protos_m
+
         maps: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None] = {"text": None, "image": None}
-        for tw, u0, um in (("text", bridge_u0_t, bridge_um_t), ("image", bridge_u0_i, bridge_um_i)):
+        for tw, u0, um in (("text", t0_bridge, tm_bridge), ("image", bridge_u0_i, bridge_um_i)):
             if u0 is not None and um is not None and u0.shape[0] >= 2:
                 u0_64 = l2_normalize(u0).to(dtype=torch.float64, device="cpu")
                 um_64 = l2_normalize(um).to(dtype=torch.float64, device="cpu")
@@ -119,6 +147,7 @@ class StreamingClassBank:
             px, py = probes[tw]
             tower_stats[tw] = {
                 "centroids": centroids_out,
+                "counts": dict(self.class_counts[tw]),
                 "within_scatter": scatter,
                 "scatter_dof": self.scatter_dof[tw],
                 "total_samples": self.total_samples[tw],
@@ -126,16 +155,26 @@ class StreamingClassBank:
                 "probe_y": py,
             }
 
-        paired_out: tuple[torch.Tensor | None, torch.Tensor | None] = (None, None)
-        if self.paired_base_t and self.paired_base_i:
-            p0_t = torch.cat(self.paired_base_t, dim=0).to(torch.float64)
-            p0_i = torch.cat(self.paired_base_i, dim=0).to(torch.float64)
+        paired_moments: dict[str, Any] | None = None
+        if self.paired_count >= 2 and self.paired_sum_t is not None and self.paired_sum_i is not None and self.paired_cross_ti is not None:
+            n_f = float(self.paired_count)
+            mu_t = self.paired_sum_t / n_f
+            mu_i = self.paired_sum_i / n_f
+            cov_ti = self.paired_cross_ti - n_f * torch.outer(mu_t, mu_i)
+            rot_t = torch.eye(mu_t.numel(), dtype=torch.float64)
+            rot_i = torch.eye(mu_i.numel(), dtype=torch.float64)
             if maps["text"] is not None:
-                rt, st, dt = maps["text"]
-                p0_t = (p0_t - st.unsqueeze(0)) @ rt.T + dt.unsqueeze(0)
+                rot_t, st_m, dt_m = maps["text"]
+                mu_t = dt_m + rot_t @ (mu_t - st_m)
             if maps["image"] is not None:
-                ri, si, di = maps["image"]
-                p0_i = (p0_i - si.unsqueeze(0)) @ ri.T + di.unsqueeze(0)
-            paired_out = (p0_t.float(), p0_i.float())
+                rot_i, si_m, di_m = maps["image"]
+                mu_i = di_m + rot_i @ (mu_i - si_m)
+            cov_m = rot_t @ cov_ti @ rot_i.T
+            paired_moments = {
+                "n_pairs": int(self.paired_count),
+                "sum_t": n_f * mu_t,
+                "sum_i": n_f * mu_i,
+                "cross_ti": cov_m + n_f * torch.outer(mu_t, mu_i),
+            }
 
-        return {"towers": tower_stats, "paired": paired_out}
+        return {"towers": {**tower_stats, "paired_moments": paired_moments}, "paired": (None, None), "paired_moments": paired_moments}

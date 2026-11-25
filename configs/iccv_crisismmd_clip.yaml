@@ -22,3 +22,4 @@ weight_decay: 1.0e-4
 max_cached_images: 25000
 workers: 4
 shrinkage: null
+include_mg_clip: true

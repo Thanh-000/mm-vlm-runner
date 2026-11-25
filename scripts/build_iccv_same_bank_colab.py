@@ -45,9 +45,9 @@ def build() -> None:
     cells = [
         _cell(
             """
-            # ICCV Same-Bank Benchmark — 9 Verbatim Author Mergers + Sequential/Oracle vs `Zero-MNAR` (dev-Only)
+            # ICCV Same-Bank Benchmark — `CSS-CT` + 11 Verbatim Mergers + VLM-CL/Analytic SOTA (dev-Only)
 
-            Runs all **9 author merging operators** (`mean`, `exposure`, `ta_sum`, `ties20`, `magmax`, `magmax_s1`, `tsvm`, `opcm`, `dc_lora`) and **3 sequential/oracle arms** (`seq_ft`, `seq_replay256`, `joint_oracle`) on the **EXACT SAME expert bank** across **4 information regimes** (`raw`, `unlab_center`, `zero_mnar` [Ours, 0 D_cal labels, 0 exemplars], `cal_bias`) + encoder-preservation checks (`Unseen-Prompt OOD`, `I->T R@1`):
+            Runs all **11 author merging operators** (`mean`, `exposure`, `ta_sum`, `ties20`, `magmax`, `magmax_s1`, `tsvm` [CVPR'25], `iso_c` [ICML'25], `opcm` [ICLR'25], `dop` [NeurIPS'25], `dc_lora` [CVPR'26]) alongside **5 continual/VLM-CL/oracle tracks** (`seq_ft`, `seq_replay256`, `mg_clip` [ICCV'25 Highlight], `pal_rls` [Analytic MMCIL'25], `joint_oracle`) on the **EXACT SAME source expert bank** across **5 information regimes** (`raw`, `gr_clip` [NeurIPS'25, 0-label], `unlab_center` [0-label], `zero_mnar` [`CSS-CT` Ours, 0 D_cal labels, O(|Y|d + d^2) moments], `cal_bias` [100% D_cal]) + encoder-preservation checks (`Unseen-Prompt OOD`, `I->T R@1` Raw vs Re-Anchored):
             1. Runs full `pytest -v` preflight gate FIRST (all parity + hygiene + double-blind checks).
             2. Reuses/downloads CrisisMMD `train` + `dev` images (`allow_test=false`).
             3. Runs `mnarm.runners.iccv_same_bank` concurrently for CLIP and SigLIP across `P4 -> P3 -> P2 -> P1`.

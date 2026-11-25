@@ -1,4 +1,4 @@
-"""Zero-leakage logit debiasing controls (unlabeled centering and convex L-BFGS calibration bias)."""
+"""Zero-leakage logit controls (unlabeled centering, GR-CLIP gap removal, convex L-BFGS cal_bias)."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ from typing import Any
 
 import torch
 from torch.nn import functional as F
+
+from mnarm.models.vlm import l2_normalize
 
 
 def apply_bias(logits: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
@@ -24,6 +26,44 @@ def fit_unlabeled_center(scores: torch.Tensor) -> dict[str, Any]:
         raise ValueError("Nonfinite unlabeled calibration logits")
     b = (-scores.detach().cpu().double().mean(dim=0)).clone()
     return {"bias": b, "n_samples": int(scores.shape[0]), "labels_used": False}
+
+
+def fit_gr_clip_gap(cal_feats_t: torch.Tensor | None, cal_feats_i: torch.Tensor | None) -> dict[str, Any]:
+    """Fit zero-label GR-CLIP (NeurIPS 2025) global modality gap vector g = mu_T - mu_I."""
+    if cal_feats_t is not None and cal_feats_i is not None and cal_feats_t.shape[0] >= 1 and cal_feats_i.shape[0] >= 1:
+        mu_t = l2_normalize(cal_feats_t).detach().cpu().double().mean(dim=0)
+        mu_i = l2_normalize(cal_feats_i).detach().cpu().double().mean(dim=0)
+        return {"gap": (mu_t - mu_i).float(), "active": True, "labels_used": False, "n_t": int(cal_feats_t.shape[0]), "n_i": int(cal_feats_i.shape[0])}
+    d = int(cal_feats_t.shape[-1]) if (cal_feats_t is not None and cal_feats_t.ndim == 2) else (int(cal_feats_i.shape[-1]) if (cal_feats_i is not None and cal_feats_i.ndim == 2) else 1)
+    return {"gap": torch.zeros(d, dtype=torch.float32), "active": False, "labels_used": False, "n_t": 0, "n_i": 0}
+
+
+def gr_clip_logits(
+    dev_t: torch.Tensor,
+    dev_i: torch.Tensor,
+    protos_full: torch.Tensor,
+    seen_classes: list[int],
+    scale: float,
+    gap_op: dict[str, Any],
+    alpha: float = 0.5,
+) -> dict[str, torch.Tensor]:
+    """Compute GR-CLIP linear gap-removed logits on text, image, and paired views."""
+    cols = torch.tensor([int(c) for c in seen_classes], dtype=torch.long)
+    p_raw = l2_normalize(protos_full.detach().cpu().float().index_select(0, cols))
+    ut = l2_normalize(dev_t.detach().cpu())
+    ui = l2_normalize(dev_i.detach().cpu())
+    if gap_op.get("active", False):
+        g = gap_op["gap"].detach().cpu().float().unsqueeze(0)
+        shift = float(alpha) * g
+        ut = l2_normalize(ut - shift)
+        p_t = l2_normalize(p_raw - shift)
+        ui = l2_normalize(ui + shift)
+        p_i = l2_normalize(p_raw - shift)
+    else:
+        p_t = p_i = p_raw
+    zt = (float(scale) * (ut @ p_t.T)).float()
+    zi = (float(scale) * (ui @ p_i.T)).float()
+    return {"text": zt, "image": zi, "paired": 0.5 * (zt + zi)}
 
 
 def fit_cal_bias(scores: torch.Tensor, labels: torch.Tensor, classes: list[int]) -> dict[str, Any]:

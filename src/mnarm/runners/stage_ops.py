@@ -210,6 +210,77 @@ def collect_train_features_by_modality(
 
 
 @torch.inference_mode()
+def encode_prompts_under_payload(
+    *,
+    vlm: MultimodalVLM,
+    kind: str,
+    payload: dict[str, torch.Tensor],
+    prompts: list[str],
+) -> torch.Tensor:
+    """Encode prompt vectors under the specified adapter/dense-delta payload."""
+    if kind == "lora":
+        vlm.restore_base_weights()
+        vlm.load_lora_state(payload)
+    else:
+        vlm.apply_dense_delta(payload)
+    fn = getattr(vlm, "encode_prompts_current", None)
+    if callable(fn):
+        return fn(list(prompts))
+    return vlm.encode_prompts(list(prompts))
+
+
+@torch.inference_mode()
+def collect_masked_cal_bundle(
+    *,
+    vlm: MultimodalVLM,
+    kind: str,
+    payload: dict[str, torch.Tensor],
+    cal_recs: list[dict[str, Any]],
+    store: PreprocessedTensorStore,
+    protos_full: torch.Tensor,
+    seen_classes: list[int],
+    batch_size: int,
+    use_amp: bool,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Compute masked calibration logits, labels, and normalized tower features in one pass."""
+    if not cal_recs:
+        return {}, {}, {}
+    if kind == "lora":
+        vlm.restore_base_weights()
+        vlm.load_lora_state(payload)
+    else:
+        vlm.apply_dense_delta(payload)
+    amp_on = bool(use_amp and vlm.device == "cuda")
+    amp_dtype = torch.bfloat16 if (amp_on and torch.cuda.is_bf16_supported()) else torch.float16
+    vlm.clip.eval()
+
+    sc_parts: dict[str, list[torch.Tensor]] = {"text": [], "image": [], "paired": []}
+    lb_parts: dict[str, list[torch.Tensor]] = {"text": [], "image": [], "paired": []}
+    fx_parts: dict[str, list[torch.Tensor]] = {"text": [], "image": []}
+    for views, batch in store.iter_batches(cal_recs, batch_size=batch_size, shuffle=False):
+        dev_inp = {k: v.to(vlm.device, non_blocking=True) for k, v in batch.items() if k not in ("label", "sample_id")}
+        lbl = batch["label"].clone()
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_on):
+            ut = vlm.encode_text(dev_inp).float().cpu() if "text" in views else None
+            ui = vlm.encode_image(dev_inp).float().cpu() if "image" in views else None
+        zt = proto_logits(ut, protos_full, seen_classes, vlm.logit_scale) if ut is not None else None
+        zi = proto_logits(ui, protos_full, seen_classes, vlm.logit_scale) if ui is not None else None
+        if zt is not None and ut is not None:
+            sc_parts["text"].append(zt); lb_parts["text"].append(lbl); fx_parts["text"].append(ut)
+        if zi is not None and ui is not None:
+            sc_parts["image"].append(zi); lb_parts["image"].append(lbl); fx_parts["image"].append(ui)
+        zp = 0.5 * (zt + zi) if (zt is not None and zi is not None) else (zt if zt is not None else zi)
+        if zp is not None:
+            sc_parts["paired"].append(zp); lb_parts["paired"].append(lbl)
+
+    return (
+        {vw: torch.cat(ps, dim=0) for vw, ps in sc_parts.items() if ps},
+        {vw: torch.cat(ls, dim=0) for vw, ls in lb_parts.items() if ls},
+        {tw: torch.cat(fs, dim=0) for tw, fs in fx_parts.items() if fs},
+    )
+
+
+@torch.inference_mode()
 def collect_masked_cal_logits(
     *,
     vlm: MultimodalVLM,
@@ -223,36 +294,8 @@ def collect_masked_cal_logits(
     use_amp: bool,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """Compute zero-hallucination masked calibration logits honoring record modality masks."""
-    if not cal_recs:
-        return {}, {}
-    if kind == "lora":
-        vlm.restore_base_weights()
-        vlm.load_lora_state(payload)
-    else:
-        vlm.apply_dense_delta(payload)
-    amp_on = bool(use_amp and vlm.device == "cuda")
-    amp_dtype = torch.bfloat16 if (amp_on and torch.cuda.is_bf16_supported()) else torch.float16
-    vlm.clip.eval()
-
-    sc_parts: dict[str, list[torch.Tensor]] = {"text": [], "image": [], "paired": []}
-    lb_parts: dict[str, list[torch.Tensor]] = {"text": [], "image": [], "paired": []}
-    for views, batch in store.iter_batches(cal_recs, batch_size=batch_size, shuffle=False):
-        dev_inp = {k: v.to(vlm.device, non_blocking=True) for k, v in batch.items() if k not in ("label", "sample_id")}
-        lbl = batch["label"].clone()
-        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_on):
-            ut = vlm.encode_text(dev_inp).float().cpu() if "text" in views else None
-            ui = vlm.encode_image(dev_inp).float().cpu() if "image" in views else None
-        zt = proto_logits(ut, protos_full, seen_classes, vlm.logit_scale) if ut is not None else None
-        zi = proto_logits(ui, protos_full, seen_classes, vlm.logit_scale) if ui is not None else None
-        if zt is not None:
-            sc_parts["text"].append(zt); lb_parts["text"].append(lbl)
-        if zi is not None:
-            sc_parts["image"].append(zi); lb_parts["image"].append(lbl)
-        zp = 0.5 * (zt + zi) if (zt is not None and zi is not None) else (zt if zt is not None else zi)
-        if zp is not None:
-            sc_parts["paired"].append(zp); lb_parts["paired"].append(lbl)
-
-    return (
-        {vw: torch.cat(ps, dim=0) for vw, ps in sc_parts.items() if ps},
-        {vw: torch.cat(ls, dim=0) for vw, ls in lb_parts.items() if ls},
+    sc, lb, _ = collect_masked_cal_bundle(
+        vlm=vlm, kind=kind, payload=payload, cal_recs=cal_recs, store=store,
+        protos_full=protos_full, seen_classes=seen_classes, batch_size=batch_size, use_amp=use_amp,
     )
+    return sc, lb

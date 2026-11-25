@@ -1,4 +1,4 @@
-"""Unified ICCV Same-Bank benchmark runner comparing 9 verbatim author mergers + 3 seq arms across 4 regimes."""
+"""Unified ICCV Same-Bank benchmark runner: 11 mergers + VLM-CL/Analytic SOTA vs CSS-CT."""
 
 from __future__ import annotations
 
@@ -12,143 +12,29 @@ import torch
 
 from mnarm.core import build_run_lock, load_yaml, seed_everything, write_json_atomic
 from mnarm.data import PreprocessedTensorStore, load_crisismmd_contracts
-from mnarm.eval import Profiler, eval_retrieval_r1, eval_view_suite, measure_cone_drift, paired_bootstrap_diff
+from mnarm.eval import Profiler, eval_view_suite, paired_bootstrap_diff
 from mnarm.methods import (
     ALL_MERGE_METHODS,
-    SelfNormalizedBayesTransportHead,
+    PALRLSClassifier,
     StreamingClassBank,
-    apply_bias,
-    fit_cal_bias,
-    fit_unlabeled_center,
+    apply_reanchor,
     merge_task_deltas,
+    train_mg_clip_stage,
 )
-from mnarm.models import MultimodalVLM, proto_logits
+from mnarm.models import MultimodalVLM
+from mnarm.runners.iccv_eval import eval_pal_rls_arm, evaluate_arm_all_regimes, fit_css_ct_with_reanchor
 from mnarm.runners.iccv_report import render_protocol_report, write_same_bank_suite_outputs
-from mnarm.runners.stage_ops import (
-    collect_masked_cal_logits,
-    collect_train_features_by_modality,
-    extract_paired_features_cached,
-    train_lora_stage,
-)
+from mnarm.runners.stage_ops import collect_train_features_by_modality, extract_paired_features_cached, train_lora_stage
 
 ABLATION_SPECS = (
-    ("none_vmf", "none_zero_shot", "isotropic_vmf"),
-    ("prompt_vmf", "prompt_bridge", "isotropic_vmf"),
-    ("cm_raw_oas", "cross_modal_transport", "raw_oas"),
-    ("cm_sfloor", "cross_modal_transport", "spectral_floor"),
-    ("cm_vmf", "cross_modal_transport", "isotropic_vmf"),
-    ("hybrid_vmf", "hybrid_bridge", "isotropic_vmf"),
+    ("none_vmf", "none_zero_shot", "isotropic_vmf", False),
+    ("prompt_vmf", "prompt_bridge", "isotropic_vmf", False),
+    ("cm_raw_oas", "cross_modal_transport", "raw_oas", False),
+    ("cm_sfloor", "cross_modal_transport", "spectral_floor", False),
+    ("cm_vmf", "cross_modal_transport", "isotropic_vmf", False),
+    ("hybrid_vmf", "hybrid_bridge", "isotropic_vmf", False),
+    ("css_ct", "conjugate_bayes", "marginal_epistemic", True),
 )
-
-
-def _fit_frozen_zero_mnar(
-    *,
-    bridge_mode: str,
-    partial_cov_mode: str,
-    vlm: MultimodalVLM,
-    kind: str,
-    payload: dict[str, torch.Tensor],
-    train_recs: list[dict[str, Any]],
-    streaming_bank: StreamingClassBank | None,
-    fit4_recs: list[dict[str, Any]],
-    store: PreprocessedTensorStore,
-    protos_full: torch.Tensor,
-    seen_classes: list[int],
-    eval_batch_size: int,
-    use_amp: bool,
-    shrinkage: float | None,
-) -> SelfNormalizedBayesTransportHead:
-    head = SelfNormalizedBayesTransportHead(bridge_mode=bridge_mode, partial_cov_mode=partial_cov_mode, shrinkage=shrinkage)
-    if streaming_bank is None:
-        tf = collect_train_features_by_modality(
-            vlm=vlm, kind=kind, payload=payload, records=train_recs,
-            tensor_store=store, batch_size=eval_batch_size, use_amp=use_amp,
-        )
-        return head.fit(
-            train_feats_t=tf["text_x"], train_y_t=tf["text_y"],
-            train_feats_i=tf["image_x"], train_y_i=tf["image_y"],
-            paired_feats_t=tf["paired_t"], paired_feats_i=tf["paired_i"],
-            protos_full=protos_full, seen_classes=seen_classes, fallback_scale=vlm.logit_scale,
-        )
-    f4_b = collect_train_features_by_modality(vlm=vlm, kind="lora", payload={}, records=fit4_recs, tensor_store=store, batch_size=eval_batch_size, use_amp=use_amp)
-    f4_a = collect_train_features_by_modality(vlm=vlm, kind=kind, payload=payload, records=fit4_recs, tensor_store=store, batch_size=eval_batch_size, use_amp=use_amp)
-    bstats = streaming_bank.transport_to_target_stats(
-        bridge_u0_t=f4_b["text_x"], bridge_um_t=f4_a["text_x"],
-        bridge_u0_i=f4_b["image_x"], bridge_um_i=f4_a["image_x"],
-        seen_classes=seen_classes, probe_y_t=f4_a["text_y"], probe_y_i=f4_a["image_y"],
-    )
-    return head.fit_from_sufficient_stats(
-        tower_stats=bstats["towers"], paired_feats_t=bstats["paired"][0], paired_feats_i=bstats["paired"][1],
-        protos_full=protos_full, seen_classes=seen_classes, fallback_scale=vlm.logit_scale,
-    )
-
-
-def _evaluate_arm_all_regimes(
-    *,
-    arm_name: str,
-    kind: str,
-    payload: dict[str, torch.Tensor],
-    vlm: MultimodalVLM,
-    protos_full: torch.Tensor,
-    unseen_protos_full: torch.Tensor,
-    seen_classes: list[int],
-    early_classes: list[int],
-    late_classes: list[int],
-    dev_rows: list[dict[str, Any]],
-    cal_recs: list[dict[str, Any]],
-    dev_cache: dict[tuple[str, ...], torch.Tensor],
-    dev0_t: torch.Tensor,
-    dev0_i: torch.Tensor,
-    train_recs: list[dict[str, Any]],
-    streaming_bank: StreamingClassBank | None,
-    fit4_recs: list[dict[str, Any]],
-    store: PreprocessedTensorStore,
-    eval_batch_size: int,
-    use_amp: bool,
-    shrinkage: float | None,
-    profiler: Profiler,
-) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
-    with profiler.track(f"eval_dev:{arm_name}", n_samples=len(dev_rows)):
-        dev_t, dev_i, dev_y = extract_paired_features_cached(
-            vlm=vlm, kind=kind, payload=payload, records=dev_rows,
-            tensor_store=store, batch_size=eval_batch_size, cache=dev_cache, use_amp=use_amp,
-        )
-
-    cone_t, cone_i = measure_cone_drift(dev_t, dev0_t), measure_cone_drift(dev_i, dev0_i)
-    zt_raw = proto_logits(dev_t, protos_full, seen_classes, vlm.logit_scale)
-    zi_raw = proto_logits(dev_i, protos_full, seen_classes, vlm.logit_scale)
-    raw_logits = {"text": zt_raw, "image": zi_raw, "paired": 0.5 * (zt_raw + zi_raw)}
-    regimes: dict[str, Any] = {"raw": eval_view_suite(raw_logits, dev_y, seen_classes, early_classes, late_classes)}
-    boot_p: dict[str, torch.Tensor] = {"raw": raw_logits["paired"]}
-
-    cal_sc, cal_lb = collect_masked_cal_logits(
-        vlm=vlm, kind=kind, payload=payload, cal_recs=cal_recs, store=store,
-        protos_full=protos_full, seen_classes=seen_classes, batch_size=eval_batch_size, use_amp=use_amp,
-    )
-    if cal_sc:
-        unlab_l = {vw: (apply_bias(raw_logits[vw], fit_unlabeled_center(cal_sc[vw])["bias"]) if vw in cal_sc else raw_logits[vw]) for vw in ("text", "image", "paired")}
-        cal_l = {vw: (apply_bias(raw_logits[vw], fit_cal_bias(cal_sc[vw], cal_lb[vw], seen_classes)["bias"]) if vw in cal_sc else raw_logits[vw]) for vw in ("text", "image", "paired")}
-        regimes["unlab_center"] = eval_view_suite(unlab_l, dev_y, seen_classes, early_classes, late_classes)
-        regimes["cal_bias"] = eval_view_suite(cal_l, dev_y, seen_classes, early_classes, late_classes)
-        boot_p["unlab_center"], boot_p["cal_bias"] = unlab_l["paired"], cal_l["paired"]
-
-    with profiler.track(f"fit_zero_mnar:{arm_name}"):
-        zn_head = _fit_frozen_zero_mnar(
-            bridge_mode="cross_modal_transport", partial_cov_mode="isotropic_vmf",
-            vlm=vlm, kind=kind, payload=payload, train_recs=train_recs,
-            streaming_bank=streaming_bank, fit4_recs=fit4_recs, store=store,
-            protos_full=protos_full, seen_classes=seen_classes,
-            eval_batch_size=eval_batch_size, use_amp=use_amp, shrinkage=shrinkage,
-        )
-    zn_logits = zn_head.predict_views(dev_t, dev_i)
-    regimes["zero_mnar"] = {**eval_view_suite(zn_logits, dev_y, seen_classes, early_classes, late_classes), "diagnostics": zn_head.diagnostics}
-    boot_p["zero_mnar"] = zn_logits["paired"]
-
-    zt_u = proto_logits(dev_t, unseen_protos_full, seen_classes, vlm.logit_scale)
-    zi_u = proto_logits(dev_i, unseen_protos_full, seen_classes, vlm.logit_scale)
-    unseen_ev = eval_view_suite({"text": zt_u, "image": zi_u, "paired": 0.5 * (zt_u + zi_u)}, dev_y, seen_classes, early_classes, late_classes)
-    enc_pres = {"unseen_prompt_paired_f1": float(unseen_ev["paired"]["macro_f1"]), "retrieval": eval_retrieval_r1(dev_t, dev_i)}
-    return {"cone_drift": {"text": cone_t, "image": cone_i}, "regimes": regimes, "encoder_preservation": enc_pres}, boot_p
 
 
 def run_single_protocol_same_bank(
@@ -156,7 +42,7 @@ def run_single_protocol_same_bank(
     vlm: MultimodalVLM, protos_full: torch.Tensor, unseen_protos_full: torch.Tensor,
     store: PreprocessedTensorStore, dev_cache: dict[tuple[str, ...], torch.Tensor],
 ) -> dict[str, Any]:
-    """Run all 9 verbatim author mergers + 3 seq/oracle arms on one shared expert bank."""
+    """Run all 11 author mergers + seq_ft(CSS-CT) + seq_replay256 + MG-CLIP + PAL-RLS + joint_oracle."""
     if bool(config.get("allow_test", False)):
         raise ValueError("ICCV Same-Bank benchmark forbids allow_test=True prior to final freeze.")
     seed = int(config["seed"])
@@ -176,13 +62,20 @@ def run_single_protocol_same_bank(
     )
 
     exp_deltas: list[dict[str, torch.Tensor]] = []
-    bank = StreamingClassBank()
-    seq_ft_state = seq_rep_state = None
+    bank, seq_bank, mg_bank = StreamingClassBank(), StreamingClassBank(), StreamingClassBank()
+    pal = PALRLSClassifier(vlm.embed_dim, len(ds["orig_prompts"]), lam=10.0)
+    seq_ft_state = seq_rep_state = mg_state = None
+    mg_heads: dict[str, Any] = {}
+    seen_so_far: list[int] = []
     t0 = time.perf_counter()
     for st in ds["stages"]:
         t = int(st["stage"])
+        new_c = [int(c) for c in st["new_classes"]]
+        old_c = [c for c in seen_so_far if c not in set(new_c)]
+        seen_so_far = [int(c) for c in st["seen_classes"]]
+
         exp_s, _ = train_lora_stage(
-            vlm=vlm, init_lora=None, records=st["fit"], protos_full=protos_full, seen_classes=st["new_classes"],
+            vlm=vlm, init_lora=None, records=st["fit"], protos_full=protos_full, seen_classes=new_c,
             objective="std_ce", stage_idx=t, epochs=int(config["epochs"]),
             effective_batch_size=int(config["effective_batch_size"]), micro_batch_size=int(config["micro_batch_size"]),
             lr=float(config["lr"]), weight_decay=float(config["weight_decay"]), seed=seed, use_amp=use_amp, tensor_store=store,
@@ -190,23 +83,40 @@ def run_single_protocol_same_bank(
         exp_deltas.append(vlm.extract_lora_delta(exp_s))
         tf_st = collect_train_features_by_modality(vlm=vlm, kind="lora", payload=exp_s, records=st["fit"], tensor_store=store, batch_size=int(config["eval_batch_size"]), use_amp=use_amp)
         tf_b0 = collect_train_features_by_modality(vlm=vlm, kind="lora", payload={}, records=st["fit"], tensor_store=store, batch_size=int(config["eval_batch_size"]), use_amp=use_amp)
-        bank.update_stage(
-            u_expert_t=tf_st["text_x"], u_base_t=tf_b0["text_x"], y_t=tf_st["text_y"],
-            u_expert_i=tf_st["image_x"], u_base_i=tf_b0["image_x"], y_i=tf_st["image_y"],
-            paired_base_t=tf_b0["paired_t"], paired_base_i=tf_b0["paired_i"],
-        )
+        bank.update_stage(u_expert_t=tf_st["text_x"], u_base_t=tf_b0["text_x"], y_t=tf_st["text_y"], u_expert_i=tf_st["image_x"], u_base_i=tf_b0["image_x"], y_i=tf_st["image_y"], paired_base_t=tf_b0["paired_t"], paired_base_i=tf_b0["paired_i"])
+
+        if tf_b0["paired_t"] is not None and tf_b0["paired_i"] is not None:
+            pal.update(tf_b0["paired_t"], tf_b0["paired_i"], tf_b0["text_y"], ("text", "image"))
+        else:
+            if tf_b0["text_x"] is not None:
+                pal.update(tf_b0["text_x"], None, tf_b0["text_y"], ("text",))
+            if tf_b0["image_x"] is not None:
+                pal.update(None, tf_b0["image_x"], tf_b0["image_y"], ("image",))
+
         seq_ft_state, _ = train_lora_stage(
-            vlm=vlm, init_lora=seq_ft_state, records=st["fit"], protos_full=protos_full, seen_classes=st["seen_classes"],
+            vlm=vlm, init_lora=seq_ft_state, records=st["fit"], protos_full=protos_full, seen_classes=seen_so_far,
             objective="std_ce", stage_idx=t, epochs=int(config["epochs"]),
             effective_batch_size=int(config["effective_batch_size"]), micro_batch_size=int(config["micro_batch_size"]),
             lr=float(config["lr"]), weight_decay=float(config["weight_decay"]), seed=seed + 1000, use_amp=use_amp, tensor_store=store,
         )
+        tf_sq = collect_train_features_by_modality(vlm=vlm, kind="lora", payload=seq_ft_state, records=st["fit"], tensor_store=store, batch_size=int(config["eval_batch_size"]), use_amp=use_amp)
+        seq_bank.update_stage(u_expert_t=tf_sq["text_x"], u_base_t=tf_b0["text_x"], y_t=tf_sq["text_y"], u_expert_i=tf_sq["image_x"], u_base_i=tf_b0["image_x"], y_i=tf_sq["image_y"], paired_base_t=tf_b0["paired_t"], paired_base_i=tf_b0["paired_i"])
+
         seq_rep_state, _ = train_lora_stage(
-            vlm=vlm, init_lora=seq_rep_state, records=st["fit"] + st["buffer_before"], protos_full=protos_full, seen_classes=st["seen_classes"],
+            vlm=vlm, init_lora=seq_rep_state, records=st["fit"] + st["buffer_before"], protos_full=protos_full, seen_classes=seen_so_far,
             objective="std_ce", stage_idx=t, epochs=int(config["epochs"]),
             effective_batch_size=int(config["effective_batch_size"]), micro_batch_size=int(config["micro_batch_size"]),
             lr=float(config["lr"]), weight_decay=float(config["weight_decay"]), seed=seed + 2000, use_amp=use_amp, tensor_store=store,
         )
+        if bool(config.get("include_mg_clip", True)):
+            mg_state, mg_heads = train_mg_clip_stage(
+                vlm=vlm, prev_state=mg_state, mg_heads=mg_heads, records=st["fit"], protos_full=protos_full,
+                old_classes=old_c, new_classes=new_c, stage_idx=t, epochs=int(config["epochs"]),
+                effective_batch_size=int(config["effective_batch_size"]), micro_batch_size=int(config["micro_batch_size"]),
+                lr=float(config["lr"]), weight_decay=float(config["weight_decay"]), seed=seed + 3000, use_amp=use_amp, tensor_store=store,
+            )
+            tf_mg = collect_train_features_by_modality(vlm=vlm, kind="lora", payload=mg_state, records=st["fit"], tensor_store=store, batch_size=int(config["eval_batch_size"]), use_amp=use_amp)
+            mg_bank.update_stage(u_expert_t=tf_mg["text_x"], u_base_t=tf_b0["text_x"], y_t=tf_mg["text_y"], u_expert_i=tf_mg["image_x"], u_base_i=tf_b0["image_x"], y_i=tf_mg["image_y"], paired_base_t=tf_b0["paired_t"], paired_base_i=tf_b0["paired_i"])
         print(f"[{config['backbone']} {config['protocol']}] trained stage {t}/4 ({time.perf_counter() - t0:.1f}s)", flush=True)
 
     joint_recs = st4["fit"] + st4["joint_before"]
@@ -216,53 +126,64 @@ def run_single_protocol_same_bank(
         effective_batch_size=int(config["effective_batch_size"]), micro_batch_size=int(config["micro_batch_size"]),
         lr=float(config["lr"]), weight_decay=float(config["weight_decay"]), seed=seed + 4000, use_amp=use_amp, tensor_store=store,
     )
-    print(f"[{config['backbone']} {config['protocol']}] joint_oracle finished ({time.perf_counter() - t0:.1f}s)", flush=True)
 
-    arm_specs: list[tuple[str, str, dict[str, torch.Tensor], list[dict[str, Any]], StreamingClassBank | None]] = [
-        (m, "delta", merge_task_deltas(exp_deltas, m), [], bank) for m in ALL_MERGE_METHODS
+    arm_specs: list[tuple[str, str, dict[str, torch.Tensor], list[dict[str, Any]], StreamingClassBank | None, dict[str, Any] | None]] = [
+        (m, "delta", merge_task_deltas(exp_deltas, m), [], bank, None) for m in ALL_MERGE_METHODS
     ] + [
-        ("seq_ft", "lora", seq_ft_state or {}, st4["fit"], None),
-        ("seq_replay256", "lora", seq_rep_state or {}, st4["fit"] + st4["buffer_before"], None),
-        ("joint_oracle", "lora", joint_state, joint_recs, None),
+        ("seq_ft", "lora", seq_ft_state or {}, [], seq_bank, None),
+        ("seq_replay256", "lora", seq_rep_state or {}, st4["fit"] + st4["buffer_before"], None, None),
     ]
+    if bool(config.get("include_mg_clip", True)) and mg_state is not None:
+        arm_specs.append(("mg_clip", "lora", mg_state, [], mg_bank, mg_heads))
+    arm_specs.append(("joint_oracle", "lora", joint_state, joint_recs, None, None))
 
     arms_out: dict[str, Any] = {}
     boot_map: dict[str, dict[str, torch.Tensor]] = {}
-    for aname, akind, apayload, tr_recs, bnk in arm_specs:
-        arec, blogits = _evaluate_arm_all_regimes(
-            arm_name=aname, kind=akind, payload=apayload, vlm=vlm, protos_full=protos_full,
+    for aname, akind, apayload, tr_recs, bnk, mgh in arm_specs:
+        arec, blogits = evaluate_arm_all_regimes(
+            arm_name=aname, kind=akind, payload=apayload, vlm=vlm, orig_prompts=ds["orig_prompts"], protos_full=protos_full,
             unseen_protos_full=unseen_protos_full, seen_classes=seen, early_classes=ds["early_classes"],
             late_classes=ds["late_classes"], dev_rows=dev_rows, cal_recs=st4["calibration_latest_views"],
             dev_cache=dev_cache, dev0_t=dev0_t, dev0_i=dev0_i, train_recs=tr_recs, streaming_bank=bnk,
             fit4_recs=st4["fit"], store=store, eval_batch_size=int(config["eval_batch_size"]),
-            use_amp=use_amp, shrinkage=config.get("shrinkage"), profiler=profiler,
+            use_amp=use_amp, shrinkage=config.get("shrinkage"), profiler=profiler, mg_heads=mgh,
         )
         arms_out[aname], boot_map[aname] = arec, blogits
+
+    pal_rec, pal_boot = eval_pal_rls_arm(
+        pal, dev0_t, dev0_i, dev_y, seen, ds["early_classes"], ds["late_classes"], unseen_protos_full,
+        vlm.logit_scale, st4["calibration_latest_views"], vlm, store, int(config["eval_batch_size"]), use_amp,
+    )
+    arms_out["pal_rls"], boot_map["pal_rls"] = pal_rec, pal_boot
 
     tsvm_delta = merge_task_deltas(exp_deltas, "tsvm")
     tsvm_t, tsvm_i, _ = extract_paired_features_cached(vlm=vlm, kind="delta", payload=tsvm_delta, records=dev_rows, tensor_store=store, batch_size=int(config["eval_batch_size"]), cache=dev_cache, use_amp=use_amp)
     ablation_out: dict[str, Any] = {}
-    for ab_name, bmode, pcmode in ABLATION_SPECS:
-        ab_h = _fit_frozen_zero_mnar(
-            bridge_mode=bmode, partial_cov_mode=pcmode, vlm=vlm, kind="delta", payload=tsvm_delta,
-            train_recs=[], streaming_bank=bank, fit4_recs=st4["fit"], store=store,
-            protos_full=protos_full, seen_classes=seen, eval_batch_size=int(config["eval_batch_size"]),
-            use_amp=use_amp, shrinkage=config.get("shrinkage"),
+    for ab_name, bmode, pcmode, use_re in ABLATION_SPECS:
+        ab_h, rt_ab, ri_ab = fit_css_ct_with_reanchor(
+            bridge_mode=bmode, partial_cov_mode=pcmode, use_reanchor=use_re, vlm=vlm, kind="delta", payload=tsvm_delta,
+            train_recs=[], streaming_bank=bank, fit4_recs=st4["fit"], store=store, orig_prompts=ds["orig_prompts"],
+            protos_full=protos_full, seen_classes=seen, eval_batch_size=int(config["eval_batch_size"]), use_amp=use_amp, shrinkage=config.get("shrinkage"),
         )
-        ablation_out[ab_name] = eval_view_suite(ab_h.predict_views(tsvm_t, tsvm_i), dev_y, seen, ds["early_classes"], ds["late_classes"])
+        tx_ab, ix_ab = (apply_reanchor(tsvm_t, rt_ab), apply_reanchor(tsvm_i, ri_ab)) if use_re else (tsvm_t, tsvm_i)
+        ablation_out[ab_name] = eval_view_suite(ab_h.predict_views(tx_ab, ix_ab), dev_y, seen, ds["early_classes"], ds["late_classes"])
 
     bootstrap: dict[str, Any] = {}
     anchor = boot_map["tsvm"]["zero_mnar"]
     for label, ref in [
         ("tsvm:zero_mnar_vs_tsvm:raw", boot_map["tsvm"]["raw"]),
-        ("tsvm:zero_mnar_vs_tsvm:unlab_center", boot_map["tsvm"].get("unlab_center")),
+        ("tsvm:zero_mnar_vs_tsvm:gr_clip", boot_map["tsvm"].get("gr_clip")),
         ("tsvm:zero_mnar_vs_tsvm:cal_bias", boot_map["tsvm"].get("cal_bias")),
+        ("tsvm:zero_mnar_vs_iso_c:cal_bias", boot_map["iso_c"].get("cal_bias")),
+        ("tsvm:zero_mnar_vs_dop:cal_bias", boot_map["dop"].get("cal_bias")),
         ("tsvm:zero_mnar_vs_dc_lora:cal_bias", boot_map["dc_lora"].get("cal_bias")),
+        ("tsvm:zero_mnar_vs_mg_clip:raw", boot_map.get("mg_clip", {}).get("raw")),
+        ("tsvm:zero_mnar_vs_pal_rls:raw", boot_map["pal_rls"].get("raw")),
     ]:
         if ref is not None:
             bootstrap[label] = paired_bootstrap_diff(anchor, ref, dev_y, seen, seed=seed)
 
-    payload_out = {"schema": "mnarm-iccv-protocol-v1", "config": config, "arms": arms_out, "ablation_tsvm": ablation_out, "bootstrap": bootstrap, "profiling": profiler.records}
+    payload_out = {"schema": "mnarm-iccv-protocol-v2", "config": config, "arms": arms_out, "ablation_tsvm": ablation_out, "bootstrap": bootstrap, "profiling": profiler.records}
     write_json_atomic(out_dir / "ICCV_PROTOCOL_RESULTS.json", payload_out)
     render_protocol_report(payload_out, out_dir / "ICCV_PROTOCOL_REPORT.md")
     return payload_out
