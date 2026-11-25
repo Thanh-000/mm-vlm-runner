@@ -257,3 +257,62 @@ def test_streaming_bank_multiclass_oof_tau_prevents_insample_overconfidence() ->
         assert ev["paired"]["ece"] < 0.15, f"{proto} paired ece={ev['paired']['ece']}"
 
 
+def test_bank_probe_oof_tau_immune_to_rare_noisy_tail_class() -> None:
+    """Prevent 50:1 rare noisy tail class 7 in Stage-4 probe from collapsing full-tower tau -> 0.005."""
+    g = torch.Generator().manual_seed(97)
+    dim, classes = 256, list(range(8))
+    sem = torch.cat([torch.zeros(8, 3), F.normalize(torch.randn(8, dim - 3, generator=g), dim=-1)], dim=-1)
+    # Give noisy tail class 7 strong overlap with earlier classes {0, 4, 5}
+    sem_img = sem.clone()
+    sem_img[7] = F.normalize(0.45 * sem[0] + 0.45 * sem[4] + 0.35 * sem[5] + 0.25 * sem[7], dim=-1)
+    mu_p, mu_i, mu_t = torch.zeros(dim), torch.zeros(dim), torch.zeros(dim)
+    mu_p[0], mu_i[1], mu_t[2] = 1.0, 1.0, 1.0
+    protos = F.normalize(0.86 * mu_p.unsqueeze(0) + 0.51 * sem, dim=-1)
+    q_i = _pos_qr(torch.eye(dim) + 0.04 * torch.randn(dim, dim, generator=g))
+    q_t = _pos_qr(torch.eye(dim) + 0.04 * torch.randn(dim, dim, generator=g))
+    basis_i = torch.randn(dim, 24, generator=g) * 0.08
+
+    def _draw_tower(cls_counts: list[tuple[int, int]], tower: str) -> tuple[torch.Tensor, torch.Tensor]:
+        xs, ys = [], []
+        for c, n_c in cls_counts:
+            if tower == "image":
+                ctr = F.normalize(0.82 * mu_i + 0.57 * (q_i @ sem_img[c]), dim=-1)
+                z = torch.randn(n_c, 24, generator=g) @ basis_i.T + 0.025 * torch.randn(n_c, dim, generator=g)
+            else:
+                ctr = F.normalize(0.84 * mu_t + 0.54 * (q_t @ sem[c]), dim=-1)
+                z = 0.14 * torch.randn(n_c, dim, generator=g)
+            xs.append(l2_normalize(ctr.unsqueeze(0) + z))
+            ys.append(torch.full((n_c,), c, dtype=torch.long))
+        return torch.cat(xs, dim=0), torch.cat(ys, dim=0)
+
+    stages = [([(0, 120), (5, 120)], False), ([(1, 120), (4, 120)], False), ([(2, 120), (6, 120)], True), ([(3, 300), (7, 16)], True)]
+    bank = StreamingClassBank()
+    pr_tx = pr_ty = pr_ix = pr_iy = None
+    for spec, paired in stages:
+        xi, yi = _draw_tower(spec, "image")
+        xt, yt = _draw_tower(spec, "text")
+        bank.update_stage(
+            u_expert_t=xt if paired else None, u_base_t=xt if paired else None, y_t=yt if paired else None,
+            u_expert_i=xi, u_base_i=xi, y_i=yi,
+            paired_base_t=xt if paired else None, paired_base_i=xi if paired else None,
+        )
+        pr_tx, pr_ty, pr_ix, pr_iy = xt, yt, xi, yi
+
+    assert pr_tx is not None and pr_ix is not None
+    stats = bank.transport_to_target_stats(
+        bridge_u0_t=pr_tx, bridge_um_t=pr_tx, bridge_u0_i=pr_ix, bridge_um_i=pr_ix,
+        seen_classes=classes, probe_y_t=pr_ty, probe_y_i=pr_iy,
+    )
+    head = SelfNormalizedBayesTransportHead(bridge_mode="cross_modal_transport", partial_cov_mode="isotropic_vmf").fit_from_sufficient_stats(
+        stats["towers"], stats["paired"][0], stats["paired"][1], protos, classes
+    )
+    dev_ix, dev_y = _draw_tower([(c, 35) for c in classes], "image")
+    dev_tx, _ = _draw_tower([(c, 35) for c in classes], "text")
+    ev = eval_view_suite(head.predict_views(dev_tx, dev_ix), dev_y, classes, [0, 1, 4, 5], [2, 3, 6, 7])
+    assert head.diagnostics["towers"]["image"]["tau"] > 0.05, f"Collapsed image tau={head.diagnostics['towers']['image']['tau']}"
+    assert ev["image"]["ece"] < 0.25, f"image ece={ev['image']['ece']}"
+    assert ev["paired"]["ece"] < 0.20, f"paired ece={ev['paired']['ece']}"
+    assert ev["paired"]["macro_f1"] > ev["text"]["macro_f1"], f"paired={ev['paired']['macro_f1']} <= text={ev['text']['macro_f1']}"
+
+
+

@@ -94,13 +94,16 @@ def _stratified_folds(labels: list[int], k_folds: int) -> list[list[int]]:
     return [sorted(f) for f in folds]
 
 
-def _fit_oof_tau(oof_scores: torch.Tensor, oof_y_local: torch.Tensor, num_obs: int) -> float:
-    """Fit 1 scalar log-temperature tau > 0 in exact nat-scale via class-balanced NLL on OOF scores."""
+def _fit_oof_tau(oof_scores: torch.Tensor, oof_y_local: torch.Tensor, num_obs: int, balanced: bool = True) -> float:
+    """Fit 1 scalar log-temperature tau > 0 in exact nat-scale via OOF NLL (class-balanced or empirical)."""
     if oof_scores.numel() == 0 or num_obs < 2:
         return 1.0
-    counts = torch.bincount(oof_y_local, minlength=num_obs).to(torch.float64).clamp_min(1.0)
-    sw = 1.0 / counts[oof_y_local]
-    sw = sw / sw.sum().clamp_min(1e-12)
+    if balanced:
+        counts = torch.bincount(oof_y_local, minlength=num_obs).to(torch.float64).clamp_min(1.0)
+        sw = 1.0 / counts[oof_y_local]
+        sw = sw / sw.sum().clamp_min(1e-12)
+    else:
+        sw = torch.full((oof_y_local.shape[0],), 1.0 / float(max(oof_y_local.shape[0], 1)), dtype=torch.float64)
     z64 = oof_scores.to(torch.float64)
     spread = float((z64.max(dim=-1).values - z64.median(dim=-1).values).mean().clamp_min(1e-4).item())
     init_tau = min(max(2.0 / spread, 1e-4), 5.0)
@@ -142,7 +145,7 @@ def _fit_bank_probe_oof_tau(probe_x: torch.Tensor, probe_y: torch.Tensor, centro
             w_f = mu_f @ prec
             oof_scores.append(p_u[f_idx] @ w_f.T + (-0.5 * (mu_f * w_f).sum(dim=-1)).unsqueeze(0))
             oof_y.append(torch.tensor([obs_map[int(v)] for v in py[f_idx].tolist()], dtype=torch.long))
-        return _fit_oof_tau(torch.cat(oof_scores, dim=0), torch.cat(oof_y, dim=0), len(obs))
+        return _fit_oof_tau(torch.cat(oof_scores, dim=0), torch.cat(oof_y, dim=0), len(obs), balanced=False)
     if p_u.shape[0] < 2:
         return 0.05
     mu_f = torch.stack([centroids[c] for c in obs], dim=0)
@@ -150,7 +153,7 @@ def _fit_bank_probe_oof_tau(probe_x: torch.Tensor, probe_y: torch.Tensor, centro
         mu_f = _equalize_mahalanobis_centroids(mu_f, prec, list(range(len(obs))))
     w_f = mu_f @ prec
     scores = p_u @ w_f.T + (-0.5 * (mu_f * w_f).sum(dim=-1)).unsqueeze(0)
-    return _fit_oof_tau(scores, torch.tensor([obs_map[int(v)] for v in py.tolist()], dtype=torch.long), len(obs))
+    return _fit_oof_tau(scores, torch.tensor([obs_map[int(v)] for v in py.tolist()], dtype=torch.long), len(obs), balanced=False)
 
 
 class SelfNormalizedBayesTransportHead:
