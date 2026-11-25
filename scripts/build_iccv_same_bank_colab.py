@@ -1,4 +1,4 @@
-"""Build clean Colab Web notebook for unified ICCV Same-Bank evaluation across disaster benchmarks."""
+"""Build clean Colab Web notebook for unified ICCV Same-Bank evaluation (dev-Only, link/upload input)."""
 
 from __future__ import annotations
 
@@ -47,11 +47,9 @@ def build() -> None:
             """
             # ICCV Same-Bank Benchmark — `Canonical CSS-CT` v2 across Multi-Altitude Disaster Benchmarks (dev-Only)
 
-            Runs all **14 verbatim author merging operators** alongside **6 continual/VLM-CL/oracle tracks** on the **EXACT SAME source expert bank** across **5 information regimes** (`raw`, `gr_clip`, `unlab_center`, `zero_mnar` [`CSS-CT` Ours: 0 D_cal labels, 0 exemplars], `cal_bias` [100% D_cal]) with **Blackwell / A100 High-VRAM Turbo Mode** (`VRAM >= 40 GB` GPU tensor pre-staging + batched GPU DOP + `use_fast=True`) across **4 zero-overlap disaster benchmarks**:
-            1. `crisismmd` (CrisisMMD v2.0 — Ground social media)
-            2. `dmd` (Damage Multimodal Dataset, UCI 456 — Ground damage inspection)
-            3. `incidents_vqa` (DisasterVQA `incidents1m` subset — 0% CrisisMMD/MEDIC overlap)
-            4. `disaster_m3` (DisasterM3 NeurIPS'25 — Orbital Optical + SAR satellite imagery)
+            Runs all **14 verbatim author merging operators** alongside **6 continual/VLM-CL/oracle tracks** on the **EXACT SAME source expert bank** across **5 information regimes** (`raw`, `gr_clip`, `unlab_center`, `zero_mnar` [`CSS-CT` Ours: 0 D_cal labels, 0 exemplars], `cal_bias` [100% D_cal]) with **Blackwell / A100 High-VRAM Turbo Mode** (`VRAM >= 36 GB` GPU tensor pre-staging + batched GPU DOP + `use_fast=True`).
+
+            - **Clean Data Input (Zero Drive Mount Needed):** Simply paste Google Drive `.tar` / `.tar.gz` / `.zip` links prepared by `Stage_Disaster_Datasets_To_Drive.ipynb` (or upload the small contracts zip). Cell 3 automatically resolves Google Drive links to direct binary streams and pulls them into `/dev/shm` via **16-connection `aria2c -x16 -s16`** (`gdown` fallback).
             """,
             kind="markdown",
             cid="iccv-cell-0",
@@ -71,12 +69,6 @@ def build() -> None:
             RUN_P2 = True  # @param {type:"boolean"}
             RUN_P1 = True  # @param {type:"boolean"}
             RESUME_COMPLETED = True  # @param {type:"boolean"}
-            MOUNT_DRIVE = False  # @param {type:"boolean"}
-            CACHE_ARCHIVES_TO_DRIVE = False  # @param {type:"boolean"}
-            DRIVE_CONTRACTS_PATH = ""  # @param {type:"string"}
-            DRIVE_IMAGES_PATH = ""  # @param {type:"string"}
-            DRIVE_DATASET_DIR = "/content/drive/MyDrive/mnarm_iccv_datasets"  # @param {type:"string"}
-            DRIVE_SAVE_DIR = "/content/drive/MyDrive/mnarm_iccv_outputs"  # @param {type:"string"}
             A2Z_INPUTS_URL = ""  # @param {type:"string"}
             CRISISMMA_TAR_URL = ""  # @param {type:"string"}
             DMD_ARCHIVE_URL = ""  # @param {type:"string"}
@@ -140,13 +132,13 @@ def build() -> None:
         ),
         _cell(
             f"""
-            import concurrent.futures, importlib, json, os, shutil, site, subprocess, sys, time, urllib.parse, zipfile
+            import concurrent.futures, html, importlib, json, os, re, shutil, site, subprocess, sys, time, urllib.parse, zipfile
             from pathlib import Path
             import requests
             try:
-                from google.colab import drive as colab_drive, files as colab_files
+                from google.colab import files as colab_files
             except ImportError:
-                colab_drive = colab_files = None
+                colab_files = None
 
             WS = Path("/content/mnarm_ws")
             CODE_DIR = WS / "repo"
@@ -158,12 +150,6 @@ def build() -> None:
             importlib.invalidate_caches()
             from mnarm.data import extract_contracts_from_a2z_zip, prepare_disaster_m3, prepare_dmd, prepare_incidents_vqa
 
-            if MOUNT_DRIVE and colab_drive is not None and not Path("/content/drive/MyDrive").exists():
-                colab_drive.mount("/content/drive")
-            drv_cache = (Path(str(DRIVE_SAVE_DIR).strip()) / "datasets_cache") if (MOUNT_DRIVE and Path("/content/drive/MyDrive").exists() and str(DRIVE_SAVE_DIR).strip()) else None
-            if drv_cache is not None and CACHE_ARCHIVES_TO_DRIVE:
-                drv_cache.mkdir(parents=True, exist_ok=True)
-
             hf_tok = os.environ.get("HF_TOKEN", "").strip()
             if not hf_tok:
                 try:
@@ -174,20 +160,80 @@ def build() -> None:
                 except Exception:
                     hf_tok = ""
 
-            DATASET_PATHS = {{}}
+            def _extract_drive_id(url_in: str) -> str:
+                m = re.search(r"/file/d/([A-Za-z0-9_-]+)", url_in)
+                if m:
+                    return m.group(1)
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(url_in).query)
+                return q.get("id", [""])[0]
 
-            def _fetch_url_or_drive(url_in: str, dst: Path, min_bytes: int = 1000) -> Path | None:
-                if not url_in.strip():
-                    return None
+            def _resolve_drive_direct_url(url_in: str) -> tuple[str, str]:
+                u = url_in.strip()
+                host = urllib.parse.urlparse(u).netloc.lower()
+                if "drive" not in host or not host.endswith("google.com"):
+                    return u, ""
+                uc_host = "drive." + "usercontent.google.com"
+                if uc_host in host and "confirm=" in u and ("uuid=" in u or "at=" in u):
+                    return u, ""
+                fid = _extract_drive_id(u)
+                if not fid:
+                    return u, ""
+                sess = requests.Session()
+                sess.headers["User-Agent"] = "Mozilla/5.0"
+                probe = f"https://{{uc_host}}/download?id={{fid}}&export=download&confirm=t"
+                with sess.get(probe, stream=True, timeout=30, allow_redirects=True) as r:
+                    ck = "; ".join(f"{{k}}={{v}}" for k, v in sess.cookies.get_dict().items())
+                    ct = (r.headers.get("Content-Type") or "").lower()
+                    if "text/html" not in ct:
+                        return r.url, ck
+                    body = r.text
+                inputs = {{m.group(1): html.unescape(m.group(2)) for m in re.finditer(r'<input[^>]*name=["\\\']([^"\\\']+)["\\\'][^>]*value=["\\\']([^"\\\']*)["\\\']', body)}}
+                if inputs:
+                    return f"https://{{uc_host}}/download?" + urllib.parse.urlencode(inputs), ck
+                return probe, ck
+
+            def _is_valid_binary(p: Path, min_bytes: int) -> bool:
+                if not p.is_file() or p.stat().st_size <= min_bytes:
+                    return False
+                with p.open("rb") as fh:
+                    head = fh.read(128).lower()
+                return (b"<html" not in head) and (b"<!doctype" not in head)
+
+            def _download_archive_aria2(url_in: str, dst: Path, min_bytes: int = 1000) -> Path:
+                u = url_in.strip()
+                if not u:
+                    raise ValueError(f"Empty download URL for {{dst.name}}")
                 dst.unlink(missing_ok=True)
-                host_in = urllib.parse.urlparse(url_in).netloc.lower()
+                host_in = urllib.parse.urlparse(u).netloc.lower()
                 is_drive = "drive" in host_in and host_in.endswith("google.com")
-                if not is_drive and shutil.which("aria2c"):
-                    subprocess.run(["aria2c", "-x16", "-s16", "-k1M", "--allow-overwrite=true", url_in, "-d", str(dst.parent), "-o", dst.name], check=False)
-                if not dst.is_file() or dst.stat().st_size <= min_bytes:
+                direct_u, cookie_hdr = _resolve_drive_direct_url(u)
+                if shutil.which("aria2c"):
+                    cmd = ["aria2c", "-x16", "-s16", "-k4M", "--file-allocation=none", "--allow-overwrite=true", "--max-tries=4", "--retry-wait=3", direct_u, "-d", str(dst.parent), "-o", dst.name]
+                    if cookie_hdr:
+                        cmd.append(f"--header=Cookie: {{cookie_hdr}}")
+                    subprocess.run(cmd, check=False)
+                if not _is_valid_binary(dst, min_bytes):
                     dst.unlink(missing_ok=True)
-                    subprocess.run([sys.executable, "-m", "gdown", "--fuzzy", url_in, "-O", str(dst)] if is_drive else ["curl", "-fL", url_in, "-o", str(dst)], check=True)
-                return dst if (dst.is_file() and dst.stat().st_size > min_bytes) else None
+                    if is_drive:
+                        subprocess.run([sys.executable, "-m", "gdown", "--fuzzy", u, "-O", str(dst)], check=True)
+                    else:
+                        subprocess.run(["curl", "-fL", "--retry", "4", u, "-o", str(dst)], check=True)
+                if not _is_valid_binary(dst, min_bytes):
+                    raise RuntimeError(f"Downloaded file invalid or too small: {{dst}}")
+                return dst
+
+            def _unpack_to_dir(arc: Path, dest_dir: Path) -> None:
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                if zipfile.is_zipfile(arc):
+                    subprocess.run(["unzip", "-q", "-o", str(arc), "-d", str(dest_dir)], check=True)
+                elif arc.name.lower().endswith(".tar"):
+                    subprocess.run(["tar", "-xf", str(arc), "-C", str(dest_dir)], check=True)
+                elif shutil.which("pigz"):
+                    subprocess.run(["tar", "-I", "pigz", "-xf", str(arc), "-C", str(dest_dir)], check=True)
+                else:
+                    subprocess.run(["tar", "-xzf", str(arc), "-C", str(dest_dir)], check=True)
+
+            DATASET_PATHS = {{}}
 
             if RUN_CRISISMMD:
                 LOCAL_CANDS = [Path("/content/crisismmd_p1_p4_contracts.zip"), Path("/content/JCMIL_A2Z_INPUTS.zip"), Path("/content/crisismmd_contracts_dl.zip")]
@@ -195,15 +241,11 @@ def build() -> None:
                     if cand.is_file() and not zipfile.is_zipfile(cand):
                         cand.unlink()
                 CONTRACTS_ZIP = next((p for p in LOCAL_CANDS if p.is_file() and zipfile.is_zipfile(p)), None)
-                if CONTRACTS_ZIP is None and MOUNT_DRIVE and Path("/content/drive/MyDrive").exists():
-                    drive_cands = [Path(str(DRIVE_CONTRACTS_PATH).strip())] if str(DRIVE_CONTRACTS_PATH).strip() else []
-                    drive_cands.extend([Path("/content/drive/MyDrive/jcmil_benchmark_v1/JCMIL_A2Z_INPUTS.zip"), Path("/content/drive/MyDrive/crisismmd_p1_p4_contracts.zip")])
-                    CONTRACTS_ZIP = next((p for p in drive_cands if p.is_file() and zipfile.is_zipfile(p)), None)
                 if CONTRACTS_ZIP is None and str(A2Z_INPUTS_URL).strip():
-                    CONTRACTS_ZIP = _fetch_url_or_drive(str(A2Z_INPUTS_URL), Path("/content/crisismmd_contracts_dl.zip"), min_bytes=1024)
+                    CONTRACTS_ZIP = _download_archive_aria2(str(A2Z_INPUTS_URL), Path("/content/crisismmd_contracts_dl.zip"), min_bytes=1024)
                 if CONTRACTS_ZIP is None:
                     if colab_files is None:
-                        raise RuntimeError("No contract ZIP found; provide A2Z_INPUTS_URL or upload crisismmd_p1_p4_contracts.zip.")
+                        raise RuntimeError("Provide A2Z_INPUTS_URL or local /content/crisismmd_p1_p4_contracts.zip.")
                     print("Upload crisismmd_p1_p4_contracts.zip (~5.8 MB):")
                     up = colab_files.upload()
                     nm, blob = next(iter(up.items()))
@@ -216,34 +258,18 @@ def build() -> None:
                     IMG_DIR = IMG_DIR / "CrisisMMD_v2.0"
                 req_set = {{r["image"] for sp in ("train", "dev") for r in manifest["rows"][sp]}}
                 if any(not (IMG_DIR / p).is_file() for p in req_set):
-                    arc_cands = [Path(str(DRIVE_IMAGES_PATH).strip())] if str(DRIVE_IMAGES_PATH).strip() else []
-                    arc_cands.extend([Path("/content/crisismmd_v2.tar"), Path("/content/CrisisMMD_v2.0.tar.gz"), Path("/content/CrisisMMD_v2.0.zip")])
-                    if str(DRIVE_DATASET_DIR).strip():
-                        ds_drv = Path(str(DRIVE_DATASET_DIR).strip())
-                        arc_cands.extend([ds_drv / "crisismmd_v2.tar", ds_drv / "CrisisMMD_v2.0.tar.gz"])
-                    if drv_cache is not None:
-                        arc_cands.extend([drv_cache / "crisismmd_v2.tar", drv_cache / "CrisisMMD_v2.0.tar.gz", drv_cache / "CrisisMMD_v2.0.zip"])
-                    if Path("/content/drive/MyDrive").exists():
-                        arc_cands.extend([Path("/content/drive/MyDrive/CrisisMMD_v2.0.tar.gz"), Path("/content/drive/MyDrive/jcmil_benchmark_v1/CrisisMMD_v2.0.tar.gz")])
+                    arc_cands = [Path("/content/crisismmd_v2.tar"), Path("/content/CrisisMMD_v2.0.tar.gz"), Path("/content/CrisisMMD_v2.0.zip")]
                     archive_path = next((p for p in arc_cands if p.is_file() and p.stat().st_size > 100_000_000), None)
-                    if archive_path is None and str(CRISISMMA_TAR_URL).strip():
-                        archive_path = _fetch_url_or_drive(str(CRISISMMA_TAR_URL), Path("/content/crisismmd_archive.dl"), min_bytes=100_000_000)
+                    tar_u = str(CRISISMMA_TAR_URL).strip()
+                    if archive_path is None and tar_u:
+                        archive_path = _download_archive_aria2(tar_u, Path("/content/crisismmd_archive.dl"), min_bytes=100_000_000)
                     if archive_path is None and shutil.which("aria2c"):
                         dl_qcri = Path("/content/crisismmd_qcri.tar.gz")
-                        subprocess.run(["aria2c", "-x16", "-s16", "-k1M", "--connect-timeout=15", "--timeout=30", "--max-tries=2", "--allow-overwrite=true", "https://crisisnlp.qcri.org/data/crisismmd/CrisisMMD_v2.0.tar.gz", "-d", "/content", "-o", dl_qcri.name], check=False)
-                        if dl_qcri.is_file() and dl_qcri.stat().st_size > 100_000_000:
+                        subprocess.run(["aria2c", "-x16", "-s16", "-k4M", "--connect-timeout=15", "--timeout=30", "--max-tries=2", "--allow-overwrite=true", "https://crisisnlp.qcri.org/data/crisismmd/CrisisMMD_v2.0.tar.gz", "-d", "/content", "-o", dl_qcri.name], check=False)
+                        if _is_valid_binary(dl_qcri, 100_000_000):
                             archive_path = dl_qcri
                     if archive_path is not None:
-                        if zipfile.is_zipfile(archive_path):
-                            subprocess.run(["unzip", "-q", "-o", str(archive_path), "-d", str(IMG_DIR)], check=True)
-                        elif archive_path.name.lower().endswith(".tar"):
-                            subprocess.run(["tar", "-xf", str(archive_path), "-C", str(IMG_DIR)], check=True)
-                        elif shutil.which("pigz"):
-                            subprocess.run(["tar", "-I", "pigz", "-xf", str(archive_path), "-C", str(IMG_DIR)], check=True)
-                        else:
-                            subprocess.run(["tar", "-xzf", str(archive_path), "-C", str(IMG_DIR)], check=True)
-                        if drv_cache is not None and CACHE_ARCHIVES_TO_DRIVE and archive_path.parent == Path("/content") and not (drv_cache / "CrisisMMD_v2.0.tar.gz").is_file():
-                            shutil.copy2(archive_path, drv_cache / "CrisisMMD_v2.0.tar.gz")
+                        _unpack_to_dir(archive_path, IMG_DIR)
                         if archive_path.parent == Path("/content"):
                             archive_path.unlink(missing_ok=True)
                         if (IMG_DIR / "CrisisMMD_v2.0" / "data_image").is_dir():
@@ -282,35 +308,34 @@ def build() -> None:
                 DATASET_PATHS["crisismmd"] = (SEQ_DIR, IMG_DIR)
                 print("[READY] crisismmd:", IMG_DIR, flush=True)
 
-            def _resolve_ds_archive(stem: str, custom_url: str, min_bytes: int = 1_000_000) -> Path | None:
-                cands = [Path(f"/content/{{stem}}.tar"), Path(f"/content/{{stem}}.tar.gz"), Path(f"/content/{{stem}}.zip")]
-                if str(DRIVE_DATASET_DIR).strip():
-                    ds_drv = Path(str(DRIVE_DATASET_DIR).strip())
-                    cands.extend([ds_drv / f"{{stem}}.tar", ds_drv / f"{{stem}}.tar.gz", ds_drv / f"{{stem}}.zip"])
-                if drv_cache is not None:
-                    cands.extend([drv_cache / f"{{stem}}.tar", drv_cache / f"{{stem}}.tar.gz", drv_cache / f"{{stem}}.zip"])
-                hit = next((p for p in cands if p.is_file() and p.stat().st_size > min_bytes), None)
-                if hit is not None:
-                    return hit
-                if custom_url.strip():
-                    return _fetch_url_or_drive(custom_url, Path(f"/content/{{stem}}_dl.archive"), min_bytes=min_bytes)
-                return None
+            def _prepare_from_link(stem: str, url_val: str, prep_fn, marker_check) -> Path:
+                ds_dir = DATA_ROOT / stem
+                if marker_check(ds_dir):
+                    print(f"[REUSE] {{stem}} already unpacked at {{ds_dir}}", flush=True)
+                    return ds_dir
+                arc = next((p for p in (Path(f"/content/{{stem}}.tar"), Path(f"/content/{{stem}}.tar.gz"), Path(f"/content/{{stem}}.zip")) if _is_valid_binary(p, 1_000_000)), None)
+                u_str = url_val.strip()
+                if arc is None and not u_str:
+                    u_str = input(f"Paste Google Drive / .tar URL for '{{stem}}' (or press Enter for direct CDN): ").strip()
+                if arc is None and u_str:
+                    arc = _download_archive_aria2(u_str, Path(f"/content/{{stem}}_dl.tar"), min_bytes=1_000_000)
+                out_dir = prep_fn(ds_dir, archive_path=arc)
+                if arc is not None and arc.parent == Path("/content"):
+                    arc.unlink(missing_ok=True)
+                return out_dir
 
             if RUN_DMD:
-                dmd_arc = _resolve_ds_archive("dmd", str(DMD_ARCHIVE_URL))
-                dmd_dir = prepare_dmd(DATA_ROOT / "dmd", archive_path=dmd_arc)
+                dmd_dir = _prepare_from_link("dmd", str(DMD_ARCHIVE_URL), prepare_dmd, lambda d: any(d.rglob("*.txt")) and any(d.rglob("*.jpg")))
                 DATASET_PATHS["dmd"] = (dmd_dir, dmd_dir)
                 print("[READY] dmd:", dmd_dir, flush=True)
 
             if RUN_INCIDENTS_VQA:
-                inc_arc = _resolve_ds_archive("incidents_vqa", str(INCIDENTS_VQA_ARCHIVE_URL))
-                inc_dir = prepare_incidents_vqa(DATA_ROOT / "incidents_vqa", archive_path=inc_arc)
+                inc_dir = _prepare_from_link("incidents_vqa", str(INCIDENTS_VQA_ARCHIVE_URL), prepare_incidents_vqa, lambda d: any(d.rglob("disastervqa_annotations.jsonl")) and any(d.rglob("*.jpg")))
                 DATASET_PATHS["incidents_vqa"] = (inc_dir, inc_dir)
                 print("[READY] incidents_vqa:", inc_dir, flush=True)
 
             if RUN_DISASTER_M3:
-                m3_arc = _resolve_ds_archive("disaster_m3", str(DISASTER_M3_ARCHIVE_URL))
-                m3_dir = prepare_disaster_m3(DATA_ROOT / "disaster_m3", archive_path=m3_arc)
+                m3_dir = _prepare_from_link("disaster_m3", str(DISASTER_M3_ARCHIVE_URL), prepare_disaster_m3, lambda d: any(d.rglob("benchmark_release.json")) and any(d.rglob("*.png")))
                 DATASET_PATHS["disaster_m3"] = (m3_dir, m3_dir)
                 print("[READY] disaster_m3:", m3_dir, flush=True)
             """,
@@ -395,11 +420,6 @@ def build() -> None:
                     if fp.is_file():
                         zout.write(fp, fp.relative_to(OUT_DIR).as_posix())
             print("[PACKAGED]", RES_ZIP, RES_ZIP.stat().st_size, "bytes")
-            if MOUNT_DRIVE and Path("/content/drive/MyDrive").exists() and str(DRIVE_SAVE_DIR).strip():
-                drv_out = Path(str(DRIVE_SAVE_DIR).strip())
-                drv_out.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(RES_ZIP, drv_out / RES_ZIP.name)
-                print("[DRIVE BACKUP]", drv_out / RES_ZIP.name, flush=True)
             if AUTO_DOWNLOAD and colab_files is not None:
                 colab_files.download(str(RES_ZIP))
             """,
