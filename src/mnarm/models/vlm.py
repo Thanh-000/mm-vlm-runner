@@ -45,9 +45,9 @@ def tower_digest(tower: str, kind: str, payload: dict[str, torch.Tensor]) -> str
     hasher = hashlib.blake2b(digest_size=16)
     hasher.update(f"{kind}:{tower}:".encode("ascii"))
     for key in keys:
-        t_flat = payload[key].detach().cpu().to(torch.float32).contiguous().clone()
+        t_flat = payload[key].detach().cpu().to(torch.float32).contiguous()
         hasher.update(key.encode("utf8"))
-        hasher.update(bytes(t_flat.untyped_storage())[: t_flat.numel() * 4])
+        hasher.update(t_flat.numpy().tobytes())
     return f"{kind}:{hasher.hexdigest()}"
 
 

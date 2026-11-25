@@ -85,3 +85,20 @@ def test_lmnar_zero_gradient_on_unsupported_classes() -> None:
     loss_both = compute_multimodal_lmnar_loss({"text": ft, "image": fi}, protos, 20.0, y_late, seen, graph)
     loss_both.backward()
     assert torch.isfinite(loss_both)
+
+    # Full conditional priors P_train(y | M=tw) must sum to 1.0 on supported classes, 0.0 on unsupported, even under 10:1 imbalance
+    imb_recs = (
+        [_rec(f"e0_{i}", 0, ["image"]) for i in range(5)]
+        + [_rec(f"e1_{i}", 1, ["image"]) for i in range(5)]
+        + [_rec(f"l2_{i}", 2, ["text", "image"]) for i in range(20)]
+        + [_rec(f"l3_{i}", 3, ["text", "image"]) for i in range(2)]
+    )
+    g_imb = analyze_co_observation_graph(imb_recs, seen)
+    tp_txt = g_imb["tower_priors"]["text"]
+    assert tp_txt[0] == 0.0 and tp_txt[1] == 0.0
+    assert abs(sum(tp_txt[c] for c in (2, 3)) - 1.0) < 1e-6
+    assert abs(tp_txt[2] - (20.0 / 22.0)) < 1e-6
+    protos.grad.zero_()
+    compute_multimodal_lmnar_loss({"text": ft}, protos, 20.0, y_late, seen, g_imb).backward()
+    assert float(protos.grad[[0, 1]].abs().max().item()) == 0.0
+

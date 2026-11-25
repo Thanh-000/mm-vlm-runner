@@ -20,7 +20,18 @@ from mnarm.runners.stage_ops import (
     train_lora_stage,
 )
 
-BRIDGE_MODES = ("prompt_bridge", "cross_modal_transport", "hybrid_bridge", "none_zero_shot")
+PILOT_V2_LMNAR_SPECS = (
+    ("cross_modal_transport", "spectral_floor", "bayes_cm_sfloor_0lab"),
+    ("hybrid_bridge", "spectral_floor", "bayes_hybrid_sfloor_0lab"),
+    ("cross_modal_transport", "isotropic_vmf", "bayes_cm_vmf_0lab"),
+    ("hybrid_bridge", "isotropic_vmf", "bayes_hybrid_vmf_0lab"),
+    ("prompt_bridge", "isotropic_vmf", "bayes_prompt_vmf_0lab"),
+    ("none_zero_shot", "isotropic_vmf", "bayes_none_vmf_0lab"),
+)
+PILOT_V2_STDCE_SPECS = (
+    ("cross_modal_transport", "spectral_floor", "bayes_cm_sfloor_0lab"),
+    ("cross_modal_transport", "isotropic_vmf", "bayes_cm_vmf_0lab"),
+)
 
 
 def _evaluate_arm(
@@ -87,10 +98,10 @@ def _evaluate_arm(
             seen_classes=seen_classes, probe_y_t=f4_arm["text_y"], probe_y_i=f4_arm["image_y"],
         )
 
-    modes = BRIDGE_MODES if objective == "l_mnar" else ("hybrid_bridge",)
-    for bmode in modes:
-        with profiler.track(f"fit_bayes:{arm_name}:{bmode}"):
-            head = SelfNormalizedBayesTransportHead(bridge_mode=bmode, shrinkage=shrinkage)
+    specs = PILOT_V2_LMNAR_SPECS if objective == "l_mnar" else PILOT_V2_STDCE_SPECS
+    for bmode, pcmode, vkey in specs:
+        with profiler.track(f"fit_bayes:{arm_name}:{vkey}"):
+            head = SelfNormalizedBayesTransportHead(bridge_mode=bmode, partial_cov_mode=pcmode, shrinkage=shrinkage)
             if tf is not None:
                 head.fit(
                     train_feats_t=tf["text_x"], train_y_t=tf["text_y"],
@@ -106,7 +117,6 @@ def _evaluate_arm(
                     protos_full=protos_full, seen_classes=seen_classes, fallback_scale=vlm.logit_scale,
                 )
         blogits = head.predict_views(dev_t, dev_i)
-        vkey = f"bayes_{bmode}_0lab"
         variants[vkey] = {**eval_view_suite(blogits, dev_y, seen_classes, early_classes, late_classes), "diagnostics": head.diagnostics}
         logits_for_boot[vkey] = blogits["paired"]
 
@@ -272,17 +282,18 @@ def run_pilot_f1(config: dict[str, Any], seq_inputs: Path, images_dir: Path, out
         if not aname.startswith("l_mnar"):
             continue
         for vname, vrec in arec["variants"].items():
-            if not vname.startswith("bayes_") or "none_zero_shot" in vname:
+            if not vname.startswith("bayes_") or "bayes_none_" in vname:
                 continue
             p_f1 = vrec["paired"]["macro_f1"]
             if p_f1 > best_p:
                 best_arm, best_var, best_p, best_3m = aname, vname, p_f1, vrec["summary"]["view3_mean_f1"]
         suffix = aname.replace("l_mnar_", "")
         ref_key = f"std_ce_{suffix}:raw_proto"
-        if ref_key in boot_logits and f"{aname}:bayes_hybrid_bridge_0lab" in boot_logits:
-            boot_vs_ce[f"{aname}:bayes_hybrid_bridge_0lab_vs_{suffix}_raw"] = paired_bootstrap_diff(
-                boot_logits[f"{aname}:bayes_hybrid_bridge_0lab"], boot_logits[ref_key], dev_y, seen, seed=seed
-            )
+        for btag in ("bayes_cm_sfloor_0lab", "bayes_cm_vmf_0lab"):
+            if ref_key in boot_logits and f"{aname}:{btag}" in boot_logits:
+                boot_vs_ce[f"{aname}:{btag}_vs_{suffix}_raw"] = paired_bootstrap_diff(
+                    boot_logits[f"{aname}:{btag}"], boot_logits[ref_key], dev_y, seen, seed=seed
+                )
 
     max_th = max(arms_out["l_mnar_seq_replay"]["cone_drift"]["text"]["theta_deg"], arms_out["l_mnar_joint"]["cone_drift"]["text"]["theta_deg"])
     gates = config["gates"]

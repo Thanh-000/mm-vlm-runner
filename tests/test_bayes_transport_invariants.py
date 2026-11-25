@@ -138,3 +138,61 @@ def test_streaming_bank_sufficient_stats_transport() -> None:
     ev_bank = eval_view_suite(head_bank.predict_views(d["dev_t"], d["dev_i"]), d["dev_y"], d["classes"], [0, 1, 2], [3, 4, 5])
     assert ev_bank["paired"]["macro_f1"] > 0.85
     assert ev_bank["text"]["macro_f1"] > 0.70
+
+
+def test_nullspace_pathology_protection_under_low_shrinkage() -> None:
+    """Protect early missing classes from precision-nullspace bias explosion when rho < 0.05."""
+    g = torch.Generator().manual_seed(41)
+    dim = 512
+    classes = list(range(8))
+    early, late = [0, 1, 4, 5], [2, 3, 6, 7]
+    p_sem = torch.cat([F.normalize(torch.randn(8, 38, generator=g), dim=-1), torch.zeros(8, dim - 40)], dim=-1)
+    sem_full = torch.cat([torch.zeros(8, 2), p_sem], dim=-1)
+    mu_p = torch.zeros(dim); mu_p[0] = 1.0
+    mu_t = torch.zeros(dim); mu_t[1] = 1.0
+    protos = F.normalize(0.86 * mu_p.unsqueeze(0) + 0.51 * sem_full, dim=-1)
+
+    null_dirs = torch.eye(dim)[440:504]
+    q_gap = _pos_qr(torch.eye(dim) + 0.012 * torch.randn(dim, dim, generator=g))
+    early_drift = {c: F.normalize(null_dirs[i * 8 : (i + 1) * 8].sum(dim=0), dim=-1) for i, c in enumerate(early)}
+
+    def _sample(cls_list: list[int], n_per: int, mode: str):
+        xs, ys = [], []
+        for c in cls_list:
+            sem_vec = q_gap @ sem_full[c] if mode == "image" else sem_full[c]
+            if mode == "image" and c in early:
+                sem_vec = F.normalize(sem_vec + 0.35 * early_drift[c], dim=-1)
+            center = F.normalize(0.86 * mu_t + 0.51 * sem_vec, dim=-1)
+            if mode == "text":
+                z = torch.zeros(n_per, dim)
+                z[:, 2:40] = 0.08 * torch.randn(n_per, 38, generator=g)
+                z[:, 40:440] = 0.008 * torch.randn(n_per, 400, generator=g)
+            else:
+                z = 0.06 * torch.randn(n_per, dim, generator=g)
+            xs.append(l2_normalize(center.unsqueeze(0) + z))
+            ys.append(torch.full((n_per,), c, dtype=torch.long))
+        return torch.cat(xs, dim=0), torch.cat(ys, dim=0)
+
+    tr_ix, tr_iy = _sample(classes, 300, "image")
+    tr_tx, tr_ty = _sample(late, 300, "text")
+    late_mask = (tr_iy == 2) | (tr_iy == 3) | (tr_iy == 6) | (tr_iy == 7)
+    paired_i, paired_t = tr_ix[late_mask], tr_tx
+    dev_ix, dev_y = _sample(classes, 40, "image")
+    dev_tx, _ = _sample(classes, 40, "text")
+
+    raw_head = SelfNormalizedBayesTransportHead(bridge_mode="cross_modal_transport", partial_cov_mode="raw_oas").fit(
+        tr_tx, tr_ty, tr_ix, tr_iy, paired_t, paired_i, protos, classes
+    )
+    assert raw_head.diagnostics["towers"]["text"]["rho"] < 0.05
+    ev_raw = eval_view_suite(raw_head.predict_views(dev_tx, dev_ix), dev_y, classes, early, late)
+    assert ev_raw["text"]["early_recall"] < 0.25
+
+    for safe_mode in ("spectral_floor", "isotropic_vmf"):
+        safe_head = SelfNormalizedBayesTransportHead(bridge_mode="cross_modal_transport", partial_cov_mode=safe_mode).fit(
+            tr_tx, tr_ty, tr_ix, tr_iy, paired_t, paired_i, protos, classes
+        )
+        ev_safe = eval_view_suite(safe_head.predict_views(dev_tx, dev_ix), dev_y, classes, early, late)
+        assert ev_safe["text"]["early_recall"] > 0.70, f"{safe_mode} text early_recall={ev_safe['text']['early_recall']}"
+        assert ev_safe["paired"]["early_recall"] > 0.80, f"{safe_mode} paired early_recall={ev_safe['paired']['early_recall']}"
+        assert ev_safe["paired"]["macro_f1"] > 0.85, f"{safe_mode} paired macro_f1={ev_safe['paired']['macro_f1']}"
+

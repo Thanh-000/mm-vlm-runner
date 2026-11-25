@@ -71,6 +71,14 @@ def analyze_co_observation_graph(records: list[dict[str, Any]], seen_classes: li
         }
         for tw in ("text", "image")
     }
+    tower_totals = {tw: sum(tower_cls_counts[tw].values()) for tw in ("text", "image")}
+    tower_priors = {
+        tw: {
+            c: (float(tower_cls_counts[tw].get(c, 0)) / float(tower_totals[tw]) if tower_totals[tw] > 0 else 0.0)
+            for c in seen
+        }
+        for tw in ("text", "image")
+    }
     has_zero_support = any(
         tower_cls_counts[tw].get(c, 0) == 0 for tw in ("text", "image") for c in seen
     )
@@ -79,6 +87,7 @@ def analyze_co_observation_graph(records: list[dict[str, Any]], seen_classes: li
         "mask_supports": mask_supports,
         "tower_supports": tower_supports,
         "tower_propensities": tower_propensities,
+        "tower_priors": tower_priors,
         "components": components,
         "num_components": len(components),
         "has_zero_support_mnar": has_zero_support,
@@ -138,7 +147,7 @@ def compute_multimodal_lmnar_loss(
             labels_global=labels_global,
             seen_classes=seen,
             supported_classes=graph_info["tower_supports"][tw],
-            propensities=graph_info["tower_propensities"][tw],
+            propensities=graph_info.get("tower_priors", graph_info["tower_propensities"])[tw],
         )
         losses.append(loss_tw)
     if not losses:
