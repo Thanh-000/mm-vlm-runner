@@ -1,5 +1,6 @@
 """Authorized dataset loaders, strict split-overlap guards, and tensor stores."""
 
+from mnarm.data.archive_ops import extract_archive_safe, hf_lfs_batch_download
 from mnarm.data.crisismmd import (
     CRISISMMD_CLASSES,
     ORIGINAL_PROMPTS,
@@ -26,7 +27,9 @@ __all__ = [
     "UNSEEN_PROMPTS",
     "assert_zero_split_overlap",
     "build_p1_p4_contracts",
+    "extract_archive_safe",
     "extract_contracts_from_a2z_zip",
+    "hf_lfs_batch_download",
     "load_benchmark_contracts",
     "load_crisismmd_contracts",
     "prepare_disaster_m3",

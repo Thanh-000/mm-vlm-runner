@@ -185,3 +185,65 @@ def test_b3_multi_altitude_disaster_suite_contracts_and_isolation(tmp_path: Path
         assert "DISASTER:" not in rec["text"] and "earthquake" not in rec["text"].lower()
     # Optical and SAR pairs sharing a pre_image_path never span splits
     assert_zero_split_overlap({"train": [{"uid": r["uid"], "image": str(ds_m3_p4["lookup"][r["uid"]]["image"])} for st in ds_m3_p4["stages"] for r in st["fit"]], "dev": [{"uid": r["uid"], "image": str(ds_m3_p4["lookup"][r["uid"]]["image"])} for r in ds_m3_p4["dev"]]})
+
+
+def test_tar_archive_unpacking_traversal_guard_and_wrapper_unwrap(tmp_path: Path) -> None:
+    import io
+    import tarfile
+    import pytest
+    from mnarm.data import extract_archive_safe, prepare_disaster_m3, prepare_dmd, prepare_incidents_vqa
+
+    # 1. Verify path traversal rejection
+    bad_tar = tmp_path / "evil.tar"
+    with tarfile.open(bad_tar, "w") as tf:
+        ti = tarfile.TarInfo("../escape.txt")
+        ti.size = 3
+        tf.addfile(ti, io.BytesIO(b"bad"))
+    with pytest.raises(ValueError):
+        extract_archive_safe(bad_tar, tmp_path / "out_bad")
+
+    # 2. Pack DMD, nested DisasterVQA-Dataset-v3 (with CrisisMMD/MEDIC to strip), and DisasterM3 into .tar
+    dmd_tar = tmp_path / "dmd.tar"
+    with tarfile.open(dmd_tar, "w") as tf:
+        for cls_dir in ("fires", "floods", "natural_landscape", "infrastructural", "human_damage", "non_damage"):
+            for i in range(6):
+                img_f = tmp_path / "src_dmd" / cls_dir / f"{cls_dir}_{i}.jpg"
+                _write_rgb(img_f, (25 * i, 50, 90))
+                txt_f = img_f.with_suffix(".txt")
+                txt_f.write_text(f"DMD tar sample {cls_dir} idx {i}", encoding="utf8")
+                tf.add(img_f, arcname=f"{cls_dir}/{img_f.name}")
+                tf.add(txt_f, arcname=f"{cls_dir}/{txt_f.name}")
+    dmd_unpacked = prepare_dmd(tmp_path / "dmd_ext", archive_path=dmd_tar)
+    assert load_benchmark_contracts("dmd", dmd_unpacked, dmd_unpacked, "P4", allow_test=False)["num_classes"] == 6
+
+    vqa_src = tmp_path / "src_vqa" / "DisasterVQA-Dataset-v3"
+    ann_rows = []
+    for c_i, dt in enumerate(("earthquake", "fire", "accidents", "flood", "storm", "other")):
+        for i in range(6):
+            iid = f"tar_inc_{c_i}_{i}"
+            rel = f"DisasterVQA/Incidents1M/{iid}.jpg"
+            _write_rgb(vqa_src / rel, (40, 20 * c_i, 15 * i))
+            ann_rows.append({"dataset_source": "incidents1m", "image_id": iid, "image_path": rel, "disaster_type": dt, "crisis_info_code": "SA-2", "question": f"Debris visible in zone {c_i}_{i}?", "groundtruth_answer": ["Yes"], "choices": None})
+    _write_rgb(vqa_src / "DisasterVQA/CrisisMMD/drop_me.jpg", (1, 1, 1))
+    (vqa_src / "disastervqa_annotations.jsonl").write_text("\n".join(json.dumps(r) for r in ann_rows), encoding="utf8")
+    vqa_tar = tmp_path / "incidents_vqa.tar"
+    with tarfile.open(vqa_tar, "w") as tf:
+        tf.add(vqa_src, arcname="DisasterVQA-Dataset-v3")
+    vqa_unpacked = prepare_incidents_vqa(tmp_path / "vqa_ext", archive_path=vqa_tar)
+    assert not (vqa_unpacked / "DisasterVQA-Dataset-v3/DisasterVQA/CrisisMMD").exists()
+    assert load_benchmark_contracts("incidents_vqa", vqa_unpacked, vqa_unpacked, "P4", allow_test=False)["num_classes"] == 6
+
+    m3_src = tmp_path / "src_m3" / "DisasterM3_Bench"
+    m3_rows = []
+    for c_i, haz in enumerate(("earthquake", "wildfire", "tornado", "hurricane", "flood", "tsunami", "explosion", "volcano")):
+        for g_i in range(4):
+            rel = f"test_images/{haz}_{g_i}.png"
+            _write_rgb(m3_src / rel, (12 * c_i, 25 * g_i, 60))
+            m3_rows.append({"pre_image_path": f"{haz}_{g_i}_pre.png", "post_image_path": rel, "task": "Disaster Report", "ground_truth": f"DISASTER: {haz}\nDAMAGE: Sector {c_i}_{g_i}."})
+    m3_src.mkdir(parents=True, exist_ok=True)
+    (m3_src / "benchmark_release.json").write_text(json.dumps(m3_rows), encoding="utf8")
+    m3_tar = tmp_path / "disaster_m3.tar"
+    with tarfile.open(m3_tar, "w") as tf:
+        tf.add(m3_src, arcname="DisasterM3_Bench")
+    m3_unpacked = prepare_disaster_m3(tmp_path / "m3_ext", archive_path=m3_tar)
+    assert load_benchmark_contracts("disaster_m3", m3_unpacked, m3_unpacked, "P4", allow_test=False)["num_classes"] == 8

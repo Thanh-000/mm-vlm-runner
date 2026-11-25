@@ -3,16 +3,13 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import subprocess
-import urllib.parse
-import urllib.request
-import zipfile
 from pathlib import Path
 from typing import Any
 
+from mnarm.data.archive_ops import extract_archive_safe, hf_lfs_batch_download
 from mnarm.data.crisismmd import load_crisismmd_contracts
 from mnarm.data.protocol_builder import build_p1_p4_contracts
 
@@ -100,71 +97,44 @@ _M3_MASK_RE = re.compile(
 )
 
 
-def _aria2_batch(url_dst_pairs: list[tuple[str, Path]], manifest_path: Path, hf_auth: bool = False) -> None:
-    missing = [(u, d) for u, d in url_dst_pairs if not d.is_file()]
-    if not missing:
-        return
-    tok = os.environ.get("HF_TOKEN", "").strip() if hf_auth else ""
-    if shutil.which("aria2c"):
-        lines: list[str] = []
-        for url, dst in missing:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            lines.extend([url, f"  dir={dst.parent}", f"  out={dst.name}"])
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_path.write_text("\n".join(lines) + "\n", encoding="utf8")
-        cmd = ["aria2c", f"--input-file={manifest_path}", "-j", "16", "-x", "4", "-s", "4", "--retry-wait=4", "--max-tries=6", "--auto-file-renaming=false", "--allow-overwrite=true", "--console-log-level=warn"]
-        if tok:
-            cmd.append(f"--header=Authorization: Bearer {tok}")
-        subprocess.run(cmd, check=False)
-        manifest_path.unlink(missing_ok=True)
-    for url, dst in missing:
-        if dst.is_file():
-            continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        hdrs = {"User-Agent": "Mozilla/5.0"}
-        if tok:
-            hdrs["Authorization"] = f"Bearer {tok}"
-        with urllib.request.urlopen(urllib.request.Request(url, headers=hdrs), timeout=30) as r:
-            dst.write_bytes(r.read())
-
-
 def prepare_dmd(dest_dir: Path, archive_path: Path | None = None) -> Path:
-    """Download/unpack official UCI #456 DMD multimodal archive into dest_dir."""
+    """Download/unpack official UCI #456 DMD (.tar/.tar.gz/.zip) into dest_dir."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     if any(dest_dir.rglob("*.txt")) and any(dest_dir.rglob("*.jpg")):
         return dest_dir
     arc = archive_path
     if arc is None:
         arc = dest_dir / "dmd_uci_456.zip"
-        _aria2_batch([(DMD_UCI_URL, arc)], dest_dir / "dmd_aria2.txt")
-    if zipfile.is_zipfile(arc):
-        with zipfile.ZipFile(arc) as zf:
-            for member in zf.infolist():
-                if not member.is_dir():
-                    target = (dest_dir / Path(member.filename)).resolve()
-                    if str(target).startswith(str(dest_dir.resolve())):
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        target.write_bytes(zf.read(member))
+        if shutil.which("curl"):
+            subprocess.run(["curl", "-fL", "--retry", "4", DMD_UCI_URL, "-o", str(arc)], check=True)
+        else:
+            import urllib.request
+            with urllib.request.urlopen(urllib.request.Request(DMD_UCI_URL, headers={"User-Agent": "Mozilla/5.0"}), timeout=120) as r:
+                arc.write_bytes(r.read())
+    extract_archive_safe(arc, dest_dir)
     for sub_zip in list(dest_dir.rglob("*.zip")):
-        if sub_zip.resolve() == arc.resolve():
-            continue
-        with zipfile.ZipFile(sub_zip) as zf:
-            for member in zf.infolist():
-                if not member.is_dir():
-                    target = (dest_dir / Path(member.filename)).resolve()
-                    if str(target).startswith(str(dest_dir.resolve())):
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        target.write_bytes(zf.read(member))
+        if sub_zip.resolve() != arc.resolve():
+            extract_archive_safe(sub_zip, dest_dir)
     return dest_dir
 
 
-def prepare_incidents_vqa(dest_dir: Path) -> Path:
-    """Fetch 0%-overlapping QCRI/DisasterVQA incidents1m subset (annotations + 377 images)."""
+def prepare_incidents_vqa(dest_dir: Path, archive_path: Path | None = None) -> Path:
+    """Unpack (.tar/.zip) or fetch 0%-overlapping QCRI/DisasterVQA incidents1m subset."""
     dest_dir.mkdir(parents=True, exist_ok=True)
+    if archive_path is not None and archive_path.is_file():
+        extract_archive_safe(archive_path, dest_dir)
+        ann_hits = list(dest_dir.rglob("disastervqa_annotations.jsonl"))
+        if ann_hits:
+            vqa_root = ann_hits[0].parent
+            for drop_name in ("CrisisMMD", "MEDIC"):
+                for sub_d in (vqa_root / "DisasterVQA" / drop_name, dest_dir / "DisasterVQA" / drop_name):
+                    if sub_d.is_dir():
+                        shutil.rmtree(sub_d, ignore_errors=True)
+        return dest_dir
+
     ann_p = dest_dir / "disastervqa_annotations.jsonl"
-    base_url = f"https://huggingface.co/datasets/QCRI/DisasterVQA/resolve/{INCIDENTS_HF_SHA}"
-    _aria2_batch([(f"{base_url}/disastervqa_annotations.jsonl", ann_p)], dest_dir / "vqa_ann_aria2.txt", hf_auth=True)
-    pairs: list[tuple[str, Path]] = []
+    hf_lfs_batch_download("QCRI/DisasterVQA", INCIDENTS_HF_SHA, ["disastervqa_annotations.jsonl"], dest_dir)
+    img_rels: list[str] = []
     seen_imgs: set[str] = set()
     for ln in ann_p.read_text(encoding="utf8").splitlines():
         if not ln.strip():
@@ -172,31 +142,35 @@ def prepare_incidents_vqa(dest_dir: Path) -> Path:
         row = json.loads(ln)
         if row.get("dataset_source") != "incidents1m":
             continue
-        rel = str(row["image_path"]).replace("\\", "/")
+        rel = str(row["image_path"]).replace("\\", "/").lstrip("/")
         if rel not in seen_imgs:
             seen_imgs.add(rel)
-            pairs.append((f"{base_url}/{urllib.parse.quote(rel, safe='/')}", dest_dir / rel))
-    _aria2_batch(pairs, dest_dir / "vqa_imgs_aria2.txt", hf_auth=True)
+            img_rels.append(rel)
+    hf_lfs_batch_download("QCRI/DisasterVQA", INCIDENTS_HF_SHA, img_rels, dest_dir)
     return dest_dir
 
 
-def prepare_disaster_m3(dest_dir: Path) -> Path:
-    """Fetch NeurIPS'25 DisasterM3 Optical+SAR tiles + benchmark_release.json."""
+def prepare_disaster_m3(dest_dir: Path, archive_path: Path | None = None) -> Path:
+    """Unpack (.tar/.zip) or fetch NeurIPS'25 DisasterM3 Optical+SAR tiles via LFS Batch CDN."""
     dest_dir.mkdir(parents=True, exist_ok=True)
-    bench_p = dest_dir / "DisasterM3_Bench" / "benchmark_release.json"
-    base_url = f"https://huggingface.co/datasets/Kingdrone-Junjue/DisasterM3/resolve/{DISASTER_M3_HF_SHA}/DisasterM3_Bench"
-    _aria2_batch([(f"{base_url}/benchmark_release.json", bench_p)], dest_dir / "m3_json_aria2.txt", hf_auth=True)
-    rows = json.loads(bench_p.read_text(encoding="utf8"))
-    pairs: list[tuple[str, Path]] = []
+    if archive_path is not None and archive_path.is_file():
+        extract_archive_safe(archive_path, dest_dir)
+        return dest_dir
+
+    bench_rel = "DisasterM3_Bench/benchmark_release.json"
+    hf_lfs_batch_download("Kingdrone-Junjue/DisasterM3", DISASTER_M3_HF_SHA, [bench_rel], dest_dir)
+    rows = json.loads((dest_dir / bench_rel).read_text(encoding="utf8"))
+    img_rels: list[str] = []
     seen: set[str] = set()
     for row in rows:
         if row.get("task") != "Disaster Report":
             continue
         rel = str(row.get("post_image_path", "")).replace("\\", "/").lstrip("/")
-        if rel and rel not in seen:
-            seen.add(rel)
-            pairs.append((f"{base_url}/{urllib.parse.quote(rel, safe='/')}", dest_dir / "DisasterM3_Bench" / rel))
-    _aria2_batch(pairs, dest_dir / "m3_imgs_aria2.txt", hf_auth=True)
+        full_rel = f"DisasterM3_Bench/{rel}"
+        if rel and full_rel not in seen:
+            seen.add(full_rel)
+            img_rels.append(full_rel)
+    hf_lfs_batch_download("Kingdrone-Junjue/DisasterM3", DISASTER_M3_HF_SHA, img_rels, dest_dir)
     return dest_dir
 
 
@@ -219,6 +193,12 @@ def _scan_dmd_records(root: Path) -> list[dict[str, Any]]:
 
 def _scan_incidents_vqa_records(root: Path) -> list[dict[str, Any]]:
     ann_p = root / "disastervqa_annotations.jsonl"
+    if not ann_p.is_file():
+        ann_hits = sorted(root.rglob("disastervqa_annotations.jsonl"))
+        if not ann_hits:
+            raise FileNotFoundError(f"disastervqa_annotations.jsonl not found under {root}")
+        ann_p = ann_hits[0]
+    base_dir = ann_p.parent
     grouped: dict[str, list[dict[str, Any]]] = {}
     for ln in ann_p.read_text(encoding="utf8").splitlines():
         if not ln.strip():
@@ -232,7 +212,7 @@ def _scan_incidents_vqa_records(root: Path) -> list[dict[str, Any]]:
         dtype = str(rows[0].get("disaster_type", "")).strip().lower()
         if dtype not in _INC_MAP:
             continue
-        img_p = root / str(rows[0]["image_path"]).replace("\\", "/")
+        img_p = base_dir / str(rows[0]["image_path"]).replace("\\", "/").lstrip("/")
         if not img_p.is_file():
             continue
         qa_parts = []
@@ -252,6 +232,11 @@ def _scan_disaster_m3_records(root: Path) -> list[dict[str, Any]]:
     bench_p = root / "DisasterM3_Bench" / "benchmark_release.json"
     if not bench_p.is_file():
         bench_p = root / "benchmark_release.json"
+    if not bench_p.is_file():
+        hits = sorted(root.rglob("benchmark_release.json"))
+        if not hits:
+            raise FileNotFoundError(f"benchmark_release.json not found under {root}")
+        bench_p = hits[0]
     rows = json.loads(bench_p.read_text(encoding="utf8"))
     advice_by_img = {
         str(r.get("post_image_path", "")).replace("\\", "/"): str(r.get("ground_truth", ""))

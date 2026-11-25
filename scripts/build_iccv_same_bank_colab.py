@@ -75,10 +75,13 @@ def build() -> None:
             CACHE_ARCHIVES_TO_DRIVE = False  # @param {type:"boolean"}
             DRIVE_CONTRACTS_PATH = ""  # @param {type:"string"}
             DRIVE_IMAGES_PATH = ""  # @param {type:"string"}
+            DRIVE_DATASET_DIR = "/content/drive/MyDrive/mnarm_iccv_datasets"  # @param {type:"string"}
             DRIVE_SAVE_DIR = "/content/drive/MyDrive/mnarm_iccv_outputs"  # @param {type:"string"}
             A2Z_INPUTS_URL = ""  # @param {type:"string"}
             CRISISMMA_TAR_URL = ""  # @param {type:"string"}
-            DMD_ZIP_URL = ""  # @param {type:"string"}
+            DMD_ARCHIVE_URL = ""  # @param {type:"string"}
+            INCIDENTS_VQA_ARCHIVE_URL = ""  # @param {type:"string"}
+            DISASTER_M3_ARCHIVE_URL = ""  # @param {type:"string"}
             AUTO_DOWNLOAD = True  # @param {type:"boolean"}
             """,
             cid="iccv-cell-1",
@@ -214,9 +217,12 @@ def build() -> None:
                 req_set = {{r["image"] for sp in ("train", "dev") for r in manifest["rows"][sp]}}
                 if any(not (IMG_DIR / p).is_file() for p in req_set):
                     arc_cands = [Path(str(DRIVE_IMAGES_PATH).strip())] if str(DRIVE_IMAGES_PATH).strip() else []
-                    arc_cands.extend([Path("/content/CrisisMMD_v2.0.tar.gz"), Path("/content/CrisisMMD_v2.0.zip")])
+                    arc_cands.extend([Path("/content/crisismmd_v2.tar"), Path("/content/CrisisMMD_v2.0.tar.gz"), Path("/content/CrisisMMD_v2.0.zip")])
+                    if str(DRIVE_DATASET_DIR).strip():
+                        ds_drv = Path(str(DRIVE_DATASET_DIR).strip())
+                        arc_cands.extend([ds_drv / "crisismmd_v2.tar", ds_drv / "CrisisMMD_v2.0.tar.gz"])
                     if drv_cache is not None:
-                        arc_cands.extend([drv_cache / "CrisisMMD_v2.0.tar.gz", drv_cache / "CrisisMMD_v2.0.zip"])
+                        arc_cands.extend([drv_cache / "crisismmd_v2.tar", drv_cache / "CrisisMMD_v2.0.tar.gz", drv_cache / "CrisisMMD_v2.0.zip"])
                     if Path("/content/drive/MyDrive").exists():
                         arc_cands.extend([Path("/content/drive/MyDrive/CrisisMMD_v2.0.tar.gz"), Path("/content/drive/MyDrive/jcmil_benchmark_v1/CrisisMMD_v2.0.tar.gz")])
                     archive_path = next((p for p in arc_cands if p.is_file() and p.stat().st_size > 100_000_000), None)
@@ -230,6 +236,8 @@ def build() -> None:
                     if archive_path is not None:
                         if zipfile.is_zipfile(archive_path):
                             subprocess.run(["unzip", "-q", "-o", str(archive_path), "-d", str(IMG_DIR)], check=True)
+                        elif archive_path.name.lower().endswith(".tar"):
+                            subprocess.run(["tar", "-xf", str(archive_path), "-C", str(IMG_DIR)], check=True)
                         elif shutil.which("pigz"):
                             subprocess.run(["tar", "-I", "pigz", "-xf", str(archive_path), "-C", str(IMG_DIR)], check=True)
                         else:
@@ -274,23 +282,35 @@ def build() -> None:
                 DATASET_PATHS["crisismmd"] = (SEQ_DIR, IMG_DIR)
                 print("[READY] crisismmd:", IMG_DIR, flush=True)
 
+            def _resolve_ds_archive(stem: str, custom_url: str, min_bytes: int = 1_000_000) -> Path | None:
+                cands = [Path(f"/content/{{stem}}.tar"), Path(f"/content/{{stem}}.tar.gz"), Path(f"/content/{{stem}}.zip")]
+                if str(DRIVE_DATASET_DIR).strip():
+                    ds_drv = Path(str(DRIVE_DATASET_DIR).strip())
+                    cands.extend([ds_drv / f"{{stem}}.tar", ds_drv / f"{{stem}}.tar.gz", ds_drv / f"{{stem}}.zip"])
+                if drv_cache is not None:
+                    cands.extend([drv_cache / f"{{stem}}.tar", drv_cache / f"{{stem}}.tar.gz", drv_cache / f"{{stem}}.zip"])
+                hit = next((p for p in cands if p.is_file() and p.stat().st_size > min_bytes), None)
+                if hit is not None:
+                    return hit
+                if custom_url.strip():
+                    return _fetch_url_or_drive(custom_url, Path(f"/content/{{stem}}_dl.archive"), min_bytes=min_bytes)
+                return None
+
             if RUN_DMD:
-                dmd_arc = None
-                if str(DMD_ZIP_URL).strip():
-                    dmd_arc = _fetch_url_or_drive(str(DMD_ZIP_URL), Path("/content/dmd_archive.zip"), min_bytes=1_000_000)
-                elif drv_cache is not None and (drv_cache / "dmd_uci_456.zip").is_file():
-                    dmd_arc = drv_cache / "dmd_uci_456.zip"
+                dmd_arc = _resolve_ds_archive("dmd", str(DMD_ARCHIVE_URL))
                 dmd_dir = prepare_dmd(DATA_ROOT / "dmd", archive_path=dmd_arc)
                 DATASET_PATHS["dmd"] = (dmd_dir, dmd_dir)
                 print("[READY] dmd:", dmd_dir, flush=True)
 
             if RUN_INCIDENTS_VQA:
-                inc_dir = prepare_incidents_vqa(DATA_ROOT / "incidents_vqa")
+                inc_arc = _resolve_ds_archive("incidents_vqa", str(INCIDENTS_VQA_ARCHIVE_URL))
+                inc_dir = prepare_incidents_vqa(DATA_ROOT / "incidents_vqa", archive_path=inc_arc)
                 DATASET_PATHS["incidents_vqa"] = (inc_dir, inc_dir)
                 print("[READY] incidents_vqa:", inc_dir, flush=True)
 
             if RUN_DISASTER_M3:
-                m3_dir = prepare_disaster_m3(DATA_ROOT / "disaster_m3")
+                m3_arc = _resolve_ds_archive("disaster_m3", str(DISASTER_M3_ARCHIVE_URL))
+                m3_dir = prepare_disaster_m3(DATA_ROOT / "disaster_m3", archive_path=m3_arc)
                 DATASET_PATHS["disaster_m3"] = (m3_dir, m3_dir)
                 print("[READY] disaster_m3:", m3_dir, flush=True)
             """,
