@@ -40,6 +40,29 @@ def compute_ece(probs: torch.Tensor, y_local: torch.Tensor, n_bins: int = 15) ->
     return float(ece)
 
 
+def compute_balanced_ece(probs: torch.Tensor, y_local: torch.Tensor, num_classes: int, n_bins: int = 15) -> float:
+    """Compute inverse-frequency class-balanced Expected Calibration Error (bECE)."""
+    if probs.shape[0] == 0:
+        return 0.0
+    conf, pred = probs.max(dim=-1)
+    correct = (pred == y_local).double()
+    counts = torch.bincount(y_local, minlength=int(num_classes)).double()
+    k_present = max(int((counts > 0).sum().item()), 1)
+    sw = 1.0 / (float(k_present) * counts[y_local].clamp_min(1.0))
+    sw = sw / sw.sum().clamp_min(1e-12)
+    bece = 0.0
+    edges = torch.linspace(0.0, 1.0, n_bins + 1)
+    for b_idx in range(n_bins):
+        lo, hi = edges[b_idx], edges[b_idx + 1]
+        in_bin = (conf >= lo) & (conf <= hi) if b_idx == 0 else (conf > lo) & (conf <= hi)
+        w_bin = float(sw[in_bin].sum().item())
+        if w_bin > 0.0:
+            acc_b = float((sw[in_bin] * correct[in_bin]).sum().item()) / w_bin
+            conf_b = float((sw[in_bin] * conf[in_bin].double()).sum().item()) / w_bin
+            bece += w_bin * abs(acc_b - conf_b)
+    return float(bece)
+
+
 def _macro_f1_from_cm(cm: torch.Tensor, class_indices: list[int]) -> float:
     denom = (cm.sum(dim=0) + cm.sum(dim=1)).double()
     tp = cm.diag().double()
@@ -68,6 +91,7 @@ def eval_classification_metrics(
     y_oh = F.one_hot(y_local, num_classes=len(cls_list)).float()
     brier = float((probs - y_oh).square().sum(dim=-1).mean().item())
     ece = compute_ece(probs, y_local, n_bins=15)
+    bal_ece = compute_balanced_ece(probs, y_local, len(cls_list), n_bins=15)
 
     pred_local = z.argmax(dim=-1)
     k = len(cls_list)
@@ -102,6 +126,7 @@ def eval_classification_metrics(
         "pred_gini": float(pred_gini),
         "excess_gini": float(excess_gini),
         "ece": float(ece),
+        "balanced_ece": float(bal_ece),
         "nll": float(nll),
         "brier": float(brier),
     }

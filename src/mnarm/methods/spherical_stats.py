@@ -81,19 +81,26 @@ def _procrustes_from_cross_moments(
     return u_mat @ vh_mat, src_mean, dst_mean
 
 
-def _safe_precision_from_cov(cov: torch.Tensor, is_partial: bool, partial_cov_mode: str, sigma2_trans: float = 0.0) -> torch.Tensor:
-    """Prevent precision nullspace explosion on partially observed towers (S_m != Y)."""
+def _safe_precision_from_cov(
+    cov: torch.Tensor,
+    is_partial: bool,
+    partial_cov_mode: str,
+    sigma2_trans: float = 0.0,
+    alpha_ep: float = 0.5,
+) -> torch.Tensor:
+    """Prevent precision nullspace explosion and over-anisotropy on partial towers (S_m != Y)."""
     d = cov.shape[0]
     if not is_partial or partial_cov_mode == "raw_oas":
         return torch.cholesky_inverse(torch.linalg.cholesky(cov))
     if partial_cov_mode == "isotropic_vmf":
         return torch.eye(d, dtype=torch.float64)
     tr = max(float(torch.trace(cov).item()), 1e-12)
-    lam_eff = max(float(cov.square().sum().item()) / tr, 1e-6)
     if partial_cov_mode == "marginal_epistemic":
-        iso_var = max(float(sigma2_trans), lam_eff)
-        cov_marg = cov + iso_var * torch.eye(d, dtype=torch.float64)
+        a_ep = min(1.0, max(0.0, float(alpha_ep)))
+        eye = torch.eye(d, dtype=torch.float64)
+        cov_marg = (1.0 - a_ep) * cov + a_ep * (tr / float(d)) * eye + max(float(sigma2_trans), 0.0) * eye
         return torch.cholesky_inverse(torch.linalg.cholesky(cov_marg))
+    lam_eff = max(float(cov.square().sum().item()) / tr, 1e-6)
     eigvals, eigvecs = torch.linalg.eigh(cov)
     lam_safe = eigvals.clamp_min(lam_eff)
     return (eigvecs / lam_safe.unsqueeze(0)) @ eigvecs.T
@@ -157,8 +164,9 @@ def _fit_direct_oof_tau(
     partial_cov_mode: str,
     sigma2_trans: float,
     calib_folds: int,
+    alpha_ep: float = 0.5,
 ) -> float:
-    """Estimate OOF temperature tau_m using exact inference precision (with sigma2_trans)."""
+    """Estimate OOF temperature tau_m using exact inference precision (with epistemic shrinkage)."""
     counts = [int((y == c).sum().item()) for c in obs]
     if len(obs) < 2 or not counts or min(counts) < 2:
         return 1.0
@@ -169,9 +177,9 @@ def _fit_direct_oof_tau(
         tr_idx = sorted(all_idx - set(f_idx))
         u_tr, y_tr = u[tr_idx], y[tr_idx]
         cov_f, _, _ = _oas_shrinkage_covariance(u_tr, y_tr, obs, shrinkage=shrinkage)
-        prec_f = _safe_precision_from_cov(cov_f, is_partial, partial_cov_mode, sigma2_trans=sigma2_trans)
+        prec_f = _safe_precision_from_cov(cov_f, is_partial, partial_cov_mode, sigma2_trans=sigma2_trans, alpha_ep=alpha_ep)
         mu_mat = torch.stack([u_tr[y_tr == c].mean(dim=0) for c in obs], dim=0)
-        if is_partial and partial_cov_mode != "raw_oas":
+        if partial_cov_mode != "raw_oas":
             mu_mat = _equalize_mahalanobis_centroids(mu_mat, prec_f, obs_rng)
         w_f = mu_mat @ prec_f
         oof_scores_list.append(u[f_idx] @ w_f.T + (-0.5 * (mu_mat * w_f).sum(dim=-1)).unsqueeze(0))
@@ -188,15 +196,19 @@ def _fit_stat_oof_tau(
     partial_cov_mode: str,
     calib_folds: int = 4,
     seed: int = 1729,
+    extra_centroids: list[torch.Tensor] | None = None,
+    trans_std: float = 0.0,
 ) -> float:
-    """Calibrate nat-scale tau_m purely from canonical sufficient statistics (0 exemplars, 0 Stage-4 probes)."""
+    """Calibrate nat-scale tau_m over all |Y| centroids purely from canonical sufficient statistics."""
     obs = sorted(centroids)
     k_cls = len(obs)
     if k_cls < 2:
         return 1.0
+    extra = list(extra_centroids or ())
+    k_tot = k_cls + len(extra)
     d = int(centroids[obs[0]].numel())
     n_folds = max(2, int(calib_folds))
-    g = torch.Generator().manual_seed(int(seed) + 37 * k_cls + d)
+    g = torch.Generator().manual_seed(int(seed) + 37 * k_tot + d)
     if raw_sample_cov is not None:
         eig_v, eig_u = torch.linalg.eigh(raw_sample_cov.to(dtype=torch.float64, device="cpu"))
         sqrt_cov = eig_u * eig_v.clamp_min(0.0).sqrt().unsqueeze(0)
@@ -210,13 +222,18 @@ def _fit_stat_oof_tau(
     m_per = {c: max(n_folds, int(round(target_m * max(int(counts.get(c, 1)), 1) / float(tot_n)))) for c in obs}
     oof_scores, oof_y, obs_rng = [], [], list(range(k_cls))
     for _ in range(n_folds):
-        mu_fold = []
-        for c in obs:
-            n_c_tr = max(float(counts.get(c, 10)) * float(n_folds - 1) / float(n_folds), 1.0)
-            eps_mu = (torch.randn(d, dtype=torch.float64, generator=g) @ sqrt_cov.T) / math.sqrt(n_c_tr)
-            mu_fold.append(centroids[c].to(dtype=torch.float64, device="cpu") + eps_mu)
+        mu_fold = [
+            centroids[c].to(dtype=torch.float64, device="cpu")
+            + (torch.randn(d, dtype=torch.float64, generator=g) @ sqrt_cov.T)
+            / math.sqrt(max(float(counts.get(c, 10)) * float(n_folds - 1) / float(n_folds), 1.0))
+            for c in obs
+        ]
+        for ec in extra:
+            ec64 = ec.to(dtype=torch.float64, device="cpu")
+            eps_ec = torch.randn(d, dtype=torch.float64, generator=g) * float(trans_std) if trans_std > 0.0 else 0.0
+            mu_fold.append(ec64 + eps_ec)
         mu_f = torch.stack(mu_fold, dim=0)
-        if is_partial and partial_cov_mode != "raw_oas":
+        if partial_cov_mode != "raw_oas":
             mu_f = _equalize_mahalanobis_centroids(mu_f, prec, obs_rng)
         w_f = mu_f @ prec
         b_f = -0.5 * (mu_f * w_f).sum(dim=-1)
@@ -229,7 +246,7 @@ def _fit_stat_oof_tau(
         xf_cat = torch.cat(xs_f, dim=0)
         oof_scores.append(xf_cat @ w_f.T + b_f.unsqueeze(0))
         oof_y.append(torch.cat(ys_f, dim=0))
-    return _fit_oof_tau(torch.cat(oof_scores, dim=0), torch.cat(oof_y, dim=0), k_cls, balanced=False)
+    return _fit_oof_tau(torch.cat(oof_scores, dim=0), torch.cat(oof_y, dim=0), k_tot, balanced=False)
 
 
 def _dir(vec: torch.Tensor) -> torch.Tensor:

@@ -1,0 +1,25 @@
+schema: mnarm-config-v1
+experiment: iccv_incidents_vqa_clip
+dataset: incidents_vqa
+protocol: P4
+allow_test: false
+
+backbone: clip_b16
+model_id: openai/clip-vit-base-patch16
+revision: 57c216476eefef5ab752ec549e440a49ae4ae5f3
+
+seed: 11
+deterministic: true
+use_amp: true
+lora_rank: 8
+lora_alpha: 16
+epochs: 5
+effective_batch_size: 64
+micro_batch_size: 64
+eval_batch_size: 256
+lr: 3.0e-5
+weight_decay: 1.0e-4
+max_cached_images: 25000
+workers: 0
+shrinkage: null
+include_mg_clip: true

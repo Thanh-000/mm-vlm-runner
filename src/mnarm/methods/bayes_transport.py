@@ -131,18 +131,10 @@ class SelfNormalizedBayesTransportHead:
             )
             t_key = f"{other_tw}_to_{tw}"
             conj = _estimate_conjugate_weights(obs, st["centroids"], p_all, other_st["centroids"], cross_maps.get(t_key), self.anchor_weight)
-            prec = _safe_precision_from_cov(st["cov"], is_partial, self.partial_cov_mode, sigma2_trans=conj["sigma2_trans"])
-
-            tau_m = float(st["tau"])
-            if tau_m <= 0.0 and st.get("oof_u") is not None and st.get("oof_y") is not None:
-                tau_m = _fit_direct_oof_tau(
-                    st["oof_u"], st["oof_y"], obs, self.shrinkage, is_partial, self.partial_cov_mode, conj["sigma2_trans"], self.calib_folds
-                )
-            elif tau_m <= 0.0:
-                tau_m = _fit_stat_oof_tau(
-                    st["centroids"], st.get("counts", {}), st.get("raw_sample_cov"),
-                    prec, is_partial, self.partial_cov_mode, calib_folds=self.calib_folds,
-                )
+            r_best = max(float(conj.get("r_p_eff", 0.0)), float(conj.get("r_cm_eff", 0.0)))
+            miss_frac = 1.0 - float(len(obs)) / float(max(len(self.seen_classes), 1))
+            alpha_ep = min(1.0, max(miss_frac, 1.0 - r_best * r_best)) if is_partial else 0.0
+            prec = _safe_precision_from_cov(st["cov"], is_partial, self.partial_cov_mode, sigma2_trans=conj["sigma2_trans"], alpha_ep=alpha_ep)
 
             mu_by_class, transported_cls, obs_local_idx = [], [], []
             counts_m = st.get("counts", {})
@@ -177,14 +169,30 @@ class SelfNormalizedBayesTransportHead:
                 mu_by_class.append(mu_est)
 
             mu_stack = torch.stack(mu_by_class, dim=0)
-            if is_partial and self.partial_cov_mode != "raw_oas":
+            if self.partial_cov_mode != "raw_oas":
                 mu_stack = _equalize_mahalanobis_centroids(mu_stack, prec, obs_local_idx)
+
+            tau_m = float(st["tau"])
+            if tau_m <= 0.0 and st.get("oof_u") is not None and st.get("oof_y") is not None:
+                tau_m = _fit_direct_oof_tau(
+                    st["oof_u"], st["oof_y"], obs, self.shrinkage, is_partial, self.partial_cov_mode, conj["sigma2_trans"], self.calib_folds, alpha_ep=alpha_ep
+                )
+            elif tau_m <= 0.0:
+                obs_idx_set = set(obs_local_idx)
+                extra_c = [mu_by_class[i] for i in range(len(self.seen_classes)) if i not in obs_idx_set]
+                d_dim = int(p_all.shape[-1])
+                trans_std = math.sqrt(max(1.0 - r_best * r_best, 1e-4) * max(1.0 - min(mean_norm, 0.999) ** 2, 1e-4) / float(d_dim))
+                tau_m = _fit_stat_oof_tau(
+                    st["centroids"], st.get("counts", {}), st.get("raw_sample_cov"), prec, is_partial,
+                    self.partial_cov_mode, calib_folds=self.calib_folds, extra_centroids=extra_c, trans_std=trans_std,
+                )
+
             w_mat = mu_stack @ prec
             self.weights[tw], self.biases[tw], self.taus[tw] = w_mat.float(), (-0.5 * (mu_stack * w_mat).sum(dim=-1)).float(), float(tau_m)
             self.diagnostics["towers"][tw] = {
                 "observed": obs, "transported": transported_cls, "is_partial": is_partial,
                 "partial_cov_mode": self.partial_cov_mode, "mean_centroid_norm": float(mean_norm),
-                "rho": float(st["rho"]), "tau": float(tau_m), **conj,
+                "rho": float(st["rho"]), "tau": float(tau_m), "alpha_ep": float(alpha_ep), **conj,
             }
         return self
 

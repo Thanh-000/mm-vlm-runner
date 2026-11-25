@@ -148,6 +148,14 @@ def _plot_encoder_preservation(backbone: str, anchor_name: str, anchor: dict[str
         ax.scatter([x1], [y1], marker="*", s=135, color="#009E73", edgecolors="white", zorder=4, label=re_lbl if idx == 0 else None)
         ax.annotate("", xy=(x1, y1), xytext=(x0, y0), arrowprops={"arrowstyle": "->", "color": "#009E73", "lw": 1.6, "alpha": 0.85})
         ax.annotate(arm, (x1, y1), xytext=(5, 4), textcoords="offset points", fontsize=8.0)
+    t0_ref = anchor.get("theta0_preservation") or arms.get("pal_rls", {}).get("encoder_preservation")
+    if t0_ref and "retrieval" in t0_ref and "unseen_prompt_paired_f1" in t0_ref:
+        rx0 = t0_ref["retrieval"]["i2t_r1"] * 100.0
+        ry0 = t0_ref["unseen_prompt_paired_f1"] * 100.0
+        ax.scatter([rx0], [ry0], marker="D", s=110, color="#0072B2", edgecolors="white", zorder=5, label="Pretrained theta_0")
+        ax.axvline(rx0, color="#0072B2", linestyle=":", linewidth=0.9, alpha=0.55)
+        ax.axhline(ry0, color="#0072B2", linestyle=":", linewidth=0.9, alpha=0.55)
+        ax.annotate("theta_0", (rx0, ry0), xytext=(5, -10), textcoords="offset points", fontsize=8.0, color="#0072B2", fontweight="bold")
     ax.set_xlabel("Zero-Shot Cross-Modal Retrieval I->T R@1 (%)")
     ax.set_ylabel("Unseen-Prompt OOD Paired Macro-F1 (%)")
     ax.set_title(f"{backbone} ({anchor_name}): Isometric O(d) Frame Re-Anchoring Preservation")

@@ -29,8 +29,9 @@ def _pf1(arec: dict[str, Any], regime: str) -> str:
 def render_protocol_report(results: dict[str, Any], out_path: Path) -> None:
     """Write single-protocol Markdown report comparing 14 mergers + VLM-CL/Analytic SOTA + CSS-CT."""
     cfg = results["config"]
+    ds_name = str(cfg.get("dataset", "crisismmd"))
     lines = [
-        f"# ICCV Same-Bank Report — {cfg['backbone']} {cfg['protocol']} (dev-Only, Strict Layer Isolation)\n",
+        f"# ICCV Same-Bank Report — {ds_name} {cfg['backbone']} {cfg['protocol']} (dev-Only, Strict Layer Isolation)\n",
         "- **Regimes:** `raw` · `gr_clip` (NeurIPS'25, 0-label) · `unlab_center` (0-label) · `zero_mnar` (**CSS-CT Ours: 0 D_cal labels, 0 exemplars**) · `cal_bias` (100% D_cal labels)\n",
         "| Arm | Track / Privilege | Raw (P) | +GR-CLIP (P) | +unlab (P) | +cal (P) | **+CSS-CT (P)** | +CSS-CT 3-View | Early Rec (Raw->CSS) | ECE (CSS) | Unseen OOD (Raw->Re) | I->T R@1 (Raw->Re) | thT/thI |",
         "|---|---|---:|---:|---:|---:|---:|---:|---|---:|---|---|---:|",
@@ -80,11 +81,12 @@ def render_protocol_report(results: dict[str, Any], out_path: Path) -> None:
 def write_same_bank_suite_outputs(config: dict[str, Any], per_proto: dict[str, dict[str, Any]], out_dir: Path) -> dict[str, Any]:
     """Export unified P1-P4 summary Markdown, booktabs LaTeX table, and machine-readable JSON."""
     backbone = str(config["backbone"])
+    ds_name = str(config.get("dataset", "crisismmd"))
     protos = [p for p in ("P1", "P2", "P3", "P4") if p in per_proto] + [p for p in per_proto if p not in ("P1", "P2", "P3", "P4")]
     hdr_cols = " | ".join(f"{p} (Raw / +GR / +cal / **CSS-CT**)" for p in protos)
     sep_cols = " | ".join("---:" for _ in protos)
     lines = [
-        f"# ICCV Same-Bank Summary — {backbone} (CrisisMMD `dev`, Same Source Bank)\n",
+        f"# ICCV Same-Bank Summary — {ds_name} {backbone} (`dev`, Same Source Bank)\n",
         f"- **Protocols:** `{', '.join(protos)}` | **Zero `D_cal` labels & O(|Y|d + d^2) moments** in `CSS-CT` (`zero_mnar`)\n",
         f"| Arm | {hdr_cols} | Mean (Raw / +GR / +cal / **CSS-CT**) |",
         f"|---|{sep_cols}|---:|",

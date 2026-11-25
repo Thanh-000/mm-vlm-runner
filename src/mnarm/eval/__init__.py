@@ -2,6 +2,7 @@
 
 from mnarm.eval.iccv_figures import generate_iccv_suite_figures
 from mnarm.eval.metrics import (
+    compute_balanced_ece,
     compute_ece,
     eval_classification_metrics,
     eval_retrieval_r1,
@@ -13,6 +14,7 @@ from mnarm.eval.profiler import Profiler
 
 __all__ = [
     "Profiler",
+    "compute_balanced_ece",
     "compute_ece",
     "eval_classification_metrics",
     "eval_retrieval_r1",

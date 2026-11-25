@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import os
 import random
 from collections import defaultdict
 from pathlib import Path
@@ -48,14 +49,29 @@ class MaskedRowsDataset(Dataset):
         return item
 
 
-class PreprocessedTensorStore:
-    """Caches tokenized text and fp16 preprocessed images in CPU RAM for fast deterministic reuse."""
+def _auto_gpu_cache(vlm: Any) -> bool:
+    if getattr(vlm, "device", "cpu") != "cuda" or not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_properties(0).total_memory >= 36 * (1024 ** 3)
 
-    def __init__(self, row_lookup: dict[str, dict[str, Any]], vlm: Any, max_cached_images: int = 25000, workers: int = 4):
+
+class PreprocessedTensorStore:
+    """Caches tokenized text and fp16 images in RAM or high-VRAM CUDA memory for deterministic reuse."""
+
+    def __init__(
+        self,
+        row_lookup: dict[str, dict[str, Any]],
+        vlm: Any,
+        max_cached_images: int = 25000,
+        workers: int = 0,
+        gpu_cache: bool | None = None,
+    ):
         self.row_lookup = row_lookup
         self.vlm = vlm
         self.max_cached_images = int(max_cached_images)
-        self.workers = max(1, int(workers))
+        self.workers = min(12, max(4, os.cpu_count() or 4)) if int(workers) <= 0 else max(1, int(workers))
+        self.gpu_cache = _auto_gpu_cache(vlm) if gpu_cache is None else bool(gpu_cache and getattr(vlm, "device", "cpu") == "cuda")
+        self.cache_device = getattr(vlm, "device", "cpu") if self.gpu_cache else "cpu"
         self._img_cache: dict[str, torch.Tensor] = {}
         self._txt_cache: dict[str, dict[str, torch.Tensor]] = {}
         self.decode_count = 0
@@ -68,7 +84,7 @@ class PreprocessedTensorStore:
 
     def _decode_pil_chunk(self, uids: list[str]) -> torch.Tensor:
         if not uids:
-            return torch.empty((0, 3, 224, 224), dtype=torch.float16)
+            return torch.empty((0, 3, 224, 224), dtype=torch.float16, device=self.cache_device)
         refs = [self.row_lookup[u]["image"] for u in uids]
         if self.workers > 1 and len(refs) > 1:
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.workers, len(refs))) as pool:
@@ -76,9 +92,10 @@ class PreprocessedTensorStore:
         else:
             pils = [self._load_pil(rf) for rf in refs]
         parts = []
-        for off in range(0, len(pils), 64):
-            pv = self.vlm.processor(images=pils[off : off + 64], return_tensors="pt")["pixel_values"]
-            parts.append(pv.to(torch.float16).cpu())
+        proc_bs = 256 if self.gpu_cache else 64
+        for off in range(0, len(pils), proc_bs):
+            pv = self.vlm.processor(images=pils[off : off + proc_bs], return_tensors="pt")["pixel_values"]
+            parts.append(pv.to(device=self.cache_device, dtype=torch.float16))
         self.decode_count += len(uids)
         return torch.cat(parts, dim=0)
 
@@ -90,15 +107,16 @@ class PreprocessedTensorStore:
         tok = self.vlm.tokenize_texts(texts)
         keys = list(tok.keys())
         for idx, uid in enumerate(missing):
-            self._txt_cache[uid] = {k: tok[k][idx].cpu() for k in keys}
+            self._txt_cache[uid] = {k: tok[k][idx].to(self.cache_device) for k in keys}
 
     def ensure_images(self, uids: list[str]) -> None:
         rem = max(0, self.max_cached_images - len(self._img_cache))
         if rem == 0:
             return
         missing = list(dict.fromkeys(u for u in uids if u not in self._img_cache))[:rem]
-        for off in range(0, len(missing), 128):
-            sub = missing[off : off + 128]
+        chunk_sz = 256 if self.gpu_cache else 128
+        for off in range(0, len(missing), chunk_sz):
+            sub = missing[off : off + chunk_sz]
             tens = self._decode_pil_chunk(sub)
             for idx, uid in enumerate(sub):
                 self._img_cache[uid] = tens[idx]

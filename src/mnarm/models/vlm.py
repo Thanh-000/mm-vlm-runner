@@ -119,6 +119,13 @@ def _load_hf_model(cls: Any, model_path: str, revision: str | None, local_files_
     raise RuntimeError(f"Unreachable loader fallthrough for {model_path}")
 
 
+def _load_processor(proc_cls: Any, model_path: str, prefer_fast: bool = True, **proc_kw: Any) -> Any:
+    try:
+        return proc_cls.from_pretrained(model_path, use_fast=prefer_fast, **proc_kw)
+    except (ImportError, ValueError, TypeError, AttributeError):
+        return proc_cls.from_pretrained(model_path, **proc_kw)
+
+
 class MultimodalVLM:
     """Unified wrapper over HuggingFace CLIPModel and SiglipModel with LoRA Q/V adapters."""
 
@@ -141,19 +148,20 @@ class MultimodalVLM:
         if revision:
             proc_kw["revision"] = revision
 
+        fast_proc = bool(torch.cuda.is_available() and device == "cuda")
         if backbone_key == "clip_b16":
             self.clip = _load_hf_model(CLIPModel, model_path, revision, local_files_only)
-            self.processor = CLIPProcessor.from_pretrained(model_path, use_fast=False, **proc_kw)
+            self.processor = _load_processor(CLIPProcessor, model_path, prefer_fast=fast_proc, **proc_kw)
             self.is_siglip = False
             self.tok_kwargs = {"padding": "max_length", "truncation": True, "max_length": 77}
         elif backbone_key == "siglip_b16":
             self.clip = _load_hf_model(SiglipModel, model_path, revision, local_files_only)
-            self.processor = AutoProcessor.from_pretrained(model_path, **proc_kw)
+            self.processor = _load_processor(AutoProcessor, model_path, prefer_fast=True, **proc_kw)
             self.is_siglip = True
             self.tok_kwargs = {"padding": "max_length", "truncation": True, "max_length": 64}
         else:
             self.clip = _load_hf_model(AutoModel, model_path, revision, local_files_only)
-            self.processor = AutoProcessor.from_pretrained(model_path, **proc_kw)
+            self.processor = _load_processor(AutoProcessor, model_path, prefer_fast=True, **proc_kw)
             self.is_siglip = hasattr(self.clip, "text_model") and not hasattr(self.clip, "text_projection")
             self.tok_kwargs = {"padding": "max_length", "truncation": True, "max_length": 64 if self.is_siglip else 77}
 
