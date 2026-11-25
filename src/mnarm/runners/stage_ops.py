@@ -14,7 +14,7 @@ from mnarm.methods.l_mnar import (
     compute_multimodal_lmnar_loss,
     compute_standard_ce_loss,
 )
-from mnarm.models.vlm import MultimodalVLM
+from mnarm.models.vlm import MultimodalVLM, proto_logits
 
 
 def train_lora_stage(
@@ -207,3 +207,52 @@ def collect_train_features_by_modality(
         "paired_t": torch.cat(pt_parts, dim=0) if pt_parts else None,
         "paired_i": torch.cat(pi_parts, dim=0) if pi_parts else None,
     }
+
+
+@torch.inference_mode()
+def collect_masked_cal_logits(
+    *,
+    vlm: MultimodalVLM,
+    kind: str,
+    payload: dict[str, torch.Tensor],
+    cal_recs: list[dict[str, Any]],
+    store: PreprocessedTensorStore,
+    protos_full: torch.Tensor,
+    seen_classes: list[int],
+    batch_size: int,
+    use_amp: bool,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Compute zero-hallucination masked calibration logits honoring record modality masks."""
+    if not cal_recs:
+        return {}, {}
+    if kind == "lora":
+        vlm.restore_base_weights()
+        vlm.load_lora_state(payload)
+    else:
+        vlm.apply_dense_delta(payload)
+    amp_on = bool(use_amp and vlm.device == "cuda")
+    amp_dtype = torch.bfloat16 if (amp_on and torch.cuda.is_bf16_supported()) else torch.float16
+    vlm.clip.eval()
+
+    sc_parts: dict[str, list[torch.Tensor]] = {"text": [], "image": [], "paired": []}
+    lb_parts: dict[str, list[torch.Tensor]] = {"text": [], "image": [], "paired": []}
+    for views, batch in store.iter_batches(cal_recs, batch_size=batch_size, shuffle=False):
+        dev_inp = {k: v.to(vlm.device, non_blocking=True) for k, v in batch.items() if k not in ("label", "sample_id")}
+        lbl = batch["label"].clone()
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_on):
+            ut = vlm.encode_text(dev_inp).float().cpu() if "text" in views else None
+            ui = vlm.encode_image(dev_inp).float().cpu() if "image" in views else None
+        zt = proto_logits(ut, protos_full, seen_classes, vlm.logit_scale) if ut is not None else None
+        zi = proto_logits(ui, protos_full, seen_classes, vlm.logit_scale) if ui is not None else None
+        if zt is not None:
+            sc_parts["text"].append(zt); lb_parts["text"].append(lbl)
+        if zi is not None:
+            sc_parts["image"].append(zi); lb_parts["image"].append(lbl)
+        zp = 0.5 * (zt + zi) if (zt is not None and zi is not None) else (zt if zt is not None else zi)
+        if zp is not None:
+            sc_parts["paired"].append(zp); lb_parts["paired"].append(lbl)
+
+    return (
+        {vw: torch.cat(ps, dim=0) for vw, ps in sc_parts.items() if ps},
+        {vw: torch.cat(ls, dim=0) for vw, ls in lb_parts.items() if ls},
+    )

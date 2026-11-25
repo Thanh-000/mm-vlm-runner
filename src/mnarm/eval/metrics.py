@@ -192,3 +192,17 @@ def paired_bootstrap_diff(
         "p_value": float(p_two),
         "n_resamples": int(n_resamples),
     }
+
+
+def eval_retrieval_r1(feats_t: torch.Tensor, feats_i: torch.Tensor) -> dict[str, float]:
+    """Compute exact zero-shot cross-modal Recall@1 (I->T and T->I) on paired L2 embeddings."""
+    if feats_t.shape[0] == 0 or feats_t.shape[0] != feats_i.shape[0]:
+        return {"i2t_r1": 0.0, "t2i_r1": 0.0}
+    ut = torch.nn.functional.normalize(feats_t.detach().cpu().float(), dim=-1)
+    ui = torch.nn.functional.normalize(feats_i.detach().cpu().float(), dim=-1)
+    sim = ui @ ut.T
+    diag_idx = torch.arange(sim.shape[0])
+    i2t_r1 = float((sim.argmax(dim=1) == diag_idx).float().mean().item())
+    t2i_r1 = float((sim.argmax(dim=0) == diag_idx).float().mean().item())
+    return {"i2t_r1": i2t_r1, "t2i_r1": t2i_r1}
+
