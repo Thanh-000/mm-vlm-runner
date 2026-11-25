@@ -9,10 +9,11 @@ from mnarm.core import write_json_atomic
 from mnarm.eval import generate_iccv_suite_figures
 from mnarm.methods import ALL_MERGE_METHODS
 
-SEQ_ORACLE_ARMS = ("seq_ft", "seq_replay256", "mg_clip", "pal_rls", "joint_oracle")
+SEQ_ORACLE_ARMS = ("seq_ft", "seq_lmnar", "seq_replay256", "mg_clip", "pal_rls", "joint_oracle")
 ARM_REGIME_TAG = {
     **{m: "Weight-Only -> Merge" for m in ALL_MERGE_METHODS},
     "seq_ft": "Sequential (0 Replay)",
+    "seq_lmnar": "Sequential L_MNAR (0 Replay)",
     "seq_replay256": "Sequential (Buffer<=256)",
     "mg_clip": "VLM-CL SOTA (ICCV'25)",
     "pal_rls": "Analytic MMCIL (2025)",

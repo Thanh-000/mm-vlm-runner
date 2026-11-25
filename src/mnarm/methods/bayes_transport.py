@@ -11,8 +11,8 @@ from mnarm.methods.spherical_stats import (
     _dir,
     _equalize_mahalanobis_centroids,
     _estimate_conjugate_weights,
-    _fit_bank_probe_oof_tau,
     _fit_direct_oof_tau,
+    _fit_stat_oof_tau,
     _identity_anchored_procrustes,
     _oas_shrinkage_covariance,
     _procrustes_from_cross_moments,
@@ -138,10 +138,11 @@ class SelfNormalizedBayesTransportHead:
                 tau_m = _fit_direct_oof_tau(
                     st["oof_u"], st["oof_y"], obs, self.shrinkage, is_partial, self.partial_cov_mode, conj["sigma2_trans"], self.calib_folds
                 )
-            elif tau_m <= 0.0 and st.get("probe_x") is not None and st.get("probe_y") is not None and st["probe_x"].shape[0] == st["probe_y"].shape[0]:
-                tau_m = _fit_bank_probe_oof_tau(st["probe_x"], st["probe_y"], st["centroids"], obs, prec, is_partial, self.partial_cov_mode, self.calib_folds)
             elif tau_m <= 0.0:
-                tau_m = 0.05
+                tau_m = _fit_stat_oof_tau(
+                    st["centroids"], st.get("counts", {}), st.get("raw_sample_cov"),
+                    prec, is_partial, self.partial_cov_mode, calib_folds=self.calib_folds,
+                )
 
             mu_by_class, transported_cls, obs_local_idx = [], [], []
             counts_m = st.get("counts", {})
@@ -230,14 +231,15 @@ class SelfNormalizedBayesTransportHead:
             scatter, dof = st.get("within_scatter"), int(st.get("scatter_dof", 0))
             n_tot = int(st.get("total_samples", dof + len(obs)))
             if scatter is not None and dof > 0:
-                cov, _, rho = _shrink_sample_cov(scatter.to(dtype=torch.float64, device="cpu") / float(dof), n_samples=n_tot, dim=d, shrinkage=self.shrinkage)
+                raw_sample_cov = scatter.to(dtype=torch.float64, device="cpu") / float(dof)
+                cov, _, rho = _shrink_sample_cov(raw_sample_cov, n_samples=n_tot, dim=d, shrinkage=self.shrinkage)
             else:
+                raw_sample_cov = None
                 cov, rho = torch.eye(d, dtype=torch.float64), 1.0
             raw_stats[tw] = {
                 "observed_classes": obs, "centroids": centroids, "counts": st.get("counts", {}),
-                "mean_norm": float(mean_norm), "cov": cov, "rho": float(rho),
-                "tau": float(st.get("tau", 0.0)), "probe_x": st.get("probe_x"), "probe_y": st.get("probe_y"),
-                "cov_trace": float(torch.trace(cov).item()),
+                "mean_norm": float(mean_norm), "cov": cov, "raw_sample_cov": raw_sample_cov, "rho": float(rho),
+                "tau": float(st.get("tau", 0.0)), "cov_trace": float(torch.trace(cov).item()),
             }
         return self._assemble_towers(raw_stats, paired_feats_t, paired_feats_i, protos_full, seen_classes, fallback_scale, paired_moments=pm)
 

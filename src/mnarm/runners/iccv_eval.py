@@ -40,7 +40,6 @@ def fit_css_ct_with_reanchor(
     payload: dict[str, torch.Tensor],
     train_recs: list[dict[str, Any]],
     streaming_bank: StreamingClassBank | None,
-    fit4_recs: list[dict[str, Any]],
     store: PreprocessedTensorStore,
     orig_prompts: list[str],
     protos_full: torch.Tensor,
@@ -49,19 +48,23 @@ def fit_css_ct_with_reanchor(
     use_amp: bool,
     shrinkage: float | None,
     cal_recs: list[dict[str, Any]] | None = None,
+    cal0_fx: dict[str, torch.Tensor] | None = None,
+    cal_fx: dict[str, torch.Tensor] | None = None,
 ) -> tuple[SelfNormalizedBayesTransportHead, dict[str, Any], dict[str, Any]]:
-    """Fit Pillar 2 O(d) canonical re-anchoring + Pillar 3 conjugate Bayes head (zero D_cal labels)."""
-    f4_b = collect_train_features_by_modality(vlm=vlm, kind="lora", payload={}, records=fit4_recs, tensor_store=store, batch_size=eval_batch_size, use_amp=use_amp)
-    f4_a = collect_train_features_by_modality(vlm=vlm, kind=kind, payload=payload, records=fit4_recs, tensor_store=store, batch_size=eval_batch_size, use_amp=use_amp)
-    u0_t, um_t = f4_b["text_x"], f4_a["text_x"]
-    u0_i, um_i = f4_b["image_x"], f4_a["image_x"]
-    if (u0_t is None or u0_i is None) and cal_recs:
-        cal_b = collect_train_features_by_modality(vlm=vlm, kind="lora", payload={}, records=cal_recs, tensor_store=store, batch_size=eval_batch_size, use_amp=use_amp)
-        cal_a = collect_train_features_by_modality(vlm=vlm, kind=kind, payload=payload, records=cal_recs, tensor_store=store, batch_size=eval_batch_size, use_amp=use_amp)
-        if u0_t is None:
-            u0_t, um_t = cal_b["text_x"], cal_a["text_x"]
-        if u0_i is None:
-            u0_i, um_i = cal_b["image_x"], cal_a["image_x"]
+    """Fit Pillar 2 O(d) canonical re-anchoring (from P U U_cal, 0 labels) + Pillar 3 CSS-CT in theta_0."""
+    if cal0_fx is None and cal_recs:
+        _, _, cal0_fx = collect_masked_cal_bundle(
+            vlm=vlm, kind="lora", payload={}, cal_recs=cal_recs, store=store,
+            protos_full=protos_full, seen_classes=seen_classes, batch_size=eval_batch_size, use_amp=use_amp,
+        )
+    if cal_fx is None and cal_recs:
+        _, _, cal_fx = collect_masked_cal_bundle(
+            vlm=vlm, kind=kind, payload=payload, cal_recs=cal_recs, store=store,
+            protos_full=protos_full, seen_classes=seen_classes, batch_size=eval_batch_size, use_amp=use_amp,
+        )
+    c0, cm = cal0_fx or {}, cal_fx or {}
+    u0_t, um_t = c0.get("text"), cm.get("text")
+    u0_i, um_i = c0.get("image"), cm.get("image")
 
     protos_m = encode_prompts_under_payload(vlm=vlm, kind=kind, payload=payload, prompts=orig_prompts)
     re_t = fit_canonical_reanchor(u0_t, um_t, protos_full, protos_m)
@@ -79,17 +82,17 @@ def fit_css_ct_with_reanchor(
         head.fit(tx, tf["text_y"], ix, tf["image_y"], pt, pi, protos_full, seen_classes, fallback_scale=vlm.logit_scale)
         return head, re_t, re_i
 
-    um_t_re = apply_reanchor(um_t, re_t) if (use_reanchor and um_t is not None) else um_t
-    um_i_re = apply_reanchor(um_i, re_i) if (use_reanchor and um_i is not None) else um_i
-    pm_use = apply_reanchor(protos_m, re_t) if use_reanchor else protos_m
-    bstats = streaming_bank.transport_to_target_stats(
-        bridge_u0_t=u0_t, bridge_um_t=um_t_re,
-        bridge_u0_i=u0_i, bridge_um_i=um_i_re,
-        seen_classes=seen_classes, probe_y_t=f4_a["text_y"], probe_y_i=f4_a["image_y"],
-        protos_0=protos_full, protos_m=pm_use,
-    )
+    if use_reanchor:
+        bstats = streaming_bank.canonical_stats(seen_classes)
+        protos_fit = protos_full
+    else:
+        bstats = streaming_bank.transport_to_target_stats(
+            bridge_u0_t=u0_t, bridge_um_t=um_t, bridge_u0_i=u0_i, bridge_um_i=um_i,
+            seen_classes=seen_classes, protos_0=protos_full, protos_m=protos_m,
+        )
+        protos_fit = protos_m
     head.fit_from_sufficient_stats(
-        bstats["towers"], None, None, protos_full, seen_classes,
+        bstats["towers"], None, None, protos_fit, seen_classes,
         fallback_scale=vlm.logit_scale, paired_moments=bstats["paired_moments"],
     )
     return head, re_t, re_i
@@ -114,7 +117,7 @@ def evaluate_arm_all_regimes(
     dev0_i: torch.Tensor,
     train_recs: list[dict[str, Any]],
     streaming_bank: StreamingClassBank | None,
-    fit4_recs: list[dict[str, Any]],
+    cal0_fx: dict[str, torch.Tensor] | None,
     store: PreprocessedTensorStore,
     eval_batch_size: int,
     use_amp: bool,
@@ -161,9 +164,10 @@ def evaluate_arm_all_regimes(
         zn_head, re_t, re_i = fit_css_ct_with_reanchor(
             bridge_mode="conjugate_bayes", partial_cov_mode="marginal_epistemic", use_reanchor=True,
             vlm=vlm, kind=kind, payload=payload, train_recs=train_recs,
-            streaming_bank=streaming_bank, fit4_recs=fit4_recs, store=store,
+            streaming_bank=streaming_bank, store=store,
             orig_prompts=orig_prompts, protos_full=protos_full, seen_classes=seen_classes,
-            eval_batch_size=eval_batch_size, use_amp=use_amp, shrinkage=shrinkage, cal_recs=cal_recs,
+            eval_batch_size=eval_batch_size, use_amp=use_amp, shrinkage=shrinkage,
+            cal_recs=cal_recs, cal0_fx=cal0_fx, cal_fx=cal_fx,
         )
     dev_t_re, dev_i_re = apply_reanchor(dev_t, re_t), apply_reanchor(dev_i, re_i)
     zn_logits = zn_head.predict_views(dev_t_re, dev_i_re)

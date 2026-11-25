@@ -1,44 +1,49 @@
-# Zero-Support MNAR Multimodal Learning & Cross-Modal Density Transport (`mnarm`)
+# Canonical Spherical Sufficiency & Conjugate Transport (`CSS-CT` / `mnarm`)
 
-Official clean-room research repository for testing **Support-Aware MNAR Propensity Risk (`L_MNAR`)** paired with **Self-Normalized Class-Conditional Density & Modality-Gap Transport** under zero-support structural missingness (`P_train(M | y) = 0`) — using **zero calibration labels** from `D_cal`.
+Official clean-room research repository for **`CSS-CT` (Canonical Spherical Sufficiency & Conjugate Transport)** — a zero-exemplar, zero-calibration-label plug-and-play framework solving **Zero-Support Missing-Not-At-Random (`P_train(M | y) = 0`)** continual multimodal VLM merging and adaptation.
 
-## Key Scientific Principles
+For full mathematical contracts, see [docs/FRAMEWORK_SPECIFICATION.md](docs/FRAMEWORK_SPECIFICATION.md), [docs/METHOD_FREEZE_ICCV.md](docs/METHOD_FREEZE_ICCV.md), and [docs/AUTHOR_CODE_PARITY_ICCV.md](docs/AUTHOR_CODE_PARITY_ICCV.md).
 
-1. **Co-Observation Graph & Support-Aware Propensity Risk (`L_MNAR`):** Replaces global cross-entropy over unsupported classes (`c ∉ S_M`) with propensity-adjusted support-restricted risk over `S_M`, eliminating the `-∞` collider gradient and Rank-1 Cone Drift during training.
-2. **Self-Normalized Shrinkage-LDA Density + Modality-Gap Transport:** Estimates OAS-regularized class-conditional Gaussian/spherical log-densities on observed towers, transports missing `(m, y)` prototypes via closed-form orthogonal Procrustes / prompt bridge across the modality gap, and calibrates scalar nat-scales purely via train-only out-of-fold validation (`0` `D_cal` labels).
-3. **Strict `dev`-Only Falsification Hygiene:** `allow_test=false` is enforced across Pilot F1 configs and data loaders until architecture & hyperparameters are frozen.
+## Core Architecture (`CSS-CT` v2)
 
-## Quickstart (Local CPU Verification)
+1. **Canonical `O(|Y|d + d^2)` Sufficient Bank (`Pillar 1`):** Aligns each stage adapter isometrically (`O(d)`) onto the frozen pretrained reference frame `theta_0` on `S^{d-1}`, maintaining exact class centroids, pooled scatter, and `O(d^2)` paired cross-moments `(N_TI, s_T, s_I, C_TI)` with **`0` stored exemplars**.
+2. **Single Isometric `O(d)` Frame Re-Anchoring (`Pillar 2`):** Solves one uncentered orthogonal Procrustes map `Q*_{m->0} in O(d)` from unlabeled anchors (`P U U_cal`, `0` labels) to map adapted/merged towers back to `theta_0` with zero hubness collapse, zero extra inference weights (`weight folding`), and full restoration of Open-Vocabulary OOD & `I->T R@1`.
+3. **Conjugate Empirical-Bayes Transport & Parametric OOF `tau_m` (`Pillar 3`):** Synthesizes missing `(m, y)` centroids from cone-adjusted prompt and cross-modal moment bridges, prevents nullspace collapse via marginal epistemic precision `(Sigma_m + max(sigma^2_trans, lambda_eff) I_d)^{-1}`, and calibrates `tau_m` purely from canonical bank statistics (`0` Stage-4 probes, immune to unimodal final stages).
+4. **Strict `dev`-Only Falsification Hygiene:** `allow_test=false` is enforced across all configs, runners, and Colab bundles prior to final pre-registered confirmatory evaluation.
+
+## Quickstart (Local Verification)
 
 ```bash
 pip install --no-build-isolation --no-deps -e .
 pytest -v
 ```
 
-## Running Pilot F1 (`dev`-Only, CLIP P4 & SigLIP P4)
+## Running Unified Same-Bank ICCV Evaluation (`dev`-Only)
 
 ```bash
-python -m mnarm.runners.pilot_f1 \
-  --config configs/pilot_f1_clip_p4.yaml \
+python -m mnarm.runners.iccv_same_bank \
+  --config configs/iccv_crisismmd_clip.yaml \
   --seq-inputs path/to/crisismmd_seq_inputs \
   --images path/to/CrisisMMD_v2.0 \
-  --out outputs/pilot_f1_clip_p4
+  --out outputs/iccv_same_bank_clip \
+  --protocols P4 P3 P2 P1
 
-python -m mnarm.runners.pilot_f1 \
-  --config configs/pilot_f1_siglip_p4.yaml \
+python -m mnarm.runners.iccv_same_bank \
+  --config configs/iccv_crisismmd_siglip.yaml \
   --seq-inputs path/to/crisismmd_seq_inputs \
   --images path/to/CrisisMMD_v2.0 \
-  --out outputs/pilot_f1_siglip_p4
+  --out outputs/iccv_same_bank_siglip \
+  --protocols P4 P3 P2 P1
 ```
 
-For Google Colab GPU execution, build and open `colab/Pilot_F1_ZeroMNAR_ColabWeb.ipynb` via `make build-colab`.
+For Colab Web (A100 / G4 / L4), rebuild and open [colab/ICCV_SameBank_ZeroMNAR_ColabWeb.ipynb](colab/ICCV_SameBank_ZeroMNAR_ColabWeb.ipynb) via `python scripts/build_iccv_same_bank_colab.py`.
 
 ## Repository Layout
 
 - `src/mnarm/core/` — Determinism, SHA-256 provenance (`RUN_LOCK.json`), atomic I/O.
 - `src/mnarm/data/` — Strict split-overlap guards (`0` uid/image/text leak) and CrisisMMD contract loaders.
 - `src/mnarm/models/` — LoRA Q/V VLM wrappers (`CLIP` / `SigLIP`) and collision-free `blake2b` tower digests.
-- `src/mnarm/methods/` — `L_MNAR`, `SelfNormalizedBayesTransportHead`, and task-vector merging (`TA`, `TIES`, `MagMax`, `TSV-M`).
-- `src/mnarm/eval/` — Macro-F1 (`8-cls` & `7-cls`), `ECE`, `NLL`, `Brier`, cone drift `θ_deg`, paired bootstrap CIs, and VRAM/latency profiling.
-- `src/mnarm/runners/` — `pilot_f1` runner emitting pre-committed `PASS / PARTIAL / FAIL` falsification verdicts.
-- `tests/` — Deterministic CPU test suite verifying mathematical invariants, zero data leakage, and double-blind anonymity.
+- `src/mnarm/methods/` — Canonical `CSS-CT` (`StreamingClassBank`, `reanchor`, `spherical_stats`, `bayes_transport`), `14` verbatim 2023–2026 mergers, `GR-CLIP`, `MG-CLIP`, `PAL-RLS`, and counterfactual `L_MNAR`.
+- `src/mnarm/eval/` — Macro-F1, `ECE/NLL/Brier`, Sato `Excess Gini`, cone drift `theta_deg`, paired bootstrap CIs, profiler, and 4 publication diagnostic figures (`PNG` + `PDF`).
+- `src/mnarm/runners/` — Unified `iccv_same_bank`, `iccv_eval`, `iccv_report`, `crisismmd_p1_p4`, and `pilot_f1` runners.
+- `tests/` — Deterministic CPU test suite verifying mathematical invariants, `0` data leakage, verbatim author parity, and double-blind anonymity.

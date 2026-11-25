@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 
 from mnarm.methods import ALL_MERGE_METHODS
 
-SEQ_ARMS = ("seq_ft", "mg_clip", "pal_rls", "seq_replay256", "joint_oracle")
+SEQ_ARMS = ("seq_ft", "seq_lmnar", "mg_clip", "pal_rls", "seq_replay256", "joint_oracle")
 
 
 def _configure_style() -> None:
@@ -98,6 +98,7 @@ def _plot_mnar_hubness(backbone: str, anchor_name: str, anchor: dict[str, Any], 
         ("mg_clip", "raw", "MG-CLIP", "d", "#D55E00"),
         ("pal_rls", "raw", "PAL-RLS", "p", "#56B4E9"),
         ("seq_ft", "raw", "Seq-FT Raw", "h", "#444444"),
+        ("seq_lmnar", "raw", "Seq-LMNAR Raw", "v", "#009E73"),
         ("tsvm", "zero_mnar", "TSV-M +CSS-CT", "^", "#0072B2"),
         ("dc_lora", "zero_mnar", "DC-LoRA +CSS-CT", "*", "#009E73"),
     ]
@@ -135,7 +136,7 @@ def _plot_mnar_hubness(backbone: str, anchor_name: str, anchor: dict[str, Any], 
 def _plot_encoder_preservation(backbone: str, anchor_name: str, anchor: dict[str, Any], fig_dir: Path) -> list[Path]:
     arms = anchor["arms"]
     fig, ax = plt.subplots(figsize=(7.6, 5.2), layout="constrained")
-    enc_arms = [a for a in ("tsvm", "knots", "iso_cts", "wudi", "dop", "dc_lora", "seq_ft", "mg_clip") if a in arms]
+    enc_arms = [a for a in ("tsvm", "knots", "iso_cts", "wudi", "dop", "dc_lora", "seq_ft", "seq_lmnar", "mg_clip") if a in arms]
     raw_lbl, re_lbl = "Raw Adapted Encoder", "After O(d) Isometric Re-Anchor"
     for idx, arm in enumerate(enc_arms):
         ep = arms[arm]["encoder_preservation"]

@@ -54,6 +54,9 @@ def test_streaming_bank_zero_exemplar_cross_moment_exactness() -> None:
         else:
             mem_large = bnk.memory_floats()
     assert mem_small == mem_large
+    for tw in ("text", "image"):
+        for mu in bank_small.class_centroids[tw].values():
+            assert float(mu.norm().item()) <= 1.0 + 1e-12
 
     pt_cat = l2_normalize(torch.cat(pt_all, dim=0)).double()
     pi_cat = l2_normalize(torch.cat(pi_all, dim=0)).double()

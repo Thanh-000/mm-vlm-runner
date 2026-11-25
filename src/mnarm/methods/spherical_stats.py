@@ -179,39 +179,57 @@ def _fit_direct_oof_tau(
     return _fit_oof_tau(torch.cat(oof_scores_list, dim=0), torch.cat(oof_y_list, dim=0), len(obs))
 
 
-def _fit_bank_probe_oof_tau(probe_x: torch.Tensor, probe_y: torch.Tensor, centroids: dict[int, torch.Tensor], obs: list[int], prec: torch.Tensor, is_partial: bool, partial_cov_mode: str, calib_folds: int) -> float:
-    """Estimate OOF temperature on probe samples scored against ALL |obs| bank classes."""
-    obs_map = {int(c): i for i, c in enumerate(obs)}
-    py_all = probe_y.detach().cpu().long()
-    keep = [i for i, v in enumerate(py_all.tolist()) if int(v) in obs_map]
-    if len(obs) < 2 or not keep:
-        return 0.05
-    p_u = l2_normalize(probe_x).to(dtype=torch.float64, device="cpu")[keep]
-    py = py_all[keep]
-    p_obs = sorted({int(v) for v in py.tolist()})
-    p_counts = [int((py == c).sum().item()) for c in p_obs]
-    if p_obs and min(p_counts) >= 2:
-        folds = _stratified_folds([int(v) for v in py.tolist()], min(calib_folds, min(p_counts)))
-        oof_scores, oof_y, all_idx, obs_rng = [], [], set(range(int(p_u.shape[0]))), list(range(len(obs)))
-        for f_idx in folds:
-            tr_idx = sorted(all_idx - set(f_idx))
-            u_tr, y_tr = p_u[tr_idx], py[tr_idx]
-            mu_list = [u_tr[y_tr == c].mean(dim=0) if (c in p_obs and bool((y_tr == c).any())) else centroids[c] for c in obs]
-            mu_f = torch.stack(mu_list, dim=0)
-            if is_partial and partial_cov_mode != "raw_oas":
-                mu_f = _equalize_mahalanobis_centroids(mu_f, prec, obs_rng)
-            w_f = mu_f @ prec
-            oof_scores.append(p_u[f_idx] @ w_f.T + (-0.5 * (mu_f * w_f).sum(dim=-1)).unsqueeze(0))
-            oof_y.append(torch.tensor([obs_map[int(v)] for v in py[f_idx].tolist()], dtype=torch.long))
-        return _fit_oof_tau(torch.cat(oof_scores, dim=0), torch.cat(oof_y, dim=0), len(obs), balanced=False)
-    if p_u.shape[0] < 2:
-        return 0.05
-    mu_f = torch.stack([centroids[c] for c in obs], dim=0)
-    if is_partial and partial_cov_mode != "raw_oas":
-        mu_f = _equalize_mahalanobis_centroids(mu_f, prec, list(range(len(obs))))
-    w_f = mu_f @ prec
-    scores = p_u @ w_f.T + (-0.5 * (mu_f * w_f).sum(dim=-1)).unsqueeze(0)
-    return _fit_oof_tau(scores, torch.tensor([obs_map[int(v)] for v in py.tolist()], dtype=torch.long), len(obs), balanced=False)
+def _fit_stat_oof_tau(
+    centroids: dict[int, torch.Tensor],
+    counts: dict[int, int],
+    raw_sample_cov: torch.Tensor | None,
+    prec: torch.Tensor,
+    is_partial: bool,
+    partial_cov_mode: str,
+    calib_folds: int = 4,
+    seed: int = 1729,
+) -> float:
+    """Calibrate nat-scale tau_m purely from canonical sufficient statistics (0 exemplars, 0 Stage-4 probes)."""
+    obs = sorted(centroids)
+    k_cls = len(obs)
+    if k_cls < 2:
+        return 1.0
+    d = int(centroids[obs[0]].numel())
+    n_folds = max(2, int(calib_folds))
+    g = torch.Generator().manual_seed(int(seed) + 37 * k_cls + d)
+    if raw_sample_cov is not None:
+        eig_v, eig_u = torch.linalg.eigh(raw_sample_cov.to(dtype=torch.float64, device="cpu"))
+        sqrt_cov = eig_u * eig_v.clamp_min(0.0).sqrt().unsqueeze(0)
+    else:
+        r_bar = sum(float(centroids[c].norm().item()) for c in obs) / float(k_cls)
+        iso_std = math.sqrt(max(1.0 - r_bar * r_bar, 1e-4) / float(d))
+        sqrt_cov = iso_std * torch.eye(d, dtype=torch.float64)
+
+    tot_n = max(sum(max(int(counts.get(c, 1)), 1) for c in obs), k_cls)
+    target_m = min(max(tot_n, 48 * k_cls), 960)
+    m_per = {c: max(n_folds, int(round(target_m * max(int(counts.get(c, 1)), 1) / float(tot_n)))) for c in obs}
+    oof_scores, oof_y, obs_rng = [], [], list(range(k_cls))
+    for _ in range(n_folds):
+        mu_fold = []
+        for c in obs:
+            n_c_tr = max(float(counts.get(c, 10)) * float(n_folds - 1) / float(n_folds), 1.0)
+            eps_mu = (torch.randn(d, dtype=torch.float64, generator=g) @ sqrt_cov.T) / math.sqrt(n_c_tr)
+            mu_fold.append(centroids[c].to(dtype=torch.float64, device="cpu") + eps_mu)
+        mu_f = torch.stack(mu_fold, dim=0)
+        if is_partial and partial_cov_mode != "raw_oas":
+            mu_f = _equalize_mahalanobis_centroids(mu_f, prec, obs_rng)
+        w_f = mu_f @ prec
+        b_f = -0.5 * (mu_f * w_f).sum(dim=-1)
+        xs_f, ys_f = [], []
+        for idx_c, c in enumerate(obs):
+            mc = max(1, m_per[c] // n_folds)
+            z = torch.randn(mc, d, dtype=torch.float64, generator=g) @ sqrt_cov.T
+            xs_f.append(l2_normalize((centroids[c].to(dtype=torch.float64, device="cpu").unsqueeze(0) + z).float()).to(torch.float64))
+            ys_f.append(torch.full((mc,), idx_c, dtype=torch.long))
+        xf_cat = torch.cat(xs_f, dim=0)
+        oof_scores.append(xf_cat @ w_f.T + b_f.unsqueeze(0))
+        oof_y.append(torch.cat(ys_f, dim=0))
+    return _fit_oof_tau(torch.cat(oof_scores, dim=0), torch.cat(oof_y, dim=0), k_cls, balanced=False)
 
 
 def _dir(vec: torch.Tensor) -> torch.Tensor:

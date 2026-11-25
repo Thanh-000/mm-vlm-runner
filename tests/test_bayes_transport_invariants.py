@@ -315,4 +315,53 @@ def test_bank_probe_oof_tau_immune_to_rare_noisy_tail_class() -> None:
     assert ev["paired"]["macro_f1"] > ev["text"]["macro_f1"], f"paired={ev['paired']['macro_f1']} <= text={ev['text']['macro_f1']}"
 
 
+def test_canonical_stats_unimodal_stage4_p1_no_tau_collapse() -> None:
+    """Verify canonical_stats + stat-OOF tau stays well-calibrated on P1 when Stage 4 is unimodal Image-only."""
+    g = torch.Generator().manual_seed(113)
+    dim, classes = 128, list(range(8))
+    early, late = [0, 1, 4, 5], [2, 3, 6, 7]
+    # P1/P2 style: Stage 4 has Image-only (0 text samples in Stage 4!) while Stage 3 is paired.
+    stages = [([0, 5], ("text",)), ([1, 4], ("image",)), ([2, 6], ("text", "image")), ([3, 7], ("image",))]
+    sem = torch.cat([torch.zeros(8, 3), F.normalize(torch.randn(8, dim - 3, generator=g), dim=-1)], dim=-1)
+    mu_p, mu_i, mu_t = torch.zeros(dim), torch.zeros(dim), torch.zeros(dim)
+    mu_p[0], mu_i[1], mu_t[2] = 1.0, 1.0, 1.0
+    protos = F.normalize(0.86 * mu_p.unsqueeze(0) + 0.51 * sem, dim=-1)
+    q_i = _pos_qr(torch.eye(dim) + 0.05 * torch.randn(dim, dim, generator=g))
+    q_t = _pos_qr(torch.eye(dim) + 0.05 * torch.randn(dim, dim, generator=g))
+
+    def _draw(cls_list: list[int], n_per: int, tower: str) -> tuple[torch.Tensor, torch.Tensor]:
+        cone = mu_i if tower == "image" else mu_t
+        rot = q_i if tower == "image" else q_t
+        noise = 0.07 if tower == "image" else 0.05
+        xs, ys = [], []
+        for c in cls_list:
+            ctr = F.normalize(0.84 * cone + 0.54 * (rot @ sem[c]), dim=-1)
+            xs.append(l2_normalize(ctr.unsqueeze(0) + noise * torch.randn(n_per, dim, generator=g)))
+            ys.append(torch.full((n_per,), c, dtype=torch.long))
+        return torch.cat(xs, dim=0), torch.cat(ys, dim=0)
+
+    bank = StreamingClassBank()
+    for st_cls, msk in stages:
+        xi, yi = _draw(st_cls, 30, "image")
+        xt, yt = _draw(st_cls, 30, "text")
+        has_t, has_i = ("text" in msk), ("image" in msk)
+        bank.update_stage(
+            u_expert_t=xt if has_t else None, u_base_t=xt if has_t else None, y_t=yt if has_t else None,
+            u_expert_i=xi if has_i else None, u_base_i=xi if has_i else None, y_i=yi if has_i else None,
+            paired_base_t=xt if (has_t and has_i) else None, paired_base_i=xi if (has_t and has_i) else None,
+        )
+
+    cstats = bank.canonical_stats(classes)
+    head = SelfNormalizedBayesTransportHead(bridge_mode="conjugate_bayes", partial_cov_mode="marginal_epistemic").fit_from_sufficient_stats(
+        cstats["towers"], None, None, protos, classes, paired_moments=cstats["paired_moments"]
+    )
+    assert head.taus["text"] > 0.10 and head.taus["image"] > 0.10
+    dev_ix, dev_y = _draw(classes, 35, "image")
+    dev_tx, _ = _draw(classes, 35, "text")
+    ev = eval_view_suite(head.predict_views(dev_tx, dev_ix), dev_y, classes, early, late)
+    assert ev["paired"]["macro_f1"] > 0.90
+    assert ev["text"]["early_recall"] > 0.80
+    assert ev["paired"]["ece"] < 0.15
+
+
 

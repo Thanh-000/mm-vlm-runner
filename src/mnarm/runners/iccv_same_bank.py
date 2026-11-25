@@ -24,7 +24,7 @@ from mnarm.methods import (
 from mnarm.models import MultimodalVLM
 from mnarm.runners.iccv_eval import eval_pal_rls_arm, evaluate_arm_all_regimes, fit_css_ct_with_reanchor
 from mnarm.runners.iccv_report import render_protocol_report, write_same_bank_suite_outputs
-from mnarm.runners.stage_ops import collect_train_features_by_modality, extract_paired_features_cached, train_lora_stage
+from mnarm.runners.stage_ops import collect_masked_cal_bundle, collect_train_features_by_modality, extract_paired_features_cached, train_lora_stage
 
 ABLATION_SPECS = (
     ("none_vmf", "none_zero_shot", "isotropic_vmf", False),
@@ -62,9 +62,9 @@ def run_single_protocol_same_bank(
     )
 
     exp_deltas: list[dict[str, torch.Tensor]] = []
-    bank, seq_bank, mg_bank = StreamingClassBank(), StreamingClassBank(), StreamingClassBank()
+    bank, seq_bank, seq_lmnar_bank, mg_bank = StreamingClassBank(), StreamingClassBank(), StreamingClassBank(), StreamingClassBank()
     pal = PALRLSClassifier(vlm.embed_dim, len(ds["orig_prompts"]), lam=1.0, seed=seed)
-    seq_ft_state = seq_rep_state = mg_state = None
+    seq_ft_state = seq_lmnar_state = seq_rep_state = mg_state = None
     mg_heads: dict[str, Any] = {}
     seen_so_far: list[int] = []
     t0 = time.perf_counter()
@@ -102,6 +102,15 @@ def run_single_protocol_same_bank(
         tf_sq = collect_train_features_by_modality(vlm=vlm, kind="lora", payload=seq_ft_state, records=st["fit"], tensor_store=store, batch_size=int(config["eval_batch_size"]), use_amp=use_amp)
         seq_bank.update_stage(u_expert_t=tf_sq["text_x"], u_base_t=tf_b0["text_x"], y_t=tf_sq["text_y"], u_expert_i=tf_sq["image_x"], u_base_i=tf_b0["image_x"], y_i=tf_sq["image_y"], paired_base_t=tf_b0["paired_t"], paired_base_i=tf_b0["paired_i"])
 
+        seq_lmnar_state, _ = train_lora_stage(
+            vlm=vlm, init_lora=seq_lmnar_state, records=st["fit"], protos_full=protos_full, seen_classes=seen_so_far,
+            objective="l_mnar", stage_idx=t, epochs=int(config["epochs"]),
+            effective_batch_size=int(config["effective_batch_size"]), micro_batch_size=int(config["micro_batch_size"]),
+            lr=float(config["lr"]), weight_decay=float(config["weight_decay"]), seed=seed + 1500, use_amp=use_amp, tensor_store=store,
+        )
+        tf_slm = collect_train_features_by_modality(vlm=vlm, kind="lora", payload=seq_lmnar_state, records=st["fit"], tensor_store=store, batch_size=int(config["eval_batch_size"]), use_amp=use_amp)
+        seq_lmnar_bank.update_stage(u_expert_t=tf_slm["text_x"], u_base_t=tf_b0["text_x"], y_t=tf_slm["text_y"], u_expert_i=tf_slm["image_x"], u_base_i=tf_b0["image_x"], y_i=tf_slm["image_y"], paired_base_t=tf_b0["paired_t"], paired_base_i=tf_b0["paired_i"])
+
         seq_rep_state, _ = train_lora_stage(
             vlm=vlm, init_lora=seq_rep_state, records=st["fit"] + st["buffer_before"], protos_full=protos_full, seen_classes=seen_so_far,
             objective="std_ce", stage_idx=t, epochs=int(config["epochs"]),
@@ -127,6 +136,11 @@ def run_single_protocol_same_bank(
         lr=float(config["lr"]), weight_decay=float(config["weight_decay"]), seed=seed + 4000, use_amp=use_amp, tensor_store=store,
     )
 
+    _, _, cal0_fx = collect_masked_cal_bundle(
+        vlm=vlm, kind="lora", payload={}, cal_recs=st4["calibration_latest_views"], store=store,
+        protos_full=protos_full, seen_classes=seen, batch_size=int(config["eval_batch_size"]), use_amp=use_amp,
+    )
+
     lora_rank_eff = int(getattr(vlm, "rank", config.get("lora_rank", 8)))
     arms_out: dict[str, Any] = {}
     boot_map: dict[str, dict[str, torch.Tensor]] = {}
@@ -141,7 +155,7 @@ def run_single_protocol_same_bank(
             unseen_protos_full=unseen_protos_full, seen_classes=seen, early_classes=ds["early_classes"],
             late_classes=ds["late_classes"], dev_rows=dev_rows, cal_recs=st4["calibration_latest_views"],
             dev_cache=dev_cache, dev0_t=dev0_t, dev0_i=dev0_i, train_recs=tr_recs, streaming_bank=bnk,
-            fit4_recs=st4["fit"], store=store, eval_batch_size=int(config["eval_batch_size"]),
+            cal0_fx=cal0_fx, store=store, eval_batch_size=int(config["eval_batch_size"]),
             use_amp=use_amp, shrinkage=config.get("shrinkage"), profiler=profiler, mg_heads=mgh,
         )
         arms_out[aname], boot_map[aname] = arec, blogits
@@ -157,6 +171,7 @@ def run_single_protocol_same_bank(
 
     traj_specs: list[tuple[str, str, dict[str, torch.Tensor], list[dict[str, Any]], StreamingClassBank | None, dict[str, Any] | None]] = [
         ("seq_ft", "lora", seq_ft_state or {}, [], seq_bank, None),
+        ("seq_lmnar", "lora", seq_lmnar_state or {}, [], seq_lmnar_bank, None),
         ("seq_replay256", "lora", seq_rep_state or {}, st4["fit"] + st4["buffer_before"], None, None),
     ]
     if bool(config.get("include_mg_clip", True)) and mg_state is not None:
@@ -174,13 +189,17 @@ def run_single_protocol_same_bank(
     if tsvm_delta is None:
         tsvm_delta = merge_task_deltas(exp_deltas, "tsvm", rank_per_task=lora_rank_eff)
     tsvm_t, tsvm_i, _ = extract_paired_features_cached(vlm=vlm, kind="delta", payload=tsvm_delta, records=dev_rows, tensor_store=store, batch_size=int(config["eval_batch_size"]), cache=dev_cache, use_amp=use_amp)
+    _, _, cal_tsvm_fx = collect_masked_cal_bundle(
+        vlm=vlm, kind="delta", payload=tsvm_delta, cal_recs=st4["calibration_latest_views"], store=store,
+        protos_full=protos_full, seen_classes=seen, batch_size=int(config["eval_batch_size"]), use_amp=use_amp,
+    )
     ablation_out: dict[str, Any] = {}
     for ab_name, bmode, pcmode, use_re in ABLATION_SPECS:
         ab_h, rt_ab, ri_ab = fit_css_ct_with_reanchor(
             bridge_mode=bmode, partial_cov_mode=pcmode, use_reanchor=use_re, vlm=vlm, kind="delta", payload=tsvm_delta,
-            train_recs=[], streaming_bank=bank, fit4_recs=st4["fit"], store=store, orig_prompts=ds["orig_prompts"],
+            train_recs=[], streaming_bank=bank, store=store, orig_prompts=ds["orig_prompts"],
             protos_full=protos_full, seen_classes=seen, eval_batch_size=int(config["eval_batch_size"]), use_amp=use_amp, shrinkage=config.get("shrinkage"),
-            cal_recs=st4["calibration_latest_views"],
+            cal_recs=st4["calibration_latest_views"], cal0_fx=cal0_fx, cal_fx=cal_tsvm_fx,
         )
         tx_ab, ix_ab = (apply_reanchor(tsvm_t, rt_ab), apply_reanchor(tsvm_i, ri_ab)) if use_re else (tsvm_t, tsvm_i)
         ablation_out[ab_name] = eval_view_suite(ab_h.predict_views(tx_ab, ix_ab), dev_y, seen, ds["early_classes"], ds["late_classes"])
@@ -197,6 +216,7 @@ def run_single_protocol_same_bank(
         ("tsvm:zero_mnar_vs_wudi:cal_bias", boot_map["wudi"].get("cal_bias")),
         ("tsvm:zero_mnar_vs_dop:cal_bias", boot_map["dop"].get("cal_bias")),
         ("tsvm:zero_mnar_vs_dc_lora:cal_bias", boot_map["dc_lora"].get("cal_bias")),
+        ("tsvm:zero_mnar_vs_seq_lmnar:raw", boot_map["seq_lmnar"].get("raw")),
         ("tsvm:zero_mnar_vs_mg_clip:raw", boot_map.get("mg_clip", {}).get("raw")),
         ("tsvm:zero_mnar_vs_pal_rls:raw", boot_map["pal_rls"].get("raw")),
     ]:
