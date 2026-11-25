@@ -297,8 +297,15 @@ def run_iccv_same_bank(
     for p in protos:
         p_out = out_dir / f"{backbone}_{p.lower()}"
         p_json = p_out / "ICCV_PROTOCOL_RESULTS.json"
-        if resume and p_json.is_file():
-            per_proto[p] = json.loads(p_json.read_text(encoding="utf8"))
+        cached_p = json.loads(p_json.read_text(encoding="utf8")) if (resume and p_json.is_file()) else None
+        is_b1_valid = bool(
+            cached_p
+            and cached_p.get("schema") == "mnarm-iccv-protocol-v2"
+            and "balanced_ece" in cached_p.get("arms", {}).get("tsvm", {}).get("regimes", {}).get("raw", {}).get("paired", {})
+        )
+        if is_b1_valid:
+            assert cached_p is not None
+            per_proto[p] = cached_p
         else:
             pcfg = {**config, "protocol": p, "experiment": f"iccv_same_bank_{config.get('dataset', 'crisismmd')}_{backbone}_{p.lower()}"}
             per_proto[p] = run_single_protocol_same_bank(pcfg, seq_inputs, images_dir, p_out, vlm, protos_full, unseen_protos, store, dev_cache, base0_cache=base0_cache)

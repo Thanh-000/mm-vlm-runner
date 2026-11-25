@@ -90,10 +90,11 @@ def build() -> None:
             WS = Path("/content/mnarm_ws")
             CODE_DIR = WS / "repo"
             sys_ram_gb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9) if hasattr(os, "sysconf") else 32.0
+            shm_free_gb = (shutil.disk_usage("/dev/shm").free / 1e9) if Path("/dev/shm").exists() else 0.0
             vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-            DATA_ROOT = Path("/dev/shm/mnarm_data") if (Path("/dev/shm").exists() and sys_ram_gb >= 24.0) else (WS / "data")
-            IMG_DIR = DATA_ROOT / "crisismmd_v2"
-            print(f"[ENV] GPU={{torch.cuda.get_device_name(0)}} VRAM={{vram_gb:.1f}}GB RAM={{sys_ram_gb:.1f}}GB DATA_ROOT={{DATA_ROOT}} TURBO_GPU_CACHE={{vram_gb >= 36.0}}", flush=True)
+            DATA_ROOT = Path("/dev/shm/mnarm_data") if shm_free_gb >= 12.0 else (WS / "data")
+            IMG_DIR = Path("/dev/shm/crisismmd_v2") if (Path("/dev/shm/crisismmd_v2").is_dir() and any(Path("/dev/shm/crisismmd_v2").rglob("*.jpg"))) else (DATA_ROOT / "crisismmd_v2")
+            print(f"[ENV] GPU={{torch.cuda.get_device_name(0)}} VRAM={{vram_gb:.1f}}GB RAM={{sys_ram_gb:.1f}}GB SHM_FREE={{shm_free_gb:.1f}}GB DATA_ROOT={{DATA_ROOT}} TURBO_GPU_CACHE={{vram_gb >= 36.0}}", flush=True)
             for d in (WS, CODE_DIR, DATA_ROOT, IMG_DIR):
                 d.mkdir(parents=True, exist_ok=True)
 
@@ -142,9 +143,9 @@ def build() -> None:
 
             WS = Path("/content/mnarm_ws")
             CODE_DIR = WS / "repo"
-            sys_ram_gb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9) if hasattr(os, "sysconf") else 32.0
-            DATA_ROOT = Path("/dev/shm/mnarm_data") if (Path("/dev/shm").exists() and sys_ram_gb >= 24.0) else (WS / "data")
-            IMG_DIR = DATA_ROOT / "crisismmd_v2"
+            shm_free_gb = (shutil.disk_usage("/dev/shm").free / 1e9) if Path("/dev/shm").exists() else 0.0
+            DATA_ROOT = Path("/dev/shm/mnarm_data") if shm_free_gb >= 12.0 else (WS / "data")
+            IMG_DIR = Path("/dev/shm/crisismmd_v2") if (Path("/dev/shm/crisismmd_v2").is_dir() and any(Path("/dev/shm/crisismmd_v2").rglob("*.jpg"))) else (DATA_ROOT / "crisismmd_v2")
             IMG_DIR.mkdir(parents=True, exist_ok=True)
             site.addsitedir(str(CODE_DIR / "src"))
             importlib.invalidate_caches()
@@ -187,7 +188,12 @@ def build() -> None:
                     if "text/html" not in ct:
                         return r.url, ck
                     body = r.text
-                inputs = {{m.group(1): html.unescape(m.group(2)) for m in re.finditer(r'<input[^>]*name=["\\\']([^"\\\']+)["\\\'][^>]*value=["\\\']([^"\\\']*)["\\\']', body)}}
+                inputs = {{}}
+                for tag in re.findall(r"<input[^>]+>", body, flags=re.I):
+                    mn = re.search(r'name=["\\\']([^"\\\']+)["\\\']', tag, flags=re.I)
+                    mv = re.search(r'value=["\\\']([^"\\\']*)["\\\']', tag, flags=re.I)
+                    if mn and mv:
+                        inputs[mn.group(1)] = html.unescape(mv.group(1))
                 if inputs:
                     return f"https://{{uc_host}}/download?" + urllib.parse.urlencode(inputs), ck
                 return probe, ck

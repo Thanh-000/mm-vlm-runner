@@ -145,13 +145,16 @@ def test_b3_multi_altitude_disaster_suite_contracts_and_isolation(tmp_path: Path
             rel = f"DisasterVQA/Incidents1M/{iid}.jpg"
             _write_rgb(vqa_root / rel, (30, 30 * c_i % 250, 20 * i))
             ann_rows.append({"dataset_source": "incidents1m", "image_id": iid, "image_path": rel, "disaster_type": dt, "crisis_info_code": "SA-1", "question": "What type?", "groundtruth_answer": ["A"], "choices": {"A": dt}})
-            ann_rows.append({"dataset_source": "incidents1m", "image_id": iid, "image_path": rel, "disaster_type": dt, "crisis_info_code": "SA-2", "question": "Visible structural damage?", "groundtruth_answer": ["A"], "choices": {"A": f"Heavy rubble scene {iid}"}})
+            ann_rows.append({"dataset_source": "incidents1m", "image_id": iid, "image_path": rel, "disaster_type": dt, "crisis_info_code": "SA-2", "question": "Visible structural damage? Select all that apply.", "groundtruth_answer": ["A"], "choices": {"A": f"Heavy rubble scene {iid}"}})
+            ann_rows.append({"dataset_source": "incidents1m", "image_id": iid, "image_path": rel, "disaster_type": dt, "crisis_info_code": "OT-1", "question": f"Emergency responders in zone {iid}? Answer with Yes or No.", "groundtruth_answer": "Yes", "choices": None})
     vqa_root.mkdir(parents=True, exist_ok=True)
     (vqa_root / "disastervqa_annotations.jsonl").write_text("\n".join(json.dumps(r) for r in ann_rows), encoding="utf8")
 
     ds_vqa = load_benchmark_contracts("incidents_vqa", vqa_root, vqa_root, "P3", allow_test=False, seed=11)
     assert all(v["uid"].startswith("incvqa:inc_") for v in ds_vqa["lookup"].values())
     assert all("What type?" not in v["text"] for v in ds_vqa["lookup"].values())
+    assert all("Y, e, s" not in v["text"] and "Yes" in v["text"] for v in ds_vqa["lookup"].values())
+    assert all("Select all that apply." not in v["text"] and "Answer with Yes or No." not in v["text"] for v in ds_vqa["lookup"].values())
     assert all(r["mask"] == ["text"] for r in ds_vqa["stages"][0]["fit"])
 
     # 3. Mock DisasterM3 (8 classes, strips DISASTER header, groups Optical+SAR by pre_image_path)
@@ -202,17 +205,18 @@ def test_tar_archive_unpacking_traversal_guard_and_wrapper_unwrap(tmp_path: Path
     with pytest.raises(ValueError):
         extract_archive_safe(bad_tar, tmp_path / "out_bad")
 
-    # 2. Pack DMD, nested DisasterVQA-Dataset-v3 (with CrisisMMD/MEDIC to strip), and DisasterM3 into .tar
+    # 2. Pack DMD (real UCI #456 multimodal/<cls>/{images,text} layout), nested DisasterVQA-Dataset-v3 (with CrisisMMD/MEDIC to strip), and DisasterM3 into .tar
     dmd_tar = tmp_path / "dmd.tar"
     with tarfile.open(dmd_tar, "w") as tf:
-        for cls_dir in ("fires", "floods", "natural_landscape", "infrastructural", "human_damage", "non_damage"):
+        for cls_dir in ("fires", "flood", "damaged_nature", "damaged_infrastructure", "human_damage", "non_damage"):
             for i in range(6):
-                img_f = tmp_path / "src_dmd" / cls_dir / f"{cls_dir}_{i}.jpg"
+                img_f = tmp_path / "src_dmd" / "multimodal" / cls_dir / "images" / f"{cls_dir}_{i}.jpg"
                 _write_rgb(img_f, (25 * i, 50, 90))
-                txt_f = img_f.with_suffix(".txt")
+                txt_f = tmp_path / "src_dmd" / "multimodal" / cls_dir / "text" / f"{cls_dir}_{i}.txt"
+                txt_f.parent.mkdir(parents=True, exist_ok=True)
                 txt_f.write_text(f"DMD tar sample {cls_dir} idx {i}", encoding="utf8")
-                tf.add(img_f, arcname=f"{cls_dir}/{img_f.name}")
-                tf.add(txt_f, arcname=f"{cls_dir}/{txt_f.name}")
+                tf.add(img_f, arcname=f"./multimodal/{cls_dir}/images/{img_f.name}")
+                tf.add(txt_f, arcname=f"./multimodal/{cls_dir}/text/{txt_f.name}")
     dmd_unpacked = prepare_dmd(tmp_path / "dmd_ext", archive_path=dmd_tar)
     assert load_benchmark_contracts("dmd", dmd_unpacked, dmd_unpacked, "P4", allow_test=False)["num_classes"] == 6
 

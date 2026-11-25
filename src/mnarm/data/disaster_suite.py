@@ -80,7 +80,7 @@ _DMD_DIR_MAP = {
     "floods": 1, "flood": 1,
     "natural_landscape": 2, "damaged_nature": 2, "nature": 2,
     "infrastructural": 3, "damaged_infrastructure": 3, "infrastructure": 3,
-    "human_damage": 4, "human": 4,
+    "human_damage": 4, "damaged_human": 4, "human": 4,
     "non_damage": 5, "nondamage": 5, "non_damaged": 5,
 }
 _INC_MAP = {
@@ -92,9 +92,10 @@ _M3_MAP = {
     "hurricane": 3, "flood": 4, "flooding": 4, "tsunami": 5, "explosion": 6, "volcano": 7,
 }
 _M3_MASK_RE = re.compile(
-    r"\b(earthquakes?|wildfires?|bushfires?|fires?|tornad(?:o|oes)|hurricanes?|flood(?:ing|s)?|tsunamis?|explosions?|volcan(?:o|oes|ic))\b",
+    r"\b(earthquakes?|wildfires?|bushfires?|fires?|accidents?|storms?|landslides?|tornad(?:o|oes)|hurricanes?|flood(?:ing|s)?|tsunamis?|explosions?|volcan(?:o|oes|ic))\b",
     re.IGNORECASE,
 )
+_VQA_BOILER_RE = re.compile(r"\s*(?:Select all that apply\.|Answer with Yes or No\.)", re.IGNORECASE)
 
 
 def prepare_dmd(dest_dir: Path, archive_path: Path | None = None) -> Path:
@@ -121,6 +122,8 @@ def prepare_dmd(dest_dir: Path, archive_path: Path | None = None) -> Path:
 def prepare_incidents_vqa(dest_dir: Path, archive_path: Path | None = None) -> Path:
     """Unpack (.tar/.zip) or fetch 0%-overlapping QCRI/DisasterVQA incidents1m subset."""
     dest_dir.mkdir(parents=True, exist_ok=True)
+    if any(dest_dir.rglob("disastervqa_annotations.jsonl")) and any(dest_dir.rglob("*.jpg")):
+        return dest_dir
     if archive_path is not None and archive_path.is_file():
         extract_archive_safe(archive_path, dest_dir)
         ann_hits = list(dest_dir.rglob("disastervqa_annotations.jsonl"))
@@ -153,6 +156,8 @@ def prepare_incidents_vqa(dest_dir: Path, archive_path: Path | None = None) -> P
 def prepare_disaster_m3(dest_dir: Path, archive_path: Path | None = None) -> Path:
     """Unpack (.tar/.zip) or fetch NeurIPS'25 DisasterM3 Optical+SAR tiles via LFS Batch CDN."""
     dest_dir.mkdir(parents=True, exist_ok=True)
+    if any(dest_dir.rglob("benchmark_release.json")) and any(dest_dir.rglob("*.png")):
+        return dest_dir
     if archive_path is not None and archive_path.is_file():
         extract_archive_safe(archive_path, dest_dir)
         return dest_dir
@@ -182,7 +187,10 @@ def _scan_dmd_records(root: Path) -> list[dict[str, Any]]:
         cls_idx = next((_DMD_DIR_MAP[p.lower()] for p in reversed(img_p.parts[:-1]) if p.lower() in _DMD_DIR_MAP), None)
         if cls_idx is None:
             continue
-        txt_p = next((c for c in (img_p.with_suffix(".txt"), img_p.parent / "text" / f"{img_p.stem}.txt") if c.is_file()), None)
+        txt_p = next(
+            (c for c in (img_p.with_suffix(".txt"), img_p.parent / "text" / f"{img_p.stem}.txt", img_p.parent.parent / "text" / f"{img_p.stem}.txt") if c.is_file()),
+            None,
+        )
         if txt_p is None:
             continue
         txt = " ".join(txt_p.read_text(encoding="utf8", errors="replace").split())
@@ -220,9 +228,12 @@ def _scan_incidents_vqa_records(root: Path) -> list[dict[str, Any]]:
             if r.get("crisis_info_code") == "SA-1":
                 continue
             ch = r.get("choices") or {}
-            ans_list = [str(ch.get(a, a)) if isinstance(ch, dict) else str(a) for a in (r.get("groundtruth_answer") or [])]
-            q_clean = _M3_MASK_RE.sub("hazard event", str(r.get("question", "")))
-            qa_parts.append(f"{q_clean} {', '.join(ans_list)}")
+            raw_ans = r.get("groundtruth_answer")
+            ans_items = raw_ans if isinstance(raw_ans, (list, tuple)) else ([raw_ans] if raw_ans not in (None, "") else [])
+            ans_list = [str(ch.get(a, a)) if isinstance(ch, dict) else str(a) for a in ans_items]
+            q_clean = _VQA_BOILER_RE.sub("", _M3_MASK_RE.sub("hazard event", str(r.get("question", "")))).strip()
+            a_clean = _M3_MASK_RE.sub("hazard event", ", ".join(ans_list)).strip()
+            qa_parts.append(f"{q_clean} {a_clean}".strip())
         if qa_parts:
             records.append({"uid": f"incvqa:{img_id}", "group_id": img_id, "label": _INC_MAP[dtype], "text": " | ".join(qa_parts), "image": img_p})
     return records
