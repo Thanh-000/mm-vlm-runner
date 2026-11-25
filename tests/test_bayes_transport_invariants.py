@@ -196,3 +196,64 @@ def test_nullspace_pathology_protection_under_low_shrinkage() -> None:
         assert ev_safe["paired"]["early_recall"] > 0.80, f"{safe_mode} paired early_recall={ev_safe['paired']['early_recall']}"
         assert ev_safe["paired"]["macro_f1"] > 0.85, f"{safe_mode} paired macro_f1={ev_safe['paired']['macro_f1']}"
 
+
+def test_streaming_bank_multiclass_oof_tau_prevents_insample_overconfidence() -> None:
+    """Verify OOF multi-class tau on small Stage-4 probes prevents overconfidence for both P4 and P3."""
+    g = torch.Generator().manual_seed(73)
+    dim, classes = 128, list(range(8))
+    early, late = [0, 1, 4, 5], [2, 3, 6, 7]
+    stages = [([0, 5], False), ([1, 4], False), ([2, 6], True), ([3, 7], True)]
+    sem = torch.cat([torch.zeros(8, 3), F.normalize(torch.randn(8, dim - 3, generator=g), dim=-1)], dim=-1)
+    mu_p, mu_i, mu_t = torch.zeros(dim), torch.zeros(dim), torch.zeros(dim)
+    mu_p[0], mu_i[1], mu_t[2] = 1.0, 1.0, 1.0
+    protos = F.normalize(0.86 * mu_p.unsqueeze(0) + 0.51 * sem, dim=-1)
+    q_i = _pos_qr(torch.eye(dim) + 0.05 * torch.randn(dim, dim, generator=g))
+    q_t = _pos_qr(torch.eye(dim) + 0.05 * torch.randn(dim, dim, generator=g))
+
+    def _draw(cls_list: list[int], n_per: int, tower: str) -> tuple[torch.Tensor, torch.Tensor]:
+        cone = mu_i if tower == "image" else mu_t
+        rot = q_i if tower == "image" else q_t
+        noise = 0.07 if tower == "image" else 0.05
+        xs, ys = [], []
+        for c in cls_list:
+            ctr = F.normalize(0.84 * cone + 0.54 * (rot @ sem[c]), dim=-1)
+            xs.append(l2_normalize(ctr.unsqueeze(0) + noise * torch.randn(n_per, dim, generator=g)))
+            ys.append(torch.full((n_per,), c, dtype=torch.long))
+        return torch.cat(xs, dim=0), torch.cat(ys, dim=0)
+
+    dev_ix, dev_y = _draw(classes, 40, "image")
+    dev_tx, _ = _draw(classes, 40, "text")
+    for proto in ("P4", "P3"):
+        missing_tw = "text" if proto == "P4" else "image"
+        bank = StreamingClassBank()
+        probe_x_t = probe_y_t = probe_x_i = probe_y_i = None
+        for st_cls, paired in stages:
+            xi, yi = _draw(st_cls, 30, "image")
+            xt, yt = _draw(st_cls, 30, "text")
+            if proto == "P4":
+                tx_in, ty_in = (xt, yt) if paired else (None, None)
+                ix_in, iy_in = xi, yi
+            else:
+                tx_in, ty_in = xt, yt
+                ix_in, iy_in = (xi, yi) if paired else (None, None)
+            bank.update_stage(
+                u_expert_t=tx_in, u_base_t=tx_in, y_t=ty_in,
+                u_expert_i=ix_in, u_base_i=ix_in, y_i=iy_in,
+                paired_base_t=xt if paired else None, paired_base_i=xi if paired else None,
+            )
+            probe_x_t, probe_y_t, probe_x_i, probe_y_i = xt, yt, xi, yi
+
+        assert probe_x_t is not None and probe_x_i is not None
+        stats = bank.transport_to_target_stats(
+            bridge_u0_t=probe_x_t, bridge_um_t=probe_x_t, bridge_u0_i=probe_x_i, bridge_um_i=probe_x_i,
+            seen_classes=classes, probe_y_t=probe_y_t, probe_y_i=probe_y_i,
+        )
+        head = SelfNormalizedBayesTransportHead(bridge_mode="cross_modal_transport", partial_cov_mode="isotropic_vmf").fit_from_sufficient_stats(
+            stats["towers"], stats["paired"][0], stats["paired"][1], protos, classes
+        )
+        ev = eval_view_suite(head.predict_views(dev_tx, dev_ix), dev_y, classes, early, late)
+        assert ev["paired"]["macro_f1"] > 0.85, f"{proto} paired macro_f1={ev['paired']['macro_f1']}"
+        assert ev[missing_tw]["early_recall"] > 0.70, f"{proto} {missing_tw} early_recall={ev[missing_tw]['early_recall']}"
+        assert ev["paired"]["ece"] < 0.15, f"{proto} paired ece={ev['paired']['ece']}"
+
+

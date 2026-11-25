@@ -129,7 +129,7 @@ def _render_report(results: dict[str, Any], out_path: Path) -> None:
     lines = [
         f"# Pilot F1 Report — {cfg['backbone']} {cfg['protocol']} (dev-Only, 0 D_cal Labels)\n",
         f"- **Verdict:** `{verdict['status']}` (Gate 1 Collider Kill: `{verdict['gate1_pass']}`, Gate 2 0-Label Parity/Win: `{verdict['gate2_pass']}`)",
-        f"- **Max theta_T (L_MNAR replay/joint):** `{verdict['max_lmnar_theta_t_deg']:.2f} deg` (target `< {cfg['gates']['max_theta_deg']:.1f} deg`)",
+        f"- **Max theta_{str(verdict.get('mnar_tower', 'text'))[0].upper()} (replay/joint vs tsvm):** `{verdict['max_lmnar_theta_t_deg']:.2f} deg` vs `{verdict.get('tsvm_theta_deg', verdict['max_lmnar_theta_t_deg']):.2f} deg` (target `< {cfg['gates']['max_theta_deg']:.1f} deg`)",
         f"- **Best 0-Label H_ZERO-MNAR:** `{verdict['best_arm']}` / `{verdict['best_variant']}` -> Paired Macro-F1 = **`{verdict['best_paired_f1']*100:.2f}%`**, 3-View Mean = **`{verdict['best_view3_mean_f1']*100:.2f}%`**\n",
         "| Arm | Variant | Text F1 | Image F1 | Paired F1 | 7-Cls F1 | 3-View Mean | ECE (P) | theta_T / theta_I |",
         "|---|---|---:|---:|---:|---:|---:|---:|---:|",
@@ -157,7 +157,11 @@ def _render_report(results: dict[str, Any], out_path: Path) -> None:
     out_path.write_text(text, encoding="utf8")
 
 
-def run_pilot_f1(config: dict[str, Any], seq_inputs: Path, images_dir: Path, out_dir: Path, model_override: str | None = None) -> dict[str, Any]:
+def run_pilot_f1(
+    config: dict[str, Any], seq_inputs: Path, images_dir: Path, out_dir: Path, model_override: str | None = None,
+    vlm: MultimodalVLM | None = None, protos_full: torch.Tensor | None = None,
+    store: PreprocessedTensorStore | None = None, dev_cache: dict[tuple[str, ...], torch.Tensor] | None = None,
+) -> dict[str, Any]:
     """Execute strict dev-only Pilot F1 comparison of Standard CE vs H_ZERO-MNAR."""
     if bool(config.get("allow_test", False)):
         raise ValueError("Pilot F1 strictly forbids allow_test=True! Only Stage-frozen final runs may open test.")
@@ -168,13 +172,13 @@ def run_pilot_f1(config: dict[str, Any], seq_inputs: Path, images_dir: Path, out
     use_amp = bool(config.get("use_amp", True)) and device == "cuda"
 
     ds = load_crisismmd_contracts(seq_inputs, images_dir, config["protocol"], allow_test=False)
-    vlm = MultimodalVLM(
+    vlm = vlm or MultimodalVLM(
         config["backbone"], model_override or config["model_id"], device=device,
         rank=int(config["lora_rank"]), alpha=int(config["lora_alpha"]),
         revision=None if model_override else config.get("revision"), local_files_only=bool(model_override),
     )
-    protos_full = vlm.encode_prompts(ds["orig_prompts"])
-    store = PreprocessedTensorStore(ds["lookup"], vlm, max_cached_images=int(config.get("max_cached_images", 25000)), workers=int(config.get("workers", 4)))
+    protos_full = vlm.encode_prompts(ds["orig_prompts"]) if protos_full is None else protos_full
+    store = store or PreprocessedTensorStore(ds["lookup"], vlm, max_cached_images=int(config.get("max_cached_images", 25000)), workers=int(config.get("workers", 4)))
     profiler = Profiler()
     out_dir.mkdir(parents=True, exist_ok=True)
     write_json_atomic(out_dir / "RUN_LOCK.json", build_run_lock(config, repo_root=Path(__file__).resolve().parents[3], dataset_hashes=ds["hashes"]))
@@ -184,17 +188,19 @@ def run_pilot_f1(config: dict[str, Any], seq_inputs: Path, images_dir: Path, out
     dev_rows = [r for r in ds["dev"] if int(r["label"]) in set(seen)]
     dev_labels = [int(r["label"]) for r in dev_rows]
     t0 = time.perf_counter()
-    dev_cache: dict[tuple[str, ...], torch.Tensor] = {}
+    dev_cache = {} if dev_cache is None else dev_cache
     dev0_t, dev0_i, dev_y = extract_paired_features_cached(
         vlm=vlm, kind="lora", payload={}, records=dev_rows, tensor_store=store,
         batch_size=int(config["eval_batch_size"]), cache=dev_cache, use_amp=use_amp,
     )
     print(f"[INIT] {config['backbone']} {config['protocol']} ready on {device} ({time.perf_counter() - t0:.1f}s) | dev={len(dev_rows)}", flush=True)
 
+    objectives = list(config.get("objectives", ["std_ce", "l_mnar"]))
+    mnar_tw = "image" if config["protocol"] in ("P1", "P3") else "text"
     arms_out: dict[str, Any] = {}
     boot_logits: dict[str, torch.Tensor] = {}
-    traj: dict[str, list[dict[str, Any]]] = {"std_ce_seq_replay": [], "l_mnar_seq_replay": []}
-    for obj in ("std_ce", "l_mnar"):
+    traj: dict[str, list[dict[str, Any]]] = {f"{obj}_seq_replay": [] for obj in objectives}
+    for obj in objectives:
         exp_deltas: list[dict[str, torch.Tensor]] = []
         bank = StreamingClassBank()
         rep_state: dict[str, torch.Tensor] | None = None
@@ -277,32 +283,44 @@ def run_pilot_f1(config: dict[str, Any], seq_inputs: Path, images_dir: Path, out
             print(f"[EVAL {aname}] best_paired={best_v_f1*100:.2f}% | theta_T={arec['cone_drift']['text']['theta_deg']:.2f} deg ({time.perf_counter() - t0:.1f}s)", flush=True)
 
     best_arm, best_var, best_p, best_3m = None, None, -1.0, -1.0
-    boot_vs_ce: dict[str, Any] = {}
+    best_lmnar_p: float | None = None
     for aname, arec in arms_out.items():
-        if not aname.startswith("l_mnar"):
-            continue
         for vname, vrec in arec["variants"].items():
-            if not vname.startswith("bayes_") or "bayes_none_" in vname:
+            if not vname.startswith("bayes_") or "bayes_none_" in vname or "bayes_prompt_" in vname:
                 continue
             p_f1 = vrec["paired"]["macro_f1"]
+            if aname.startswith("l_mnar"):
+                best_lmnar_p = p_f1 if best_lmnar_p is None else max(best_lmnar_p, p_f1)
             if p_f1 > best_p:
                 best_arm, best_var, best_p, best_3m = aname, vname, p_f1, vrec["summary"]["view3_mean_f1"]
-        suffix = aname.replace("l_mnar_", "")
-        ref_key = f"std_ce_{suffix}:raw_proto"
-        for btag in ("bayes_cm_sfloor_0lab", "bayes_cm_vmf_0lab"):
-            if ref_key in boot_logits and f"{aname}:{btag}" in boot_logits:
-                boot_vs_ce[f"{aname}:{btag}_vs_{suffix}_raw"] = paired_bootstrap_diff(
-                    boot_logits[f"{aname}:{btag}"], boot_logits[ref_key], dev_y, seen, seed=seed
-                )
 
-    max_th = max(arms_out["l_mnar_seq_replay"]["cone_drift"]["text"]["theta_deg"], arms_out["l_mnar_joint"]["cone_drift"]["text"]["theta_deg"])
+    boot_vs_ce: dict[str, Any] = {}
+    for aname in arms_out:
+        for prefix, btags in (("std_ce", ("bayes_cm_vmf_0lab",)), ("l_mnar", ("bayes_cm_sfloor_0lab", "bayes_cm_vmf_0lab"))):
+            if not aname.startswith(f"{prefix}_"):
+                continue
+            suffix = aname[len(prefix) + 1 :]
+            if prefix == "std_ce" and suffix not in ("tsvm", "ta_sum"):
+                continue
+            ref_key = f"std_ce_{suffix}:raw_proto"
+            for btag in btags:
+                if ref_key in boot_logits and f"{aname}:{btag}" in boot_logits:
+                    boot_vs_ce[f"{aname}:{btag}_vs_{suffix}_raw"] = paired_bootstrap_diff(boot_logits[f"{aname}:{btag}"], boot_logits[ref_key], dev_y, seen, seed=seed)
+
+    if "l_mnar_seq_replay" in arms_out and "l_mnar_joint" in arms_out:
+        max_th = max(arms_out[a]["cone_drift"][mnar_tw]["theta_deg"] for a in ("l_mnar_seq_replay", "l_mnar_joint"))
+    else:
+        max_th = arms_out["std_ce_tsvm"]["cone_drift"][mnar_tw]["theta_deg"]
+    tsvm_th = arms_out["l_mnar_tsvm" if "l_mnar_tsvm" in arms_out else "std_ce_tsvm"]["cone_drift"][mnar_tw]["theta_deg"]
     gates = config["gates"]
     g1 = max_th < float(gates["max_theta_deg"])
     g2 = best_p >= float(gates["min_paired_f1"]) and best_3m >= float(gates["min_view3_mean_f1"])
     verdict = {
         "status": "PASS" if (g1 and g2) else ("PARTIAL" if (g1 or g2) else "FAIL"),
         "gate1_pass": g1, "gate2_pass": g2, "max_lmnar_theta_t_deg": float(max_th),
-        "best_arm": best_arm, "best_variant": best_var, "best_paired_f1": float(best_p), "best_view3_mean_f1": float(best_3m),
+        "tsvm_theta_deg": float(tsvm_th), "mnar_tower": mnar_tw,
+        "best_arm": best_arm, "best_variant": best_var, "best_paired_f1": float(best_p),
+        "best_view3_mean_f1": float(best_3m), "best_lmnar_paired_f1": best_lmnar_p,
     }
     payload_out = {"schema": "mnarm-pilot-f1-v1", "config": config, "verdict": verdict, "arms": arms_out, "stage_trajectory": traj, "bootstrap_vs_std_ce": boot_vs_ce, "profiling": profiler.records}
     write_json_atomic(out_dir / "PILOT_F1_DEV_RESULTS.json", payload_out)

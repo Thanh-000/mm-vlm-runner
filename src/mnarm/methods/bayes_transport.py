@@ -118,6 +118,41 @@ def _fit_oof_tau(oof_scores: torch.Tensor, oof_y_local: torch.Tensor, num_obs: i
     return float(torch.exp(torch.clamp(log_tau.detach(), -12.0, 6.0)).item())
 
 
+def _fit_bank_probe_oof_tau(probe_x: torch.Tensor, probe_y: torch.Tensor, centroids: dict[int, torch.Tensor], obs: list[int], prec: torch.Tensor, is_partial: bool, partial_cov_mode: str, calib_folds: int) -> float:
+    """Estimate OOF temperature on probe samples scored against ALL |obs| bank classes."""
+    obs_map = {int(c): i for i, c in enumerate(obs)}
+    py_all = probe_y.detach().cpu().long()
+    keep = [i for i, v in enumerate(py_all.tolist()) if int(v) in obs_map]
+    if len(obs) < 2 or not keep:
+        return 0.05
+    p_u = l2_normalize(probe_x).to(dtype=torch.float64, device="cpu")[keep]
+    py = py_all[keep]
+    p_obs = sorted({int(v) for v in py.tolist()})
+    p_counts = [int((py == c).sum().item()) for c in p_obs]
+    if p_obs and min(p_counts) >= 2:
+        folds = _stratified_folds([int(v) for v in py.tolist()], min(calib_folds, min(p_counts)))
+        oof_scores, oof_y, all_idx, obs_rng = [], [], set(range(int(p_u.shape[0]))), list(range(len(obs)))
+        for f_idx in folds:
+            tr_idx = sorted(all_idx - set(f_idx))
+            u_tr, y_tr = p_u[tr_idx], py[tr_idx]
+            mu_list = [u_tr[y_tr == c].mean(dim=0) if (c in p_obs and bool((y_tr == c).any())) else centroids[c] for c in obs]
+            mu_f = torch.stack(mu_list, dim=0)
+            if is_partial and partial_cov_mode != "raw_oas":
+                mu_f = _equalize_mahalanobis_centroids(mu_f, prec, obs_rng)
+            w_f = mu_f @ prec
+            oof_scores.append(p_u[f_idx] @ w_f.T + (-0.5 * (mu_f * w_f).sum(dim=-1)).unsqueeze(0))
+            oof_y.append(torch.tensor([obs_map[int(v)] for v in py[f_idx].tolist()], dtype=torch.long))
+        return _fit_oof_tau(torch.cat(oof_scores, dim=0), torch.cat(oof_y, dim=0), len(obs))
+    if p_u.shape[0] < 2:
+        return 0.05
+    mu_f = torch.stack([centroids[c] for c in obs], dim=0)
+    if is_partial and partial_cov_mode != "raw_oas":
+        mu_f = _equalize_mahalanobis_centroids(mu_f, prec, list(range(len(obs))))
+    w_f = mu_f @ prec
+    scores = p_u @ w_f.T + (-0.5 * (mu_f * w_f).sum(dim=-1)).unsqueeze(0)
+    return _fit_oof_tau(scores, torch.tensor([obs_map[int(v)] for v in py.tolist()], dtype=torch.long), len(obs))
+
+
 class SelfNormalizedBayesTransportHead:
     """Zero-D_cal-label generative Shrinkage-LDA classifier with cross-modal gap transport."""
 
@@ -253,16 +288,7 @@ class SelfNormalizedBayesTransportHead:
 
             tau_m, probe_x, probe_y = float(st.get("tau", 0.0)), st.get("probe_x"), st.get("probe_y")
             if tau_m <= 0.0 and probe_x is not None and probe_y is not None:
-                p_obs = sorted({int(v) for v in probe_y.tolist()})
-                if len(p_obs) >= 2:
-                    p_u, p_map = l2_normalize(probe_x).to(dtype=torch.float64, device="cpu"), {c: i for i, c in enumerate(p_obs)}
-                    mu_p = torch.stack([centroids[c] for c in p_obs], dim=0)
-                    if is_partial and self.partial_cov_mode != "raw_oas":
-                        mu_p = _equalize_mahalanobis_centroids(mu_p, prec, list(range(len(p_obs))))
-                    w_p = mu_p @ prec
-                    tau_m = _fit_oof_tau(p_u @ w_p.T + (-0.5 * (mu_p * w_p).sum(dim=-1)).unsqueeze(0), torch.tensor([p_map[int(v)] for v in probe_y.tolist()], dtype=torch.long), len(p_obs))
-                else:
-                    tau_m = 0.05
+                tau_m = _fit_bank_probe_oof_tau(probe_x, probe_y, centroids, obs, prec, is_partial, self.partial_cov_mode, self.calib_folds)
             elif tau_m <= 0.0:
                 tau_m = 0.05
 

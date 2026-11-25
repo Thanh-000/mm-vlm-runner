@@ -131,8 +131,12 @@ def compute_multimodal_lmnar_loss(
     labels_global: torch.Tensor,
     seen_classes: list[int],
     graph_info: dict[str, Any],
+    adjustment_mode: str = "propensity",
 ) -> torch.Tensor:
     """Compute per-tower support-aware L_MNAR risk summed/averaged over active modalities."""
+    if adjustment_mode not in ("propensity", "prior"):
+        raise ValueError(f"Unsupported adjustment_mode={adjustment_mode!r}")
+    prop_key = "tower_propensities" if adjustment_mode == "propensity" else "tower_priors"
     seen = [int(c) for c in seen_classes]
     p_seen = F.normalize(protos_full[seen].float(), dim=-1)
     losses: list[torch.Tensor] = []
@@ -147,7 +151,7 @@ def compute_multimodal_lmnar_loss(
             labels_global=labels_global,
             seen_classes=seen,
             supported_classes=graph_info["tower_supports"][tw],
-            propensities=graph_info.get("tower_priors", graph_info["tower_propensities"])[tw],
+            propensities=graph_info[prop_key][tw],
         )
         losses.append(loss_tw)
     if not losses:

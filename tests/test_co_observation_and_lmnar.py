@@ -86,7 +86,8 @@ def test_lmnar_zero_gradient_on_unsupported_classes() -> None:
     loss_both.backward()
     assert torch.isfinite(loss_both)
 
-    # Full conditional priors P_train(y | M=tw) must sum to 1.0 on supported classes, 0.0 on unsupported, even under 10:1 imbalance
+    # Under 10:1 imbalance with uniform propensity=1.0, default "propensity" mode must stay class-unbiased
+    # (matching equal-propensity logits/gradients), while "prior" mode still preserves exact zero gradient on [0, 1].
     imb_recs = (
         [_rec(f"e0_{i}", 0, ["image"]) for i in range(5)]
         + [_rec(f"e1_{i}", 1, ["image"]) for i in range(5)]
@@ -94,11 +95,34 @@ def test_lmnar_zero_gradient_on_unsupported_classes() -> None:
         + [_rec(f"l3_{i}", 3, ["text", "image"]) for i in range(2)]
     )
     g_imb = analyze_co_observation_graph(imb_recs, seen)
+    assert abs(g_imb["tower_propensities"]["text"][2] - 1.0) < 1e-6
+    assert abs(g_imb["tower_propensities"]["text"][3] - 1.0) < 1e-6
     tp_txt = g_imb["tower_priors"]["text"]
     assert tp_txt[0] == 0.0 and tp_txt[1] == 0.0
     assert abs(sum(tp_txt[c] for c in (2, 3)) - 1.0) < 1e-6
     assert abs(tp_txt[2] - (20.0 / 22.0)) < 1e-6
+
+    bal_recs = (
+        [_rec(f"e0b_{i}", 0, ["image"]) for i in range(5)]
+        + [_rec(f"e1b_{i}", 1, ["image"]) for i in range(5)]
+        + [_rec(f"l2b_{i}", 2, ["text", "image"]) for i in range(5)]
+        + [_rec(f"l3b_{i}", 3, ["text", "image"]) for i in range(5)]
+    )
+    g_bal = analyze_co_observation_graph(bal_recs, seen)
     protos.grad.zero_()
-    compute_multimodal_lmnar_loss({"text": ft}, protos, 20.0, y_late, seen, g_imb).backward()
+    loss_prop_imb = compute_multimodal_lmnar_loss({"text": ft}, protos, 20.0, y_late, seen, g_imb)
+    loss_prop_imb.backward()
+    grad_prop_imb = protos.grad.clone()
+    assert float(grad_prop_imb[[0, 1]].abs().max().item()) == 0.0
+
+    protos.grad.zero_()
+    loss_prop_bal = compute_multimodal_lmnar_loss({"text": ft}, protos, 20.0, y_late, seen, g_bal, adjustment_mode="propensity")
+    loss_prop_bal.backward()
+    assert float((loss_prop_imb - loss_prop_bal).abs().item()) < 1e-6
+    assert float((grad_prop_imb - protos.grad).abs().max().item()) < 1e-6
+
+    protos.grad.zero_()
+    compute_multimodal_lmnar_loss({"text": ft}, protos, 20.0, y_late, seen, g_imb, adjustment_mode="prior").backward()
     assert float(protos.grad[[0, 1]].abs().max().item()) == 0.0
+    assert float((grad_prop_imb - protos.grad)[[2, 3]].abs().max().item()) > 1e-3
 

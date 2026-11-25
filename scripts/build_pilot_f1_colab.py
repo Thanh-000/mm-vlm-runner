@@ -45,13 +45,13 @@ def build() -> None:
     cells = [
         _cell(
             """
-            # Pilot F1 — Falsification Test of H_ZERO-MNAR (Strict dev-Only, 0 D_cal Labels)
+            # CrisisMMD P1-P4 Suite — Zero-D_cal, Zero-Exemplar H_ZERO-MNAR (dev-Only)
 
-            Runs `L_MNAR` + `SelfNormalizedBayesTransportHead` vs `Standard CE` on **CrisisMMD P4 (`dev` only)**:
+            Runs `std_ce` + `l_mnar` with `SelfNormalizedBayesTransportHead` (`0` `D_cal` labels, `0` exemplars) across **CrisisMMD `P4`, `P3`, `P2`, `P1` (`dev` only)**:
             1. Installs clean `mnarm` package and runs full `pytest -v` preflight gate FIRST.
-            2. Fetches pinned HuggingFace snapshots (`CLIP` + `SigLIP`) and CrisisMMD images (`train` + `dev` only) from official HF commit `10a5626`.
-            3. Runs `configs/pilot_f1_clip_p4.yaml` and `configs/pilot_f1_siglip_p4.yaml` with `allow_test=false`.
-            4. Displays `PILOT_F1_REPORT.md` and downloads `PILOT_F1_RESULTS.zip`.
+            2. Fetches/reuses CrisisMMD `train` + `dev` images (already cached in `/dev/shm` if rerunning in a live session).
+            3. Runs `mnarm.runners.crisismmd_p1_p4` concurrently for CLIP and SigLIP (single shared VLM per backbone across all protocols).
+            4. Displays `CRISISMMD_P1_P4_*_SUMMARY.md`, per-protocol reports, and downloads `CRISISMMD_P1_P4_DEV_RESULTS.zip`.
             """,
             kind="markdown",
             cid="pf1-cell-0",
@@ -59,9 +59,15 @@ def build() -> None:
         _cell(
             """
             #@title Configuration { display-mode: "form" }
-            RUN_CLIP_P4 = True  # @param {type:"boolean"}
-            RUN_SIGLIP_P4 = True  # @param {type:"boolean"}
+            RUN_CLIP = True  # @param {type:"boolean"}
+            RUN_SIGLIP = True  # @param {type:"boolean"}
             PARALLEL_BACKBONES = True  # @param {type:"boolean"}
+            RUN_P4 = True  # @param {type:"boolean"}
+            RUN_P3 = True  # @param {type:"boolean"}
+            RUN_P2 = True  # @param {type:"boolean"}
+            RUN_P1 = True  # @param {type:"boolean"}
+            INCLUDE_LMNAR_ON_P1_P2 = False  # @param {type:"boolean"}
+            RESUME_COMPLETED = True  # @param {type:"boolean"}
             MOUNT_DRIVE = False  # @param {type:"boolean"}
             DRIVE_CONTRACTS_PATH = ""  # @param {type:"string"}
             A2Z_INPUTS_URL = ""  # @param {type:"string"}
@@ -77,11 +83,11 @@ def build() -> None:
             import torch
 
             if not torch.cuda.is_available():
-                raise RuntimeError("Enable GPU runtime in Colab before executing Pilot F1.")
+                raise RuntimeError("Enable GPU runtime in Colab before executing CrisisMMD P1-P4.")
 
             WS = Path("/content/mnarm_ws")
             CODE_DIR = WS / "repo"
-            OUT_DIR = WS / "outputs"
+            OUT_DIR = WS / "outputs_p1_p4"
             IMG_DIR = Path("/dev/shm/crisismmd_v2") if Path("/dev/shm").exists() else (WS / "crisismmd_v2")
             for d in (WS, CODE_DIR, OUT_DIR, IMG_DIR):
                 d.mkdir(parents=True, exist_ok=True)
@@ -305,19 +311,28 @@ def build() -> None:
             import torch
             from IPython.display import Markdown, display
 
+            OUT_DIR = WS / "outputs_p1_p4"
+            OUT_DIR.mkdir(parents=True, exist_ok=True)
             run_env = {**os.environ, "PYTHONPATH": str(CODE_DIR / "src") + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")}
             print_lock = threading.Lock()
+            sel_protos = [p for flag, p in ((RUN_P4, "P4"), (RUN_P3, "P3"), (RUN_P2, "P2"), (RUN_P1, "P1")) if flag]
+            if not sel_protos:
+                raise RuntimeError("Enable at least one of RUN_P4, RUN_P3, RUN_P2, RUN_P1.")
 
-            def _run_job(tag, cfg_rel, out_sub):
+            def _run_job(tag, cfg_rel, out_sub, bb_name):
                 out_path = OUT_DIR / out_sub
                 out_path.mkdir(parents=True, exist_ok=True)
                 log_path = OUT_DIR / f"{out_sub}.log"
                 cmd = [
-                    sys.executable, "-u", "-m", "mnarm.runners.pilot_f1",
+                    sys.executable, "-u", "-m", "mnarm.runners.crisismmd_p1_p4",
                     "--config", str(CODE_DIR / cfg_rel),
                     "--seq-inputs", str(SEQ_DIR), "--images", str(IMG_DIR),
-                    "--out", str(out_path),
+                    "--out", str(out_path), "--protocols", *sel_protos,
                 ]
+                if INCLUDE_LMNAR_ON_P1_P2:
+                    cmd.append("--include-lmnar-p1-p2")
+                if RESUME_COMPLETED:
+                    cmd.append("--resume")
                 tail = deque(maxlen=40)
                 with log_path.open("w", encoding="utf8") as lf:
                     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=run_env)
@@ -330,17 +345,17 @@ def build() -> None:
                     rc = proc.wait()
                 if rc != 0:
                     raise RuntimeError(f"{tag} failed (exit={rc}). Last 40 log lines:\\n" + "\\n".join(tail))
-                return out_sub
+                return out_sub, bb_name
 
             jobs = []
-            if RUN_CLIP_P4:
-                jobs.append(("CLIP_P4", "configs/pilot_f1_clip_p4.yaml", "clip_p4"))
-            if RUN_SIGLIP_P4:
-                jobs.append(("SIGLIP_P4", "configs/pilot_f1_siglip_p4.yaml", "siglip_p4"))
+            if RUN_CLIP:
+                jobs.append(("CLIP", "configs/crisismmd_p1_p4_clip.yaml", "clip_p1_p4", "clip_b16"))
+            if RUN_SIGLIP:
+                jobs.append(("SIGLIP", "configs/crisismmd_p1_p4_siglip.yaml", "siglip_p1_p4", "siglip_b16"))
 
             vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
             if PARALLEL_BACKBONES and len(jobs) > 1 and vram_gb >= 23.0:
-                print(f"[PARALLEL] Running {', '.join(j[0] for j in jobs)} concurrently on {vram_gb:.1f} GB GPU", flush=True)
+                print(f"[PARALLEL] Running {', '.join(j[0] for j in jobs)} ({','.join(sel_protos)}) concurrently on {vram_gb:.1f} GB GPU", flush=True)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
                     for fut in [pool.submit(_run_job, *j) for j in jobs]:
                         fut.result()
@@ -348,10 +363,12 @@ def build() -> None:
                 for j in jobs:
                     _run_job(*j)
 
-            for _, _, out_sub in jobs:
-                display(Markdown((OUT_DIR / out_sub / "PILOT_F1_REPORT.md").read_text(encoding="utf8")))
+            for _, _, out_sub, bb_name in jobs:
+                sum_md = OUT_DIR / out_sub / f"CRISISMMD_P1_P4_{bb_name}_SUMMARY.md"
+                if sum_md.is_file():
+                    display(Markdown(sum_md.read_text(encoding="utf8")))
 
-            RES_ZIP = Path("/content/PILOT_F1_RESULTS.zip")
+            RES_ZIP = Path("/content/CRISISMMD_P1_P4_DEV_RESULTS.zip")
             with zipfile.ZipFile(RES_ZIP, "w", compression=zipfile.ZIP_DEFLATED) as zout:
                 for fp in sorted(OUT_DIR.rglob("*")):
                     if fp.is_file():

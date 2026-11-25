@@ -296,8 +296,9 @@ def test_run_pilot_f1_end_to_end_p4_mock_vlm(tmp_path: Path, monkeypatch: pytest
         plans_p4.append({"stage": st_i, "seen_classes": list(seen_acc), "buffer": buf_rows, "calibration_latest_views": []})
         pc_p4.append({"stage": st_i, "modalities": mods, "train_ids": t_ids})
 
-    (seq_dir / "PLANS.json").write_text(json.dumps({"P4": plans_p4}), encoding="utf8")
-    (seq_dir / "partition_contract.json").write_text(json.dumps({"protocols": {"P4": pc_p4}}), encoding="utf8")
+    (seq_dir / "PLANS.json").write_text(json.dumps({"P4": plans_p4, "P3": plans_p4}), encoding="utf8")
+    pc_p3 = [{"stage": s["stage"], "modalities": ["text"] if s["modalities"] == ["image"] else s["modalities"], "train_ids": s["train_ids"]} for s in pc_p4]
+    (seq_dir / "partition_contract.json").write_text(json.dumps({"protocols": {"P4": pc_p4, "P3": pc_p3}}), encoding="utf8")
     with zipfile.ZipFile(seq_dir / "splits.zip", "w") as zf:
         for sp, rlist in (("train", train_rows), ("dev", dev_rows)):
             lines = ["tweet_id\timage_id\ttweet_text"] + [f"{r['tweet_id']}\t{r['image_id']}\t{r['tweet_text']}" for r in rlist]
@@ -428,5 +429,24 @@ def test_run_pilot_f1_end_to_end_p4_mock_vlm(tmp_path: Path, monkeypatch: pytest
     assert len(res["stage_trajectory"]["std_ce_seq_replay"]) == 4
     assert len(res["stage_trajectory"]["l_mnar_seq_replay"]) == 4
     assert res["verdict"]["best_paired_f1"] > 0.7
+
+    # Also verify shared-VLM multi-protocol runner across P4 and P3 without reloading model weights
+    from mnarm.runners import crisismmd_p1_p4 as p14_mod
+
+    init_calls = []
+    orig_init = _MockVLM.__init__
+
+    def _counting_init(self, *a: object, **kw: object) -> None:
+        init_calls.append(1)
+        orig_init(self, *a, **kw)
+
+    monkeypatch.setattr(_MockVLM, "__init__", _counting_init)
+    monkeypatch.setattr(p14_mod, "MultimodalVLM", _MockVLM)
+    suite_out = tmp_path / "suite_out"
+    suite = p14_mod.run_crisismmd_p1_p4(cfg, seq_dir, img_dir, suite_out, protocols=["P4", "P3"])
+    assert len(init_calls) == 1
+    assert set(suite["protocols"].keys()) == {"P4", "P3"}
+    assert (suite_out / "CRISISMMD_P1_P4_clip_b16_SUMMARY.md").is_file()
+    assert "$" not in (suite_out / "CRISISMMD_P1_P4_clip_b16_SUMMARY.md").read_text(encoding="utf8")
 
 
