@@ -12,14 +12,13 @@ from mnarm.methods.spherical_stats import (
     _equalize_mahalanobis_centroids,
     _estimate_conjugate_weights,
     _fit_bank_probe_oof_tau,
-    _fit_oof_tau,
+    _fit_direct_oof_tau,
     _identity_anchored_procrustes,
     _oas_shrinkage_covariance,
     _procrustes_from_cross_moments,
     _safe_precision_from_cov,
     _scale_to_norm,
     _shrink_sample_cov,
-    _stratified_folds,
 )
 from mnarm.models.vlm import l2_normalize
 
@@ -62,25 +61,6 @@ class SelfNormalizedBayesTransportHead:
         mean_norm = sum(float(mu.norm().item()) for mu in centroids.values()) / max(len(centroids), 1)
         cov, _, rho = _oas_shrinkage_covariance(u, y, obs, shrinkage=self.shrinkage)
         precision = _safe_precision_from_cov(cov, is_partial, self.partial_cov_mode)
-
-        tau_m, counts = 1.0, [counts_map[c] for c in obs]
-        if len(obs) >= 2 and min(counts) >= 2:
-            folds = _stratified_folds([int(v) for v in y.tolist()], min(self.calib_folds, min(counts)))
-            obs_map = {c: i for i, c in enumerate(obs)}
-            oof_scores_list, oof_y_list, all_idx, obs_rng = [], [], set(range(int(u.shape[0]))), list(range(len(obs)))
-            for f_idx in folds:
-                tr_idx = sorted(all_idx - set(f_idx))
-                u_tr, y_tr = u[tr_idx], y[tr_idx]
-                cov_f, _, _ = _oas_shrinkage_covariance(u_tr, y_tr, obs, shrinkage=self.shrinkage)
-                prec_f = _safe_precision_from_cov(cov_f, is_partial, self.partial_cov_mode)
-                mu_mat = torch.stack([u_tr[y_tr == c].mean(dim=0) for c in obs], dim=0)
-                if is_partial and self.partial_cov_mode != "raw_oas":
-                    mu_mat = _equalize_mahalanobis_centroids(mu_mat, prec_f, obs_rng)
-                w_f = mu_mat @ prec_f
-                oof_scores_list.append(u[f_idx] @ w_f.T + (-0.5 * (mu_mat * w_f).sum(dim=-1)).unsqueeze(0))
-                oof_y_list.append(torch.tensor([obs_map[int(v)] for v in y[f_idx].tolist()], dtype=torch.long))
-            tau_m = _fit_oof_tau(torch.cat(oof_scores_list, dim=0), torch.cat(oof_y_list, dim=0), len(obs))
-
         return {
             "observed_classes": obs,
             "centroids": centroids,
@@ -89,7 +69,9 @@ class SelfNormalizedBayesTransportHead:
             "cov": cov,
             "precision": precision,
             "rho": float(rho),
-            "tau": float(tau_m),
+            "tau": 0.0,
+            "oof_u": u,
+            "oof_y": y,
             "cov_trace": float(torch.trace(cov).item()),
         }
 
@@ -152,7 +134,11 @@ class SelfNormalizedBayesTransportHead:
             prec = _safe_precision_from_cov(st["cov"], is_partial, self.partial_cov_mode, sigma2_trans=conj["sigma2_trans"])
 
             tau_m = float(st["tau"])
-            if tau_m <= 0.0 and st.get("probe_x") is not None and st.get("probe_y") is not None:
+            if tau_m <= 0.0 and st.get("oof_u") is not None and st.get("oof_y") is not None:
+                tau_m = _fit_direct_oof_tau(
+                    st["oof_u"], st["oof_y"], obs, self.shrinkage, is_partial, self.partial_cov_mode, conj["sigma2_trans"], self.calib_folds
+                )
+            elif tau_m <= 0.0 and st.get("probe_x") is not None and st.get("probe_y") is not None and st["probe_x"].shape[0] == st["probe_y"].shape[0]:
                 tau_m = _fit_bank_probe_oof_tau(st["probe_x"], st["probe_y"], st["centroids"], obs, prec, is_partial, self.partial_cov_mode, self.calib_folds)
             elif tau_m <= 0.0:
                 tau_m = 0.05

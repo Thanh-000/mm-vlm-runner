@@ -148,6 +148,37 @@ def _fit_oof_tau(oof_scores: torch.Tensor, oof_y_local: torch.Tensor, num_obs: i
     return float(torch.exp(torch.clamp(log_tau.detach(), -12.0, 6.0)).item())
 
 
+def _fit_direct_oof_tau(
+    u: torch.Tensor,
+    y: torch.Tensor,
+    obs: list[int],
+    shrinkage: float | None,
+    is_partial: bool,
+    partial_cov_mode: str,
+    sigma2_trans: float,
+    calib_folds: int,
+) -> float:
+    """Estimate OOF temperature tau_m using exact inference precision (with sigma2_trans)."""
+    counts = [int((y == c).sum().item()) for c in obs]
+    if len(obs) < 2 or not counts or min(counts) < 2:
+        return 1.0
+    folds = _stratified_folds([int(v) for v in y.tolist()], min(calib_folds, min(counts)))
+    obs_map = {c: i for i, c in enumerate(obs)}
+    oof_scores_list, oof_y_list, all_idx, obs_rng = [], [], set(range(int(u.shape[0]))), list(range(len(obs)))
+    for f_idx in folds:
+        tr_idx = sorted(all_idx - set(f_idx))
+        u_tr, y_tr = u[tr_idx], y[tr_idx]
+        cov_f, _, _ = _oas_shrinkage_covariance(u_tr, y_tr, obs, shrinkage=shrinkage)
+        prec_f = _safe_precision_from_cov(cov_f, is_partial, partial_cov_mode, sigma2_trans=sigma2_trans)
+        mu_mat = torch.stack([u_tr[y_tr == c].mean(dim=0) for c in obs], dim=0)
+        if is_partial and partial_cov_mode != "raw_oas":
+            mu_mat = _equalize_mahalanobis_centroids(mu_mat, prec_f, obs_rng)
+        w_f = mu_mat @ prec_f
+        oof_scores_list.append(u[f_idx] @ w_f.T + (-0.5 * (mu_mat * w_f).sum(dim=-1)).unsqueeze(0))
+        oof_y_list.append(torch.tensor([obs_map[int(v)] for v in y[f_idx].tolist()], dtype=torch.long))
+    return _fit_oof_tau(torch.cat(oof_scores_list, dim=0), torch.cat(oof_y_list, dim=0), len(obs))
+
+
 def _fit_bank_probe_oof_tau(probe_x: torch.Tensor, probe_y: torch.Tensor, centroids: dict[int, torch.Tensor], obs: list[int], prec: torch.Tensor, is_partial: bool, partial_cov_mode: str, calib_folds: int) -> float:
     """Estimate OOF temperature on probe samples scored against ALL |obs| bank classes."""
     obs_map = {int(c): i for i, c in enumerate(obs)}

@@ -236,7 +236,7 @@ def test_run_iccv_same_bank_end_to_end_mock(tmp_path: Path, monkeypatch: pytest.
     assert set(res["protocols"].keys()) == {"P4", "P3"}
     for p in ("P4", "P3"):
         p_res = json.loads((out_dir / f"clip_b16_{p.lower()}" / "ICCV_PROTOCOL_RESULTS.json").read_text(encoding="utf8"))
-        assert len(p_res["arms"]) == 16
+        assert len(p_res["arms"]) == len(ALL_MERGE_METHODS) + 5
         for arm in list(ALL_MERGE_METHODS) + ["seq_ft", "seq_replay256", "mg_clip", "joint_oracle"]:
             assert set(p_res["arms"][arm]["regimes"].keys()) == {"raw", "gr_clip", "unlab_center", "zero_mnar", "cal_bias"}
             assert "i2t_r1" in p_res["arms"][arm]["encoder_preservation"]["retrieval"]

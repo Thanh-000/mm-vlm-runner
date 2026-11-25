@@ -48,13 +48,24 @@ def fit_css_ct_with_reanchor(
     eval_batch_size: int,
     use_amp: bool,
     shrinkage: float | None,
+    cal_recs: list[dict[str, Any]] | None = None,
 ) -> tuple[SelfNormalizedBayesTransportHead, dict[str, Any], dict[str, Any]]:
-    """Fit Pillar 2 O(d) canonical re-anchoring + Pillar 3 conjugate Bayes head."""
+    """Fit Pillar 2 O(d) canonical re-anchoring + Pillar 3 conjugate Bayes head (zero D_cal labels)."""
     f4_b = collect_train_features_by_modality(vlm=vlm, kind="lora", payload={}, records=fit4_recs, tensor_store=store, batch_size=eval_batch_size, use_amp=use_amp)
     f4_a = collect_train_features_by_modality(vlm=vlm, kind=kind, payload=payload, records=fit4_recs, tensor_store=store, batch_size=eval_batch_size, use_amp=use_amp)
+    u0_t, um_t = f4_b["text_x"], f4_a["text_x"]
+    u0_i, um_i = f4_b["image_x"], f4_a["image_x"]
+    if (u0_t is None or u0_i is None) and cal_recs:
+        cal_b = collect_train_features_by_modality(vlm=vlm, kind="lora", payload={}, records=cal_recs, tensor_store=store, batch_size=eval_batch_size, use_amp=use_amp)
+        cal_a = collect_train_features_by_modality(vlm=vlm, kind=kind, payload=payload, records=cal_recs, tensor_store=store, batch_size=eval_batch_size, use_amp=use_amp)
+        if u0_t is None:
+            u0_t, um_t = cal_b["text_x"], cal_a["text_x"]
+        if u0_i is None:
+            u0_i, um_i = cal_b["image_x"], cal_a["image_x"]
+
     protos_m = encode_prompts_under_payload(vlm=vlm, kind=kind, payload=payload, prompts=orig_prompts)
-    re_t = fit_canonical_reanchor(f4_b["text_x"], f4_a["text_x"], protos_full, protos_m)
-    re_i = fit_canonical_reanchor(f4_b["image_x"], f4_a["image_x"])
+    re_t = fit_canonical_reanchor(u0_t, um_t, protos_full, protos_m)
+    re_i = fit_canonical_reanchor(u0_i, um_i)
 
     head = SelfNormalizedBayesTransportHead(bridge_mode=bridge_mode, partial_cov_mode=partial_cov_mode, shrinkage=shrinkage)
     if streaming_bank is None:
@@ -68,12 +79,12 @@ def fit_css_ct_with_reanchor(
         head.fit(tx, tf["text_y"], ix, tf["image_y"], pt, pi, protos_full, seen_classes, fallback_scale=vlm.logit_scale)
         return head, re_t, re_i
 
-    um_t = apply_reanchor(f4_a["text_x"], re_t) if (use_reanchor and f4_a["text_x"] is not None) else f4_a["text_x"]
-    um_i = apply_reanchor(f4_a["image_x"], re_i) if (use_reanchor and f4_a["image_x"] is not None) else f4_a["image_x"]
+    um_t_re = apply_reanchor(um_t, re_t) if (use_reanchor and um_t is not None) else um_t
+    um_i_re = apply_reanchor(um_i, re_i) if (use_reanchor and um_i is not None) else um_i
     pm_use = apply_reanchor(protos_m, re_t) if use_reanchor else protos_m
     bstats = streaming_bank.transport_to_target_stats(
-        bridge_u0_t=f4_b["text_x"], bridge_um_t=um_t,
-        bridge_u0_i=f4_b["image_x"], bridge_um_i=um_i,
+        bridge_u0_t=u0_t, bridge_um_t=um_t_re,
+        bridge_u0_i=u0_i, bridge_um_i=um_i_re,
         seen_classes=seen_classes, probe_y_t=f4_a["text_y"], probe_y_i=f4_a["image_y"],
         protos_0=protos_full, protos_m=pm_use,
     )
@@ -152,7 +163,7 @@ def evaluate_arm_all_regimes(
             vlm=vlm, kind=kind, payload=payload, train_recs=train_recs,
             streaming_bank=streaming_bank, fit4_recs=fit4_recs, store=store,
             orig_prompts=orig_prompts, protos_full=protos_full, seen_classes=seen_classes,
-            eval_batch_size=eval_batch_size, use_amp=use_amp, shrinkage=shrinkage,
+            eval_batch_size=eval_batch_size, use_amp=use_amp, shrinkage=shrinkage, cal_recs=cal_recs,
         )
     dev_t_re, dev_i_re = apply_reanchor(dev_t, re_t), apply_reanchor(dev_i, re_i)
     zn_logits = zn_head.predict_views(dev_t_re, dev_i_re)

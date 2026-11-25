@@ -209,9 +209,85 @@ def test_iso_c_dop_gr_clip_and_pal_rls_behavior() -> None:
             self.weight = nn.Parameter(torch.eye(8)[:4])
             self.initialized = torch.tensor([False, False, True, True])
         def forward(self, u: torch.Tensor, classes: list[int]) -> torch.Tensor:
-            return l2_normalize(u) @ l2_normalize(self.weight[classes]).T
+            return torch.nn.functional.linear(torch.nn.functional.normalize(u.float(), dim=-1), torch.nn.functional.normalize(self.weight[classes], dim=-1))
 
     heads = {"text": _Dummy(), "image": _Dummy()}
     cross = {k: torch.zeros(3, 4) for k in ("text", "image", "paired")}
     mg = mg_clip_eval_logits(torch.randn(3, 8), torch.randn(3, 8), cross, heads, [0, 1, 2, 3], 10.0)
     assert mg["paired"].shape == (3, 4) and torch.isfinite(mg["paired"]).all()
+
+
+def test_lora_nullspace_zero_leakage_and_verbatim_author_parity() -> None:
+    from mnarm.eval import eval_classification_metrics
+
+    torch.manual_seed(7)
+    d, r_lora, n_tasks = 64, 4, 4
+    deltas = [{"v": (torch.randn(d, r_lora) @ torch.randn(r_lora, d)) * 0.02} for _ in range(n_tasks)]
+
+    # 1. Exact active-rank SVD truncation (zero nullspace noise leakage beyond rank 16)
+    for m in ("iso_c", "iso_cts", "tsvm", "knots", "dc_lora"):
+        merged = merge_task_deltas(deltas, m, rank_per_task=r_lora)["v"]
+        svals = torch.linalg.svdvals(merged)
+        assert float(svals[n_tasks * r_lora :].max().item()) < 1e-5, f"{m} leaked into nullspace"
+        if m in ("iso_c", "iso_cts"):
+            act_s = svals[: n_tasks * r_lora]
+            assert float((act_s.max() - act_s.min()).item()) < 1e-4, f"{m} spectrum not isotropic"
+
+    # 2. WUDI strictly reduces author input-span interference objective vs TA initialization
+    vecs = torch.stack([d_t["v"] for d_t in deltas], dim=0)
+    l2_norms = vecs.reshape(n_tasks, -1).square().sum(dim=-1)
+    def _wudi_obj(w: torch.Tensor) -> float:
+        inner = torch.matmul(w.unsqueeze(0) - vecs, vecs.transpose(1, 2))
+        return float((inner.square() / l2_norms.unsqueeze(-1).unsqueeze(-1)).sum().item())
+    ta_init = vecs.sum(dim=0)
+    wudi_merged = merge_task_deltas(deltas, "wudi", rank_per_task=r_lora)["v"]
+    assert _wudi_obj(wudi_merged) < _wudi_obj(ta_init)
+
+    # 3. Verbatim GR-CLIP 3-mean centering parity (qry_mean, doc_text_mean, doc_image_mean)
+    cal_t, cal_i = torch.randn(15, 8) + 1.0, torch.randn(15, 8) - 1.0
+    gap_op = fit_gr_clip_gap(cal_t, cal_i)
+    dt, di = torch.randn(5, 8), torch.randn(5, 8)
+    protos = torch.randn(4, 8)
+    seen = [0, 1, 2, 3]
+    out_gr = gr_clip_logits(dt, di, protos, seen, 10.0, gap_op, alpha=0.5)
+    q_ref = l2_normalize(l2_normalize(protos) - l2_normalize(protos).mean(dim=0, keepdim=True))
+    dt_c = l2_normalize(dt) - l2_normalize(cal_t).mean(dim=0, keepdim=True)
+    di_c = l2_normalize(di) - l2_normalize(cal_i).mean(dim=0, keepdim=True)
+    assert float((out_gr["text"] - 10.0 * (l2_normalize(dt_c) @ q_ref.T)).abs().max().item()) < 1e-5
+    assert float((out_gr["paired"] - 10.0 * (l2_normalize(0.5 * dt_c + 0.5 * di_c) @ q_ref.T)).abs().max().item()) < 1e-5
+
+    # 4. Verbatim MG-CLIP inference formula: (1 * softmax(cross) + 4 * softmax(unscaled_intra)) / 5
+    class _CosHead(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(4, 8))
+            self.initialized = torch.tensor([True, True, True, True])
+        def forward(self, u: torch.Tensor, classes: list[int]) -> torch.Tensor:
+            return torch.nn.functional.linear(l2_normalize(u), l2_normalize(self.weight[classes]))
+
+    heads = {"text": _CosHead(), "image": _CosHead()}
+    ut, ui = torch.randn(4, 8), torch.randn(4, 8)
+    cross = {"text": torch.randn(4, 4), "image": torch.randn(4, 4), "paired": torch.randn(4, 4)}
+    mg_out = mg_clip_eval_logits(ut, ui, cross, heads, seen, logit_scale=50.0)
+    expected_txt = torch.log((torch.softmax(cross["text"], -1) + 4.0 * torch.softmax(heads["text"](ut, seen), -1)) / 5.0)
+    assert float((mg_out["text"] - expected_txt).abs().max().item()) < 1e-5
+
+    # 5. Verbatim PAL-RLS ReLU expansion + closed-form ridge parity
+    pal = PALRLSClassifier(embed_dim=8, num_classes=4, lam=1.0, expand_dim=32, seed=19)
+    xt, xi, y = torch.randn(12, 8), torch.randn(12, 8), torch.arange(4).repeat(3)
+    pal.update(xt, xi, y, ("text", "image"))
+    xq = torch.randn(6, 8)
+    pred = pal.predict_batch(xq, xq, ("text", "image"), seen)
+    h_tr = torch.relu(torch.cat([l2_normalize(xt), l2_normalize(xi)], -1).double() @ pal.w_up)
+    w_ref = torch.linalg.solve(h_tr.T @ h_tr + torch.eye(32, dtype=torch.float64), h_tr.T @ torch.nn.functional.one_hot(y, 4).double()).float()
+    h_q = torch.relu(torch.cat([l2_normalize(xq), l2_normalize(xq)], -1).double() @ pal.w_up).float()
+    assert float((pred - h_q @ w_ref).abs().max().item()) < 1e-5
+
+    # 6. Sato et al. (arXiv:2609.01103) Predicted-Class Gini & Excess Gini
+    y_bal = torch.arange(4).repeat(10)
+    z_unif = torch.eye(4).repeat(10, 1) * 5.0
+    m_unif = eval_classification_metrics(z_unif, y_bal, seen)
+    assert abs(m_unif["pred_gini"]) < 1e-6 and abs(m_unif["excess_gini"]) < 1e-6
+    z_hub = torch.tensor([[5.0, 0.0, 0.0, 0.0]]).repeat(40, 1)
+    m_hub = eval_classification_metrics(z_hub, y_bal, seen)
+    assert m_hub["pred_gini"] > 0.7 and m_hub["excess_gini"] > 0.7

@@ -63,7 +63,7 @@ def run_single_protocol_same_bank(
 
     exp_deltas: list[dict[str, torch.Tensor]] = []
     bank, seq_bank, mg_bank = StreamingClassBank(), StreamingClassBank(), StreamingClassBank()
-    pal = PALRLSClassifier(vlm.embed_dim, len(ds["orig_prompts"]), lam=10.0)
+    pal = PALRLSClassifier(vlm.embed_dim, len(ds["orig_prompts"]), lam=1.0, seed=seed)
     seq_ft_state = seq_rep_state = mg_state = None
     mg_heads: dict[str, Any] = {}
     seen_so_far: list[int] = []
@@ -127,8 +127,9 @@ def run_single_protocol_same_bank(
         lr=float(config["lr"]), weight_decay=float(config["weight_decay"]), seed=seed + 4000, use_amp=use_amp, tensor_store=store,
     )
 
+    lora_rank_eff = int(getattr(vlm, "rank", config.get("lora_rank", 8)))
     arm_specs: list[tuple[str, str, dict[str, torch.Tensor], list[dict[str, Any]], StreamingClassBank | None, dict[str, Any] | None]] = [
-        (m, "delta", merge_task_deltas(exp_deltas, m), [], bank, None) for m in ALL_MERGE_METHODS
+        (m, "delta", merge_task_deltas(exp_deltas, m, rank_per_task=lora_rank_eff), [], bank, None) for m in ALL_MERGE_METHODS
     ] + [
         ("seq_ft", "lora", seq_ft_state or {}, [], seq_bank, None),
         ("seq_replay256", "lora", seq_rep_state or {}, st4["fit"] + st4["buffer_before"], None, None),
@@ -156,7 +157,7 @@ def run_single_protocol_same_bank(
     )
     arms_out["pal_rls"], boot_map["pal_rls"] = pal_rec, pal_boot
 
-    tsvm_delta = merge_task_deltas(exp_deltas, "tsvm")
+    tsvm_delta = merge_task_deltas(exp_deltas, "tsvm", rank_per_task=lora_rank_eff)
     tsvm_t, tsvm_i, _ = extract_paired_features_cached(vlm=vlm, kind="delta", payload=tsvm_delta, records=dev_rows, tensor_store=store, batch_size=int(config["eval_batch_size"]), cache=dev_cache, use_amp=use_amp)
     ablation_out: dict[str, Any] = {}
     for ab_name, bmode, pcmode, use_re in ABLATION_SPECS:
@@ -164,6 +165,7 @@ def run_single_protocol_same_bank(
             bridge_mode=bmode, partial_cov_mode=pcmode, use_reanchor=use_re, vlm=vlm, kind="delta", payload=tsvm_delta,
             train_recs=[], streaming_bank=bank, fit4_recs=st4["fit"], store=store, orig_prompts=ds["orig_prompts"],
             protos_full=protos_full, seen_classes=seen, eval_batch_size=int(config["eval_batch_size"]), use_amp=use_amp, shrinkage=config.get("shrinkage"),
+            cal_recs=st4["calibration_latest_views"],
         )
         tx_ab, ix_ab = (apply_reanchor(tsvm_t, rt_ab), apply_reanchor(tsvm_i, ri_ab)) if use_re else (tsvm_t, tsvm_i)
         ablation_out[ab_name] = eval_view_suite(ab_h.predict_views(tx_ab, ix_ab), dev_y, seen, ds["early_classes"], ds["late_classes"])
@@ -174,7 +176,10 @@ def run_single_protocol_same_bank(
         ("tsvm:zero_mnar_vs_tsvm:raw", boot_map["tsvm"]["raw"]),
         ("tsvm:zero_mnar_vs_tsvm:gr_clip", boot_map["tsvm"].get("gr_clip")),
         ("tsvm:zero_mnar_vs_tsvm:cal_bias", boot_map["tsvm"].get("cal_bias")),
+        ("tsvm:zero_mnar_vs_knots:cal_bias", boot_map["knots"].get("cal_bias")),
         ("tsvm:zero_mnar_vs_iso_c:cal_bias", boot_map["iso_c"].get("cal_bias")),
+        ("tsvm:zero_mnar_vs_iso_cts:cal_bias", boot_map["iso_cts"].get("cal_bias")),
+        ("tsvm:zero_mnar_vs_wudi:cal_bias", boot_map["wudi"].get("cal_bias")),
         ("tsvm:zero_mnar_vs_dop:cal_bias", boot_map["dop"].get("cal_bias")),
         ("tsvm:zero_mnar_vs_dc_lora:cal_bias", boot_map["dc_lora"].get("cal_bias")),
         ("tsvm:zero_mnar_vs_mg_clip:raw", boot_map.get("mg_clip", {}).get("raw")),

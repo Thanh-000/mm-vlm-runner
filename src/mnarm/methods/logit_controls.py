@@ -1,4 +1,4 @@
-"""Zero-leakage logit controls (unlabeled centering, GR-CLIP gap removal, convex L-BFGS cal_bias)."""
+"""Zero-leakage logit controls (unlabeled centering, GR-CLIP 3-mean gap removal, convex L-BFGS cal_bias)."""
 
 from __future__ import annotations
 
@@ -29,13 +29,26 @@ def fit_unlabeled_center(scores: torch.Tensor) -> dict[str, Any]:
 
 
 def fit_gr_clip_gap(cal_feats_t: torch.Tensor | None, cal_feats_i: torch.Tensor | None) -> dict[str, Any]:
-    """Fit zero-label GR-CLIP (NeurIPS 2025) global modality gap vector g = mu_T - mu_I."""
-    if cal_feats_t is not None and cal_feats_i is not None and cal_feats_t.shape[0] >= 1 and cal_feats_i.shape[0] >= 1:
-        mu_t = l2_normalize(cal_feats_t).detach().cpu().double().mean(dim=0)
-        mu_i = l2_normalize(cal_feats_i).detach().cpu().double().mean(dim=0)
-        return {"gap": (mu_t - mu_i).float(), "active": True, "labels_used": False, "n_t": int(cal_feats_t.shape[0]), "n_i": int(cal_feats_i.shape[0])}
-    d = int(cal_feats_t.shape[-1]) if (cal_feats_t is not None and cal_feats_t.ndim == 2) else (int(cal_feats_i.shape[-1]) if (cal_feats_i is not None and cal_feats_i.ndim == 2) else 1)
-    return {"gap": torch.zeros(d, dtype=torch.float32), "active": False, "labels_used": False, "n_t": 0, "n_i": 0}
+    """Fit zero-label GR-CLIP (NeurIPS 2025, arXiv:2507.19054 Alg. 1) modality document means."""
+    has_t = cal_feats_t is not None and cal_feats_t.ndim == 2 and cal_feats_t.shape[0] >= 1
+    has_i = cal_feats_i is not None and cal_feats_i.ndim == 2 and cal_feats_i.shape[0] >= 1
+    d = (
+        int(cal_feats_t.shape[-1])
+        if (cal_feats_t is not None and cal_feats_t.ndim == 2)
+        else (int(cal_feats_i.shape[-1]) if (cal_feats_i is not None and cal_feats_i.ndim == 2) else 1)
+    )
+    doc_text_mean = l2_normalize(cal_feats_t).detach().cpu().float().mean(dim=0) if has_t else torch.zeros(d, dtype=torch.float32)  # type: ignore[arg-type]
+    doc_image_mean = l2_normalize(cal_feats_i).detach().cpu().float().mean(dim=0) if has_i else torch.zeros(d, dtype=torch.float32)  # type: ignore[arg-type]
+    return {
+        "doc_text_mean": doc_text_mean,
+        "doc_image_mean": doc_image_mean,
+        "has_t": bool(has_t),
+        "has_i": bool(has_i),
+        "active": bool(has_t or has_i),
+        "labels_used": False,
+        "n_t": int(cal_feats_t.shape[0]) if has_t else 0,  # type: ignore[union-attr]
+        "n_i": int(cal_feats_i.shape[0]) if has_i else 0,  # type: ignore[union-attr]
+    }
 
 
 def gr_clip_logits(
@@ -47,22 +60,25 @@ def gr_clip_logits(
     gap_op: dict[str, Any],
     alpha: float = 0.5,
 ) -> dict[str, torch.Tensor]:
-    """Compute GR-CLIP linear gap-removed logits on text, image, and paired views."""
+    """Compute verbatim GR-CLIP (MixedModalitySearch Alg. 1) 3-mean centered logits on all views."""
     cols = torch.tensor([int(c) for c in seen_classes], dtype=torch.long)
-    p_raw = l2_normalize(protos_full.detach().cpu().float().index_select(0, cols))
-    ut = l2_normalize(dev_t.detach().cpu())
-    ui = l2_normalize(dev_i.detach().cpu())
+    q_norm = l2_normalize(protos_full.detach().cpu().float().index_select(0, cols))
+    ut = l2_normalize(dev_t.detach().cpu().float())
+    ui = l2_normalize(dev_i.detach().cpu().float())
     if gap_op.get("active", False):
-        g = gap_op["gap"].detach().cpu().float().unsqueeze(0)
-        shift = float(alpha) * g
-        ut = l2_normalize(ut - shift)
-        p_t = l2_normalize(p_raw - shift)
-        ui = l2_normalize(ui + shift)
-        p_i = l2_normalize(p_raw - shift)
-    else:
-        p_t = p_i = p_raw
-    zt = (float(scale) * (ut @ p_t.T)).float()
-    zi = (float(scale) * (ui @ p_i.T)).float()
+        q_gr = l2_normalize(q_norm - q_norm.mean(dim=0, keepdim=True))
+        dt_c = ut - gap_op["doc_text_mean"].detach().cpu().float().unsqueeze(0) if gap_op.get("has_t", False) else ut
+        di_c = ui - gap_op["doc_image_mean"].detach().cpu().float().unsqueeze(0) if gap_op.get("has_i", False) else ui
+        e_t = l2_normalize(dt_c)
+        e_i = l2_normalize(di_c)
+        e_pair = l2_normalize(float(alpha) * dt_c + (1.0 - float(alpha)) * di_c)
+        return {
+            "text": (float(scale) * (e_t @ q_gr.T)).float(),
+            "image": (float(scale) * (e_i @ q_gr.T)).float(),
+            "paired": (float(scale) * (e_pair @ q_gr.T)).float(),
+        }
+    zt = (float(scale) * (ut @ q_norm.T)).float()
+    zi = (float(scale) * (ui @ q_norm.T)).float()
     return {"text": zt, "image": zi, "paired": 0.5 * (zt + zi)}
 
 

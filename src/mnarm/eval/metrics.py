@@ -11,6 +11,17 @@ from torch.nn import functional as F
 from mnarm.models.vlm import l2_normalize
 
 
+def compute_gini(counts: torch.Tensor) -> float:
+    """Compute Gini concentration coefficient across class counts (Sato et al., arXiv:2609.01103 Eq. 11.2)."""
+    c = int(counts.numel())
+    tot = float(counts.sum().item())
+    if c <= 1 or tot <= 0.0:
+        return 0.0
+    ms = counts.detach().cpu().double().sort().values
+    ranks = torch.arange(1, c + 1, dtype=torch.float64)
+    return float(((2.0 * (ranks * ms).sum()) / (float(c) * tot) - float(c + 1) / float(c)).item())
+
+
 def compute_ece(probs: torch.Tensor, y_local: torch.Tensor, n_bins: int = 15) -> float:
     """Compute top-1 Expected Calibration Error with equal-width confidence bins."""
     if probs.shape[0] == 0:
@@ -76,6 +87,9 @@ def eval_classification_metrics(
 
     cls_7 = [i for i, c in enumerate(cls_list) if c != 7]
     macro_f1_7cls = (sum(per_cls_f1[i] for i in cls_7) / len(cls_7)) if (len(cls_list) == 8 and 7 in cls_map and cls_7) else None
+    pred_gini = compute_gini(cm.sum(dim=0))
+    label_gini = compute_gini(cm.sum(dim=1))
+    excess_gini = float(pred_gini - label_gini)
 
     return {
         "n": int(len(y)),
@@ -85,6 +99,8 @@ def eval_classification_metrics(
         "early_recall": float(early_rec) if early_rec is not None else None,
         "late_recall": float(late_rec) if late_rec is not None else None,
         "worst_class_f1": float(worst_class_f1),
+        "pred_gini": float(pred_gini),
+        "excess_gini": float(excess_gini),
         "ece": float(ece),
         "nll": float(nll),
         "brier": float(brier),
