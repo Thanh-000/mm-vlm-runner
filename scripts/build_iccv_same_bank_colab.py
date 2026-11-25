@@ -5,7 +5,9 @@ from __future__ import annotations
 import ast
 import base64
 import hashlib
+import io
 import json
+import tarfile
 import textwrap
 import warnings
 import zipfile
@@ -40,8 +42,24 @@ def _pack_repo_zip(zip_path: Path) -> tuple[str, str]:
     return hashlib.sha256(raw).hexdigest(), base64.b64encode(raw).decode("ascii")
 
 
+def _pack_contracts_xz() -> tuple[str, str]:
+    zp = ROOT / "colab" / "crisismmd_p1_p4_contracts.zip"
+    if not zp.is_file():
+        return "", ""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(zp) as zf, tarfile.open(fileobj=buf, mode="w:xz", preset=9) as tf:
+        for nm in ("CONTRACT_SHA256.json", "manifest.json", "PLANS.json", "partition_contract.json"):
+            raw = zf.read(nm)
+            ti = tarfile.TarInfo(nm)
+            ti.size = len(raw)
+            tf.addfile(ti, io.BytesIO(raw))
+    raw_xz = buf.getvalue()
+    return hashlib.sha256(raw_xz).hexdigest(), base64.b64encode(raw_xz).decode("ascii")
+
+
 def build() -> None:
     code_sha, code_b64 = _pack_repo_zip(OUT_ZIP)
+    cxz_sha, cxz_b64 = _pack_contracts_xz()
     cells = [
         _cell(
             """
@@ -49,7 +67,7 @@ def build() -> None:
 
             Runs all **14 verbatim author merging operators** alongside **6 continual/VLM-CL/oracle tracks** on the **EXACT SAME source expert bank** across **5 information regimes** (`raw`, `gr_clip`, `unlab_center`, `zero_mnar` [`CSS-CT` Ours: 0 D_cal labels, 0 exemplars], `cal_bias` [100% D_cal]) with **Blackwell / A100 High-VRAM Turbo Mode** (`VRAM >= 36 GB` GPU tensor pre-staging + batched GPU DOP + `use_fast=True`).
 
-            - **Clean Data Input (Zero Drive Mount Needed):** Simply paste Google Drive `.tar` / `.tar.gz` / `.zip` links prepared by `Stage_Disaster_Datasets_To_Drive.ipynb` (or upload the small contracts zip). Cell 3 automatically resolves Google Drive links to direct binary streams and pulls them into `/dev/shm` via **16-connection `aria2c -x16 -s16`** (`gdown` fallback).
+            - **100% Unattended 4-Dataset Execution (Zero Upload / Zero Drive Mount):** All **4 verified Google Drive archives** (`CrisisMMD` + `DMD` + `DisasterVQA-Incidents` + `DisasterM3`) and SHA-256 `CrisisMMD` P1–P4 contracts are pre-integrated. Just click **Runtime -> Run all**; Cell 3 pulls all 4 benchmarks into `/dev/shm` via **16-connection `aria2c -x16 -s16`**.
             """,
             kind="markdown",
             cid="iccv-cell-0",
@@ -58,9 +76,9 @@ def build() -> None:
             """
             #@title Configuration { display-mode: "form" }
             RUN_CRISISMMD = True  # @param {type:"boolean"}
-            RUN_DMD = False  # @param {type:"boolean"}
-            RUN_INCIDENTS_VQA = False  # @param {type:"boolean"}
-            RUN_DISASTER_M3 = False  # @param {type:"boolean"}
+            RUN_DMD = True  # @param {type:"boolean"}
+            RUN_INCIDENTS_VQA = True  # @param {type:"boolean"}
+            RUN_DISASTER_M3 = True  # @param {type:"boolean"}
             RUN_CLIP = True  # @param {type:"boolean"}
             RUN_SIGLIP = True  # @param {type:"boolean"}
             PARALLEL_BACKBONES = True  # @param {type:"boolean"}
@@ -70,10 +88,10 @@ def build() -> None:
             RUN_P1 = True  # @param {type:"boolean"}
             RESUME_COMPLETED = True  # @param {type:"boolean"}
             A2Z_INPUTS_URL = ""  # @param {type:"string"}
-            CRISISMMA_TAR_URL = ""  # @param {type:"string"}
-            DMD_ARCHIVE_URL = ""  # @param {type:"string"}
-            INCIDENTS_VQA_ARCHIVE_URL = ""  # @param {type:"string"}
-            DISASTER_M3_ARCHIVE_URL = ""  # @param {type:"string"}
+            CRISISMMA_TAR_URL = "https://drive.google.com/uc?id=1wOJzIezlrH-o2LmWHtcxv8KdAKL6a7K6&export=download"  # @param {type:"string"}
+            DMD_ARCHIVE_URL = "https://drive.google.com/uc?id=1_1Bn0dHKqZ7sk4r2mVcShoQlvgZXcPL0&export=download"  # @param {type:"string"}
+            INCIDENTS_VQA_ARCHIVE_URL = "https://drive.google.com/uc?id=1WUMyBQ68cMkhW3ONCzvPl2W1KpV1QPO5&export=download"  # @param {type:"string"}
+            DISASTER_M3_ARCHIVE_URL = "https://drive.google.com/uc?id=1oknnyMNKCXXK3tTrVVD4M7XAx3VzLmiO&export=download"  # @param {type:"string"}
             AUTO_DOWNLOAD = True  # @param {type:"boolean"}
             """,
             cid="iccv-cell-1",
@@ -133,7 +151,7 @@ def build() -> None:
         ),
         _cell(
             f"""
-            import concurrent.futures, html, importlib, json, os, re, shutil, site, subprocess, sys, time, urllib.parse, zipfile
+            import base64, concurrent.futures, hashlib, html, importlib, io, json, os, re, shutil, site, subprocess, sys, tarfile, time, urllib.parse, zipfile
             from pathlib import Path
             import requests
             try:
@@ -230,40 +248,57 @@ def build() -> None:
 
             def _unpack_to_dir(arc: Path, dest_dir: Path) -> None:
                 dest_dir.mkdir(parents=True, exist_ok=True)
+                with arc.open("rb") as fh:
+                    magic = fh.read(4)
                 if zipfile.is_zipfile(arc):
                     subprocess.run(["unzip", "-q", "-o", str(arc), "-d", str(dest_dir)], check=True)
-                elif arc.name.lower().endswith(".tar"):
-                    subprocess.run(["tar", "-xf", str(arc), "-C", str(dest_dir)], check=True)
-                elif shutil.which("pigz"):
-                    subprocess.run(["tar", "-I", "pigz", "-xf", str(arc), "-C", str(dest_dir)], check=True)
+                elif magic[:2] == b"\\x1f\\x8b":
+                    if shutil.which("pigz"):
+                        subprocess.run(["tar", "-I", "pigz", "-xf", str(arc), "-C", str(dest_dir)], check=True)
+                    else:
+                        subprocess.run(["tar", "-xzf", str(arc), "-C", str(dest_dir)], check=True)
                 else:
-                    subprocess.run(["tar", "-xzf", str(arc), "-C", str(dest_dir)], check=True)
+                    subprocess.run(["tar", "-xf", str(arc), "-C", str(dest_dir)], check=True)
 
             DATASET_PATHS = {{}}
 
             if RUN_CRISISMMD:
-                LOCAL_CANDS = [Path("/content/crisismmd_p1_p4_contracts.zip"), Path("/content/JCMIL_A2Z_INPUTS.zip"), Path("/content/crisismmd_contracts_dl.zip")]
-                for cand in LOCAL_CANDS:
-                    if cand.is_file() and not zipfile.is_zipfile(cand):
-                        cand.unlink()
-                CONTRACTS_ZIP = next((p for p in LOCAL_CANDS if p.is_file() and zipfile.is_zipfile(p)), None)
-                if CONTRACTS_ZIP is None and str(A2Z_INPUTS_URL).strip():
-                    CONTRACTS_ZIP = _download_archive_aria2(str(A2Z_INPUTS_URL), Path("/content/crisismmd_contracts_dl.zip"), min_bytes=1024)
-                if CONTRACTS_ZIP is None:
-                    if colab_files is None:
-                        raise RuntimeError("Provide A2Z_INPUTS_URL or local /content/crisismmd_p1_p4_contracts.zip.")
-                    print("Upload crisismmd_p1_p4_contracts.zip (~5.8 MB):")
-                    up = colab_files.upload()
-                    nm, blob = next(iter(up.items()))
-                    CONTRACTS_ZIP = Path("/content") / Path(nm).name
-                    CONTRACTS_ZIP.write_bytes(blob)
+                SEQ_DIR = WS / "crisismmd_seq_inputs"
+                SEQ_DIR.mkdir(parents=True, exist_ok=True)
+                CONTRACTS_XZ_SHA = {cxz_sha!r}
+                CONTRACTS_XZ_B64 = {cxz_b64!r}
+                req_json = ("CONTRACT_SHA256.json", "manifest.json", "PLANS.json", "partition_contract.json")
+                if CONTRACTS_XZ_B64 and any(not (SEQ_DIR / fn).is_file() for fn in req_json):
+                    raw_cxz = base64.b64decode(CONTRACTS_XZ_B64)
+                    if hashlib.sha256(raw_cxz).hexdigest() != CONTRACTS_XZ_SHA:
+                        raise ValueError("Embedded CrisisMMD contracts SHA mismatch!")
+                    with tarfile.open(fileobj=io.BytesIO(raw_cxz), mode="r:xz") as tf:
+                        tf.extractall(SEQ_DIR)
 
-                SEQ_DIR = extract_contracts_from_a2z_zip(CONTRACTS_ZIP, WS / "crisismmd_seq_inputs")
+                if not (SEQ_DIR / "manifest.json").is_file():
+                    LOCAL_CANDS = [Path("/content/crisismmd_p1_p4_contracts.zip"), Path("/content/JCMIL_A2Z_INPUTS.zip"), Path("/content/crisismmd_contracts_dl.zip")]
+                    for cand in LOCAL_CANDS:
+                        if cand.is_file() and not zipfile.is_zipfile(cand):
+                            cand.unlink()
+                    CONTRACTS_ZIP = next((p for p in LOCAL_CANDS if p.is_file() and zipfile.is_zipfile(p)), None)
+                    if CONTRACTS_ZIP is None and str(A2Z_INPUTS_URL).strip():
+                        CONTRACTS_ZIP = _download_archive_aria2(str(A2Z_INPUTS_URL), Path("/content/crisismmd_contracts_dl.zip"), min_bytes=1024)
+                    if CONTRACTS_ZIP is None:
+                        if colab_files is None:
+                            raise RuntimeError("Provide A2Z_INPUTS_URL or local /content/crisismmd_p1_p4_contracts.zip.")
+                        print("Upload crisismmd_p1_p4_contracts.zip (~5.8 MB):")
+                        up = colab_files.upload()
+                        nm, blob = next(iter(up.items()))
+                        CONTRACTS_ZIP = Path("/content") / Path(nm).name
+                        CONTRACTS_ZIP.write_bytes(blob)
+                    SEQ_DIR = extract_contracts_from_a2z_zip(CONTRACTS_ZIP, SEQ_DIR)
+
                 manifest = json.loads((SEQ_DIR / "manifest.json").read_bytes())
                 if (IMG_DIR / "CrisisMMD_v2.0" / "data_image").is_dir():
                     IMG_DIR = IMG_DIR / "CrisisMMD_v2.0"
                 req_set = {{r["image"] for sp in ("train", "dev") for r in manifest["rows"][sp]}}
-                if any(not (IMG_DIR / p).is_file() for p in req_set):
+                has_splits = (SEQ_DIR / "splits.zip").is_file() or (IMG_DIR / "crisismmd_datasplit_all.zip").is_file() or (IMG_DIR.parent / "CrisisMMD_v2.0" / "crisismmd_datasplit_all.zip").is_file()
+                if (not has_splits) or any(not (IMG_DIR / p).is_file() for p in req_set):
                     arc_cands = [Path("/content/crisismmd_v2.tar"), Path("/content/CrisisMMD_v2.0.tar.gz"), Path("/content/CrisisMMD_v2.0.zip")]
                     archive_path = next((p for p in arc_cands if p.is_file() and p.stat().st_size > 100_000_000), None)
                     tar_u = str(CRISISMMA_TAR_URL).strip()
@@ -280,6 +315,17 @@ def build() -> None:
                             archive_path.unlink(missing_ok=True)
                         if (IMG_DIR / "CrisisMMD_v2.0" / "data_image").is_dir():
                             IMG_DIR = IMG_DIR / "CrisisMMD_v2.0"
+
+                if not (SEQ_DIR / "splits.zip").is_file():
+                    split_src = next((p for p in (IMG_DIR / "crisismmd_datasplit_all.zip", IMG_DIR.parent / "crisismmd_datasplit_all.zip", IMG_DIR.parent / "CrisisMMD_v2.0" / "crisismmd_datasplit_all.zip") if p.is_file() and zipfile.is_zipfile(p)), None)
+                    if split_src is not None:
+                        shutil.copy2(split_src, SEQ_DIR / "splits.zip")
+                if (SEQ_DIR / "CONTRACT_SHA256.json").is_file():
+                    csha = json.loads((SEQ_DIR / "CONTRACT_SHA256.json").read_bytes())
+                    for fn, exp in csha.items():
+                        fp = SEQ_DIR / fn
+                        if not fp.is_file() or hashlib.sha256(fp.read_bytes()).hexdigest() != exp:
+                            raise RuntimeError(f"CrisisMMD contract verification failed for {{fn}}")
 
                 test_only = {{r["image"] for r in manifest["rows"]["test"]}} - req_set
                 sum(1 for rel_t in test_only if (IMG_DIR / rel_t).is_file() and ((IMG_DIR / rel_t).unlink() or True))
