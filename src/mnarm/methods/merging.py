@@ -12,7 +12,7 @@ from mnarm.methods.subspace_merging import (
     _knots_matrix,
     _opcm_merge,
     _tsvm_merge_matrix,
-    _wudi_matrix,
+    _wudi_merge,
 )
 
 ALL_MERGE_METHODS = (
@@ -98,7 +98,7 @@ def merge_task_deltas(
     if method == "iso_cts":
         return {k: _iso_cts_matrix([d[k] for d in deltas], rank_per_task=rank_per_task, k_frac=0.8) for k in keys}
     if method == "wudi":
-        return {k: _wudi_matrix([d[k] for d in deltas]) for k in keys}
+        return _wudi_merge(deltas, keys)
     if method == "opcm":
         return _opcm_merge(deltas, keys, alpha=0.5)
     if method == "dop":

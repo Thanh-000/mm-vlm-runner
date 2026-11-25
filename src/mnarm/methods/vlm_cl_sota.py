@@ -107,6 +107,7 @@ class IntraModalCosineClassifier(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(num_classes, embed_dim, dtype=torch.float32))
         self.initialized = torch.zeros(num_classes, dtype=torch.bool)
+        self.mgp_trace: dict[int, Any] = {}
 
     def forward(self, u: torch.Tensor, classes: list[int]) -> torch.Tensor:
         return F.linear(F.normalize(u.float(), p=2, dim=-1), F.normalize(self.weight[classes], p=2, dim=-1))
@@ -186,6 +187,8 @@ def train_mg_clip_stage(
     rng = random.Random(int(seed) + stage_idx * 23)
     train_specs = list(specs)
     last_valid = copy.deepcopy(saved_state)
+    stopped_ep = max(1, int(epochs))
+    rel_drift = 0.0
     for ep in range(int(epochs)):
         vlm.clip.train()
         rng.shuffle(train_specs)
@@ -211,12 +214,19 @@ def train_mg_clip_stage(
         if ep == 0:
             last_valid = vlm.lora_state()
             if rel_drift > float(gap_alpha):
+                stopped_ep = ep + 1
                 break
         elif rel_drift > float(gap_alpha):
             vlm.load_lora_state(last_valid)
+            stopped_ep = ep + 1
             break
         else:
             last_valid = vlm.lora_state()
+    mg_heads["text"].mgp_trace[int(stage_idx)] = {
+        "neg0": {"+".join(vw): round(val, 4) for vw, val in neg0.items()},
+        "rel_drift": round(float(rel_drift), 5),
+        "stopped_epoch": int(stopped_ep),
+    }
 
     vlm.clip.eval()
     trained_state = vlm.lora_state()

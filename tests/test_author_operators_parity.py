@@ -21,6 +21,7 @@ from mnarm.methods import (
     fit_unlabeled_center,
     merge_task_deltas,
 )
+from mnarm.methods.subspace_merging import _dop_merge, _wudi_matrix, _wudi_merge
 from mnarm.models.vlm import attach_qv_lora, tower_digest
 
 
@@ -60,6 +61,27 @@ def test_all_nine_author_mergers_and_mnar_zero_towers() -> None:
     ]
     m_dcl = merge_task_deltas(d_single_txt, "dc_lora")
     assert float((m_dcl["t"] - d_single_txt[2]["t"]).abs().max().item()) < 1e-6
+
+
+def test_batched_wudi_and_sync_free_dop_exact_parity() -> None:
+    torch.manual_seed(19)
+    deltas = []
+    for st in range(4):
+        row = {
+            "v.l0": torch.zeros(16, 16) if st == 1 else (torch.randn(16, 4) @ torch.randn(4, 16)) * 0.05,
+            "v.l1": torch.zeros(16, 16) if st == 1 else (torch.randn(16, 4) @ torch.randn(4, 16)) * 0.05,
+            "t.l0": torch.zeros(16, 16) if st == 0 else (torch.randn(16, 4) @ torch.randn(4, 16)) * 0.05,
+        }
+        deltas.append(row)
+    keys = ["v.l0", "v.l1", "t.l0"]
+    batched = _wudi_merge(deltas, keys, iter_num=40, lr=1e-4)
+    for k in keys:
+        single = _wudi_matrix([d[k] for d in deltas], iter_num=40, lr=1e-4)
+        assert float((batched[k] - single).abs().max().item()) < 1e-5
+    dop_a = _dop_merge(deltas, keys)
+    dop_b = _dop_merge(deltas, keys)
+    for k in keys:
+        assert torch.isfinite(dop_a[k]).all() and torch.equal(dop_a[k], dop_b[k])
 
 
 def test_logit_controls_and_retrieval_r1() -> None:
@@ -246,3 +268,8 @@ def test_run_iccv_same_bank_end_to_end_mock(tmp_path: Path, monkeypatch: pytest.
     assert (out_dir / "ICCV_SAME_BANK_clip_b16_TABLE.tex").is_file()
     md_sum = (out_dir / "ICCV_SAME_BANK_clip_b16_SUMMARY.md").read_text(encoding="utf8")
     assert "$" not in md_sum
+    fig_dir = out_dir / "figures"
+    for stem in ("fig1_same_bank_regimes_clip_b16", "fig2_mnar_pathology_hubness_clip_b16", "fig3_encoder_preservation_pareto_clip_b16", "fig4_ablation_bootstrap_clip_b16"):
+        assert (fig_dir / f"{stem}.png").stat().st_size > 1000
+        assert (fig_dir / f"{stem}.pdf").stat().st_size > 1000
+    assert len(res.get("figures", [])) == 8

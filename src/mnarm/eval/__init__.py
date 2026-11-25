@@ -1,5 +1,6 @@
 """Evaluation metrics, calibration errors, cone geometry diagnostics, bootstrap stats, and profiler."""
 
+from mnarm.eval.iccv_figures import generate_iccv_suite_figures
 from mnarm.eval.metrics import (
     compute_ece,
     eval_classification_metrics,
@@ -16,6 +17,7 @@ __all__ = [
     "eval_classification_metrics",
     "eval_retrieval_r1",
     "eval_view_suite",
+    "generate_iccv_suite_figures",
     "measure_cone_drift",
     "paired_bootstrap_diff",
 ]

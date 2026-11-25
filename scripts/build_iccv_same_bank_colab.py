@@ -45,13 +45,13 @@ def build() -> None:
     cells = [
         _cell(
             """
-            # ICCV Same-Bank Benchmark — `CSS-CT` + 11 Verbatim Mergers + VLM-CL/Analytic SOTA (dev-Only)
+            # ICCV Same-Bank Benchmark — `CSS-CT` + 14 Verbatim Author Mergers + VLM-CL/Analytic SOTA (dev-Only)
 
-            Runs all **11 author merging operators** (`mean`, `exposure`, `ta_sum`, `ties20`, `magmax`, `magmax_s1`, `tsvm` [CVPR'25], `iso_c` [ICML'25], `opcm` [ICLR'25], `dop` [NeurIPS'25], `dc_lora` [CVPR'26]) alongside **5 continual/VLM-CL/oracle tracks** (`seq_ft`, `seq_replay256`, `mg_clip` [ICCV'25 Highlight], `pal_rls` [Analytic MMCIL'25], `joint_oracle`) on the **EXACT SAME source expert bank** across **5 information regimes** (`raw`, `gr_clip` [NeurIPS'25, 0-label], `unlab_center` [0-label], `zero_mnar` [`CSS-CT` Ours, 0 D_cal labels, O(|Y|d + d^2) moments], `cal_bias` [100% D_cal]) + encoder-preservation checks (`Unseen-Prompt OOD`, `I->T R@1` Raw vs Re-Anchored):
+            Runs all **14 verbatim author merging operators** (`mean`, `exposure`, `ta_sum`, `ties20`, `magmax`, `magmax_s1`, `knots` [ICLR'25], `tsvm` [CVPR'25], `iso_c` [ICML'25], `iso_cts` [ICML'25], `wudi` [ICML'25], `opcm` [ICLR'25], `dop` [NeurIPS'25], `dc_lora` [CVPR'26]) alongside **5 continual/VLM-CL/oracle tracks** (`seq_ft`, `seq_replay256`, `mg_clip` [ICCV'25 Highlight], `pal_rls` [Analytic MMCIL'25], `joint_oracle`) on the **EXACT SAME source expert bank** across **5 information regimes** (`raw`, `gr_clip` [NeurIPS'25, 0-label], `unlab_center` [0-label], `zero_mnar` [`CSS-CT` Ours, 0 D_cal labels, O(|Y|d + d^2) moments], `cal_bias` [100% D_cal]) + encoder-preservation checks (`Unseen-Prompt OOD`, `I->T R@1` Raw vs Re-Anchored) + inline ICCV diagnostic figures (`fig1..fig4`):
             1. Runs full `pytest -v` preflight gate FIRST (all parity + hygiene + double-blind checks).
-            2. Reuses/downloads CrisisMMD `train` + `dev` images (`allow_test=false`).
+            2. Reuses/downloads CrisisMMD `train` + `dev` images (`allow_test=false`) with RAM-aware `/dev/shm` caching (auto-enabled on A100 / G4 / L4).
             3. Runs `mnarm.runners.iccv_same_bank` concurrently for CLIP and SigLIP across `P4 -> P3 -> P2 -> P1`.
-            4. Displays `ICCV_SAME_BANK_*_SUMMARY.md`, exports `.tex` tables, and downloads `ICCV_SAME_BANK_DEV_RESULTS.zip`.
+            4. Displays `ICCV_SAME_BANK_*_SUMMARY.md`, renders inline diagnostic PNGs (`fig1..fig4`), exports `.tex` tables + `.pdf` vector figures, and downloads `ICCV_SAME_BANK_DEV_RESULTS.zip`.
             """,
             kind="markdown",
             cid="iccv-cell-0",
@@ -77,7 +77,7 @@ def build() -> None:
         ),
         _cell(
             f"""
-            import base64, concurrent.futures, hashlib, importlib, io, shutil, site, subprocess, sys, zipfile
+            import base64, concurrent.futures, hashlib, importlib, io, os, shutil, site, subprocess, sys, zipfile
             from pathlib import Path
             import torch
 
@@ -86,7 +86,9 @@ def build() -> None:
 
             WS = Path("/content/mnarm_ws")
             CODE_DIR = WS / "repo"
-            IMG_DIR = Path("/dev/shm/crisismmd_v2") if Path("/dev/shm").exists() else (WS / "crisismmd_v2")
+            sys_ram_gb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9) if hasattr(os, "sysconf") else 32.0
+            IMG_DIR = Path("/dev/shm/crisismmd_v2") if (Path("/dev/shm").exists() and sys_ram_gb >= 24.0) else (WS / "crisismmd_v2")
+            print(f"[ENV] GPU={{torch.cuda.get_device_name(0)}} VRAM={{torch.cuda.get_device_properties(0).total_memory/1e9:.1f}}GB RAM={{sys_ram_gb:.1f}}GB IMG_DIR={{IMG_DIR}}", flush=True)
             for d in (WS, CODE_DIR, IMG_DIR):
                 d.mkdir(parents=True, exist_ok=True)
 
@@ -102,7 +104,7 @@ def build() -> None:
                 zf.extractall(CODE_DIR)
 
             def _pip_deps():
-                subprocess.run([sys.executable, "-m", "pip", "install", "-q", "transformers==4.57.6", "datasets==3.2.0", "PyYAML", "scipy", "pillow", "huggingface_hub", "pytest", "wheel", "gdown"], check=True)
+                subprocess.run([sys.executable, "-m", "pip", "install", "-q", "transformers==4.57.6", "datasets==3.2.0", "PyYAML", "scipy", "pillow", "matplotlib>=3.8.0", "huggingface_hub", "pytest", "wheel", "gdown"], check=True)
                 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-build-isolation", "--no-deps", "-e", str(CODE_DIR)], check=True)
 
             def _apt_deps():
@@ -124,14 +126,18 @@ def build() -> None:
         ),
         _cell(
             f"""
-            import concurrent.futures, importlib, json, shutil, site, subprocess, sys, time, urllib.parse, zipfile
+            import concurrent.futures, importlib, json, os, shutil, site, subprocess, sys, time, urllib.parse, zipfile
             from pathlib import Path
             import requests
-            from google.colab import files as colab_files
+            try:
+                from google.colab import drive as colab_drive, files as colab_files
+            except ImportError:
+                colab_drive = colab_files = None
 
             WS = Path("/content/mnarm_ws")
             CODE_DIR = WS / "repo"
-            IMG_DIR = Path("/dev/shm/crisismmd_v2") if Path("/dev/shm").exists() else (WS / "crisismmd_v2")
+            sys_ram_gb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9) if hasattr(os, "sysconf") else 32.0
+            IMG_DIR = Path("/dev/shm/crisismmd_v2") if (Path("/dev/shm").exists() and sys_ram_gb >= 24.0) else (WS / "crisismmd_v2")
             IMG_DIR.mkdir(parents=True, exist_ok=True)
             site.addsitedir(str(CODE_DIR / "src"))
             importlib.invalidate_caches()
@@ -147,8 +153,7 @@ def build() -> None:
                     cand.unlink()
 
             CONTRACTS_ZIP = next((p for p in LOCAL_CANDIDATES if p.is_file() and zipfile.is_zipfile(p)), None)
-            if CONTRACTS_ZIP is None and MOUNT_DRIVE:
-                from google.colab import drive as colab_drive
+            if CONTRACTS_ZIP is None and MOUNT_DRIVE and colab_drive is not None:
                 colab_drive.mount("/content/drive")
                 drive_cands = [Path(str(DRIVE_CONTRACTS_PATH).strip())] if str(DRIVE_CONTRACTS_PATH).strip() else []
                 drive_cands.extend([Path("/content/drive/MyDrive/jcmil_benchmark_v1/JCMIL_A2Z_INPUTS.zip"), Path("/content/drive/MyDrive/crisismmd_p1_p4_contracts.zip")])
@@ -167,6 +172,8 @@ def build() -> None:
                 CONTRACTS_ZIP = dst_dl
 
             if CONTRACTS_ZIP is None:
+                if colab_files is None:
+                    raise RuntimeError("No contract ZIP found and google.colab.files unavailable; provide A2Z_INPUTS_URL or local /content/crisismmd_p1_p4_contracts.zip.")
                 print("Upload crisismmd_p1_p4_contracts.zip (~5.8 MB):")
                 up = colab_files.upload()
                 if not up:
@@ -213,7 +220,11 @@ def build() -> None:
             import concurrent.futures, os, threading
             from collections import deque
             import torch
-            from IPython.display import Markdown, display
+            from IPython.display import Image as IPyImage, Markdown, display
+            try:
+                from google.colab import files as colab_files
+            except ImportError:
+                colab_files = None
 
             OUT_DIR = WS / "outputs_iccv_same_bank"
             OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -255,12 +266,15 @@ def build() -> None:
                 jobs.append(("SIGLIP", "configs/iccv_crisismmd_siglip.yaml", "siglip_same_bank", "siglip_b16"))
 
             vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-            if PARALLEL_BACKBONES and len(jobs) > 1 and vram_gb >= 23.0:
-                print(f"[PARALLEL] Running {', '.join(j[0] for j in jobs)} ({','.join(sel_protos)}) on {vram_gb:.1f} GB GPU", flush=True)
+            sys_ram_gb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9) if hasattr(os, "sysconf") else 32.0
+            gpu_name = torch.cuda.get_device_name(0)
+            if PARALLEL_BACKBONES and len(jobs) > 1 and vram_gb >= 22.0 and sys_ram_gb >= 28.0:
+                print(f"[PARALLEL] Running {', '.join(j[0] for j in jobs)} ({','.join(sel_protos)}) on {gpu_name} ({vram_gb:.1f} GB VRAM / {sys_ram_gb:.1f} GB RAM)", flush=True)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                     for fut in [pool.submit(_run_job, *j) for j in jobs]:
                         fut.result()
             else:
+                print(f"[SEQUENTIAL] Running on {gpu_name} ({vram_gb:.1f} GB VRAM / {sys_ram_gb:.1f} GB RAM)", flush=True)
                 for j in jobs:
                     _run_job(*j)
 
@@ -268,6 +282,9 @@ def build() -> None:
                 sum_md = OUT_DIR / out_sub / f"ICCV_SAME_BANK_{bb_name}_SUMMARY.md"
                 if sum_md.is_file():
                     display(Markdown(sum_md.read_text(encoding="utf8")))
+                fig_dir = OUT_DIR / out_sub / "figures"
+                for fig_png in sorted(fig_dir.glob("*.png")):
+                    display(IPyImage(filename=str(fig_png)))
 
             RES_ZIP = Path("/content/ICCV_SAME_BANK_DEV_RESULTS.zip")
             with zipfile.ZipFile(RES_ZIP, "w", compression=zipfile.ZIP_DEFLATED) as zout:
@@ -275,7 +292,7 @@ def build() -> None:
                     if fp.is_file():
                         zout.write(fp, fp.relative_to(OUT_DIR).as_posix())
             print("[PACKAGED]", RES_ZIP, RES_ZIP.stat().st_size, "bytes")
-            if AUTO_DOWNLOAD:
+            if AUTO_DOWNLOAD and colab_files is not None:
                 colab_files.download(str(RES_ZIP))
             """,
             cid="iccv-cell-4",

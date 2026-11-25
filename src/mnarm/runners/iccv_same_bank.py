@@ -1,4 +1,4 @@
-"""Unified ICCV Same-Bank benchmark runner: 11 mergers + VLM-CL/Analytic SOTA vs CSS-CT."""
+"""Unified ICCV Same-Bank benchmark runner: 14 verbatim mergers + VLM-CL/Analytic SOTA vs CSS-CT."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ def run_single_protocol_same_bank(
     vlm: MultimodalVLM, protos_full: torch.Tensor, unseen_protos_full: torch.Tensor,
     store: PreprocessedTensorStore, dev_cache: dict[tuple[str, ...], torch.Tensor],
 ) -> dict[str, Any]:
-    """Run all 11 author mergers + seq_ft(CSS-CT) + seq_replay256 + MG-CLIP + PAL-RLS + joint_oracle."""
+    """Run all 14 author mergers + seq_ft(CSS-CT) + seq_replay256 + MG-CLIP + PAL-RLS + joint_oracle."""
     if bool(config.get("allow_test", False)):
         raise ValueError("ICCV Same-Bank benchmark forbids allow_test=True prior to final freeze.")
     seed = int(config["seed"])
@@ -128,19 +128,14 @@ def run_single_protocol_same_bank(
     )
 
     lora_rank_eff = int(getattr(vlm, "rank", config.get("lora_rank", 8)))
-    arm_specs: list[tuple[str, str, dict[str, torch.Tensor], list[dict[str, Any]], StreamingClassBank | None, dict[str, Any] | None]] = [
-        (m, "delta", merge_task_deltas(exp_deltas, m, rank_per_task=lora_rank_eff), [], bank, None) for m in ALL_MERGE_METHODS
-    ] + [
-        ("seq_ft", "lora", seq_ft_state or {}, [], seq_bank, None),
-        ("seq_replay256", "lora", seq_rep_state or {}, st4["fit"] + st4["buffer_before"], None, None),
-    ]
-    if bool(config.get("include_mg_clip", True)) and mg_state is not None:
-        arm_specs.append(("mg_clip", "lora", mg_state, [], mg_bank, mg_heads))
-    arm_specs.append(("joint_oracle", "lora", joint_state, joint_recs, None, None))
-
     arms_out: dict[str, Any] = {}
     boot_map: dict[str, dict[str, torch.Tensor]] = {}
-    for aname, akind, apayload, tr_recs, bnk, mgh in arm_specs:
+    tsvm_delta: dict[str, torch.Tensor] | None = None
+
+    def _eval_one(
+        aname: str, akind: str, apayload: dict[str, torch.Tensor], tr_recs: list[dict[str, Any]],
+        bnk: StreamingClassBank | None, mgh: dict[str, Any] | None,
+    ) -> None:
         arec, blogits = evaluate_arm_all_regimes(
             arm_name=aname, kind=akind, payload=apayload, vlm=vlm, orig_prompts=ds["orig_prompts"], protos_full=protos_full,
             unseen_protos_full=unseen_protos_full, seen_classes=seen, early_classes=ds["early_classes"],
@@ -151,13 +146,33 @@ def run_single_protocol_same_bank(
         )
         arms_out[aname], boot_map[aname] = arec, blogits
 
+    for m in ALL_MERGE_METHODS:
+        with profiler.track(f"merge:{m}"):
+            delta_m = merge_task_deltas(exp_deltas, m, rank_per_task=lora_rank_eff)
+        _eval_one(m, "delta", delta_m, [], bank, None)
+        if m == "tsvm":
+            tsvm_delta = delta_m
+        else:
+            del delta_m
+
+    traj_specs: list[tuple[str, str, dict[str, torch.Tensor], list[dict[str, Any]], StreamingClassBank | None, dict[str, Any] | None]] = [
+        ("seq_ft", "lora", seq_ft_state or {}, [], seq_bank, None),
+        ("seq_replay256", "lora", seq_rep_state or {}, st4["fit"] + st4["buffer_before"], None, None),
+    ]
+    if bool(config.get("include_mg_clip", True)) and mg_state is not None:
+        traj_specs.append(("mg_clip", "lora", mg_state, [], mg_bank, mg_heads))
+    traj_specs.append(("joint_oracle", "lora", joint_state, joint_recs, None, None))
+    for spec in traj_specs:
+        _eval_one(*spec)
+
     pal_rec, pal_boot = eval_pal_rls_arm(
         pal, dev0_t, dev0_i, dev_y, seen, ds["early_classes"], ds["late_classes"], unseen_protos_full,
         vlm.logit_scale, st4["calibration_latest_views"], vlm, store, int(config["eval_batch_size"]), use_amp,
     )
     arms_out["pal_rls"], boot_map["pal_rls"] = pal_rec, pal_boot
 
-    tsvm_delta = merge_task_deltas(exp_deltas, "tsvm", rank_per_task=lora_rank_eff)
+    if tsvm_delta is None:
+        tsvm_delta = merge_task_deltas(exp_deltas, "tsvm", rank_per_task=lora_rank_eff)
     tsvm_t, tsvm_i, _ = extract_paired_features_cached(vlm=vlm, kind="delta", payload=tsvm_delta, records=dev_rows, tensor_store=store, batch_size=int(config["eval_batch_size"]), cache=dev_cache, use_amp=use_amp)
     ablation_out: dict[str, Any] = {}
     for ab_name, bmode, pcmode, use_re in ABLATION_SPECS:

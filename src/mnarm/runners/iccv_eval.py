@@ -182,7 +182,10 @@ def evaluate_arm_all_regimes(
         "retrieval": eval_retrieval_r1(dev_t, dev_i),
         "retrieval_reanchored": eval_retrieval_r1(dev_t_re, dev_i_re),
     }
-    return {"cone_drift": {"text": cone_t, "image": cone_i}, "regimes": regimes, "encoder_preservation": enc_pres}, boot_p
+    out_arm: dict[str, Any] = {"cone_drift": {"text": cone_t, "image": cone_i}, "regimes": regimes, "encoder_preservation": enc_pres}
+    if mg_heads is not None and getattr(mg_heads.get("text"), "mgp_trace", None):
+        out_arm["mgp_trace"] = dict(mg_heads["text"].mgp_trace)
+    return out_arm, boot_p
 
 
 def eval_pal_rls_arm(

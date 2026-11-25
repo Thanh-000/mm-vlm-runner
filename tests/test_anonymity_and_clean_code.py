@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 
 
@@ -45,3 +46,11 @@ def test_anonymity_and_clean_code_gates() -> None:
         lines = src_py.read_text(encoding="utf8").splitlines()
         assert len(lines) <= 350, f"Module exceeds 350 LOC limit ({len(lines)}): {src_py.relative_to(repo_root)}"
         assert "sys.path.insert" not in "\n".join(lines), f"Forbidden sys.path hack in {src_py.relative_to(repo_root)}"
+
+    zp = repo_root / "colab" / "mnarm_iccv_same_bank_code.zip"
+    if zp.is_file():
+        with zipfile.ZipFile(zp) as zf:
+            znames = set(zf.namelist())
+        for src_py in sorted((repo_root / "src" / "mnarm").rglob("*.py")):
+            rel = src_py.relative_to(repo_root).as_posix()
+            assert rel in znames, f"Stale Colab zip missing {rel}; rebuild via build_iccv_same_bank_colab.py"

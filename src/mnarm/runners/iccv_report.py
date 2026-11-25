@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from mnarm.core import write_json_atomic
+from mnarm.eval import generate_iccv_suite_figures
 from mnarm.methods import ALL_MERGE_METHODS
 
 SEQ_ORACLE_ARMS = ("seq_ft", "seq_replay256", "mg_clip", "pal_rls", "joint_oracle")
@@ -25,7 +26,7 @@ def _pf1(arec: dict[str, Any], regime: str) -> str:
 
 
 def render_protocol_report(results: dict[str, Any], out_path: Path) -> None:
-    """Write single-protocol Markdown report comparing 11 mergers + VLM-CL/Analytic SOTA + CSS-CT."""
+    """Write single-protocol Markdown report comparing 14 mergers + VLM-CL/Analytic SOTA + CSS-CT."""
     cfg = results["config"]
     lines = [
         f"# ICCV Same-Bank Report — {cfg['backbone']} {cfg['protocol']} (dev-Only, Strict Layer Isolation)\n",
@@ -142,6 +143,13 @@ def write_same_bank_suite_outputs(config: dict[str, Any], per_proto: dict[str, d
     ]) + "\n"
     (out_dir / f"ICCV_SAME_BANK_{backbone}_TABLE.tex").write_text(tex_body, encoding="utf8")
 
-    payload = {"schema": "mnarm-iccv-same-bank-v2", "backbone": backbone, "allow_test": False, "protocols": compact_protocols}
+    fig_paths = generate_iccv_suite_figures(config, per_proto, out_dir / "figures")
+    payload = {
+        "schema": "mnarm-iccv-same-bank-v2",
+        "backbone": backbone,
+        "allow_test": False,
+        "protocols": compact_protocols,
+        "figures": [p.name for p in fig_paths],
+    }
     write_json_atomic(out_dir / f"ICCV_SAME_BANK_{backbone}_RESULTS.json", payload)
     return payload

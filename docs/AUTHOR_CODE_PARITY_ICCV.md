@@ -1,0 +1,20 @@
+# Verbatim Author Code Parity & Scientific Role Matrix (ICCV)
+
+This table maps every baseline integrated in `mnarm` to its official author source, preserved hyperparameters, Zero-Support MNAR (`P_train(M | y) = 0`) numerical safety guards, and exact scientific hypothesis tested.
+
+| Family / Method | Venue | Official Source & Commit | Verbatim Equation / Hyperparameters | MNAR Numerical Guards Applied | Hypothesis Tested in ICCV Evaluation |
+|---|---|---|---|---|---|
+| `mean` / `exposure` / `ta_sum` | ICLR'23 | Task Arithmetic | Uniform average, active-count average, and sum of stage deltas | Active norm filter (`norm > 1e-12`) | Parameter-space scaling vs naive averaging on sparse towers |
+| `ties20` | NeurIPS'23 | TIES-Merging | Top-20% magnitude trim, sign mass election, disjoint mean | Zero-row safe denominator (`clamp_min(1)`) | Whether sign-conflict resolution fixes MNAR cross-modal imbalance |
+| `magmax` / `magmax_s1` | CVPR'24 | MagMax | Entrywise max-magnitude selection (`s=0.5` and `s=1.0`) | Zero-tensor fallback for inactive stages | Whether selecting largest LoRA weights avoids interference forgetting |
+| `knots` | ICLR'25 | `gstoica27/KnOTS@baa35e85` | Horizontal `float64` SVD alignment (`svd_tol=1e-5`) + TIES `0.20` + `scale=0.6` | Active-stage filtering; empty `keep` -> zero delta | Shared LoRA representation alignment across asymmetric towers |
+| `tsvm` | CVPR'25 | Task Singular Vectors | Per-task rank-`r` SVD (`rank_per_task=lora_rank`) + `U/V` orthogonalization | Active rank truncation matching LoRA rank `8` | Low-rank task singular-vector interference removal on Same-Bank deltas |
+| `iso_c` / `iso_cts` | ICML'25 | `danielm1405/iso-merging@d34010af` | Active-rank SVD (`r_act`) + common/task-specific split (`k_frac=0.8`) + equalized spectrum | Active LoRA rank cap (`n * rank_per_task`) prevents nullspace inflation | Isotropic spectrum flattening on vision+text LoRA experts |
+| `wudi` | ICML'25 | `nathanielyvo/WUDI-Merging@dc3cd120` | `300`-step Adam (`lr=1e-5`) minimizing `(M - d_i) d_i^T / norm(d_i)^2` | Batched per-tower active grouping + `clamp_min(1e-24)` avoids `0/0` NaN | Approximate input-span interference minimization under MNAR |
+| `opcm` | ICLR'25 | Orthogonal Projection Merging | Sequential SVD energy split (`alpha=0.5`) + residual orthogonal clean + norm rescaling | Skip rank projection on zero-norm MNAR stage deltas | Iterative subspace conflict removal in sequential stream |
+| `dop` | NeurIPS'25 | `EnnengYang/DOP@6ddf5c87` | Dual SVD projection (`svd_eps=0.99999`) + 2-task MGDA + EMA (`alpha=0.8, beta=0.999, 200 steps`) | Sync-free GPU tensors + rank floor `k >= 1` | Pareto dual-projection trade-off on MNAR multimodal tasks |
+| `dc_lora` | CVPR'26 | `Tobeginwith/DC-Merge@089af77a` | Active rank-`r` energy smoothing + cover space + top-`0.1%` TIES + block mask | Single-active-stage exact bypass (`no spurious pruning`) | Dual-calibration LoRA merging under zero-support MNAR |
+| `gr_clip` | NeurIPS'25 | `yuhui-zh15/MixedModalitySearch@8fab110a` | Linear 3-mean centering (`q_mean`, `doc_text_mean`, `doc_image_mean`) | Safe mean fallback when a view is empty in calibration stream | Refutes linear unlabeled mean-centering hypothesis under MNAR drift |
+| `mg_clip` | ICCV'25 | `linlany/MindtheGap@21fb1da0` | Epoch-level MGP (`rel_drift > 0.10`), unscaled MGC (`3` ep, `lr=5e-4`), `(1*cross + 4*intra)/5` | In-memory checkpointing, signed `abs(neg0)`, `-1e4` mask on unobserved rows | Direct SOTA continual VLM baseline exposing intra-head MNAR gaps |
+| `pal_rls` | arXiv'25 | PAL-RLS (`2501.09352`) | Random ReLU feature expansion (`2d -> expand_dim`) + `lam=1.0` recursive least squares | Global running modality-mean imputation when a tower is unobserved | Analytic MMCIL baseline without class-conditional cross-modal transport |
+| `Sato Hubness` | arXiv'26 | `2609.01103` | Prediction concentration `pred_gini` & `excess_gini` across seen classes | Exact `float64` Gini on confusion matrix column marginals | Verifies `CSS-CT` eliminates unit-sphere hubness collapse |

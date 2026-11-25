@@ -121,25 +121,53 @@ def _knots_matrix(
         return (float(scale) * (u_k @ merged_sv)).float().cpu()
 
 
-def _wudi_matrix(mats: list[torch.Tensor], iter_num: int = 300, lr: float = 1e-5) -> torch.Tensor:
-    """Verbatim WUDI-Merging (ICML 2025): minimize interference in approximate input span."""
-    active, fallback = _prep_active(mats)
-    if fallback is not None:
-        return fallback
+def _wudi_merge(
+    deltas: list[dict[str, torch.Tensor]],
+    keys: list[str],
+    iter_num: int = 300,
+    lr: float = 1e-5,
+) -> dict[str, torch.Tensor]:
+    """Batched verbatim WUDI-Merging grouped by active stages & tensor shape."""
+    out: dict[str, torch.Tensor] = {}
+    groups: dict[tuple[tuple[int, ...], tuple[int, ...]], list[str]] = {}
+    for k in keys:
+        mats = [d[k] for d in deltas]
+        sig = tuple(i for i, m in enumerate(mats) if float(m.norm().item()) > 1e-12)
+        if len(sig) <= 1 or mats[0].ndim != 2:
+            _, fallback = _prep_active(mats)
+            assert fallback is not None
+            out[k] = fallback
+        else:
+            groups.setdefault((sig, tuple(int(s) for s in mats[0].shape)), []).append(k)
+    if not groups:
+        return out
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     with torch.inference_mode(False), torch.enable_grad():
-        vectors = torch.stack([m.detach().float().cpu().clone() for m in active], dim=0).to(device=dev, dtype=torch.float32)
-        merging_vector = torch.nn.Parameter(torch.sum(vectors, dim=0))
-        opt = torch.optim.Adam([merging_vector], lr=float(lr), weight_decay=0.0)
-        l2_norms = torch.square(torch.norm(vectors.reshape(vectors.shape[0], -1), p=2, dim=-1)).clamp_min(1e-24)
-        for _ in range(int(iter_num)):
-            disturbing = merging_vector.unsqueeze(0) - vectors
-            inner = torch.matmul(disturbing, vectors.transpose(1, 2))
-            loss = torch.sum(torch.square(inner) / l2_norms.unsqueeze(-1).unsqueeze(-1))
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-        return merging_vector.detach().cpu()
+        for (sig, _), gkeys in groups.items():
+            vectors = torch.stack(
+                [torch.stack([deltas[i][k].detach().float().cpu().clone() for i in sig], dim=0) for k in gkeys],
+                dim=0,
+            ).to(device=dev, dtype=torch.float32)
+            b_sz, t_act = vectors.shape[0], vectors.shape[1]
+            merging_vector = torch.nn.Parameter(vectors.sum(dim=1))
+            opt = torch.optim.Adam([merging_vector], lr=float(lr), weight_decay=0.0)
+            l2_norms = torch.square(torch.norm(vectors.reshape(b_sz, t_act, -1), p=2, dim=-1)).clamp_min(1e-24)
+            for _ in range(int(iter_num)):
+                disturbing = merging_vector.unsqueeze(1) - vectors
+                inner = torch.matmul(disturbing, vectors.transpose(-1, -2))
+                loss = torch.sum(torch.square(inner) / l2_norms.unsqueeze(-1).unsqueeze(-1))
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+            res = merging_vector.detach().cpu()
+            for idx, k in enumerate(gkeys):
+                out[k] = res[idx].clone()
+    return out
+
+
+def _wudi_matrix(mats: list[torch.Tensor], iter_num: int = 300, lr: float = 1e-5) -> torch.Tensor:
+    """Single-layer verbatim WUDI-Merging wrapper delegating to batched _wudi_merge."""
+    return _wudi_merge([{"k": m} for m in mats], ["k"], iter_num=iter_num, lr=lr)["k"]
 
 
 def _dc_lora_matrix(mats: list[torch.Tensor], rank_per_task: int = 8) -> torch.Tensor:
@@ -259,33 +287,33 @@ def _dop_merge_pair(
         w = 0.5 * (d0_d + d1_d)
         m_adam = torch.zeros_like(w)
         v_adam = torch.zeros_like(w)
-        ema_c = float(alpha)
+        ema_c = torch.tensor(float(alpha), dtype=w.dtype, device=dev)
         (u0, s0, vh0), (u1, s1, vh1) = factors
 
         for step in range(1, int(num_steps) + 1):
             diff0 = w - d0_d
             p0_u = s0.unsqueeze(1) * (u0.T @ diff0)
             p0_v = (diff0 @ vh0.T) * s0.unsqueeze(0)
-            loss0 = float((p0_u.square().sum() + p0_v.square().sum()).item())
+            loss0 = (p0_u.square().sum() + p0_v.square().sum()).clamp_min(1e-12)
             grad0 = 2.0 * (u0 @ (s0.unsqueeze(1) * p0_u) + (p0_v * s0.unsqueeze(0)) @ vh0)
 
             diff1 = w - d1_d
             p1_u = s1.unsqueeze(1) * (u1.T @ diff1)
             p1_v = (diff1 @ vh1.T) * s1.unsqueeze(0)
-            loss1 = float((p1_u.square().sum() + p1_v.square().sum()).item())
+            loss1 = (p1_u.square().sum() + p1_v.square().sum()).clamp_min(1e-12)
             grad1 = 2.0 * (u1 @ (s1.unsqueeze(1) * p1_u) + (p1_v * s1.unsqueeze(0)) @ vh1)
 
-            g0_n = grad0 / max(loss0, 1e-12)
-            g1_n = grad1 / max(loss1, 1e-12)
-            v11 = float((g0_n * g0_n).sum().item())
-            v12 = float((g0_n * g1_n).sum().item())
-            v22 = float((g1_n * g1_n).sum().item())
-            if v12 >= v11:
-                gamma = 0.999
-            elif v12 >= v22:
-                gamma = 0.001
-            else:
-                gamma = min(0.999, max(0.001, -1.0 * ((v12 - v22) / max(v11 + v22 - 2.0 * v12, 1e-12))))
+            g0_n = grad0 / loss0
+            g1_n = grad1 / loss1
+            v11 = (g0_n * g0_n).sum()
+            v12 = (g0_n * g1_n).sum()
+            v22 = (g1_n * g1_n).sum()
+            gamma_mid = (-1.0 * ((v12 - v22) / (v11 + v22 - 2.0 * v12).clamp_min(1e-12))).clamp(0.001, 0.999)
+            gamma = torch.where(
+                v12 >= v11,
+                torch.full_like(v12, 0.999),
+                torch.where(v12 >= v22, torch.full_like(v12, 0.001), gamma_mid),
+            )
 
             ema_c = float(ema_beta) * ema_c + (1.0 - float(ema_beta)) * gamma
             grad = ema_c * grad0 + (1.0 - ema_c) * grad1

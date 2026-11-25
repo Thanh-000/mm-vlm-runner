@@ -7,9 +7,9 @@
 Every comparison in this benchmark isolates **exactly one layer** at a time while holding the remaining three layers strictly identical:
 
 1. **Contract Layer:** Fixed split manifests, zero UID/image/text overlap across `train` / `cal` / `dev` / `test`, and exact modality masks across `P1–P4`.
-2. **Source Layer:** One canonical 4-stage `std_ce` LoRA Q/V (`r=8, alpha=16`) expert bank trained per `(dataset, backbone, protocol, seed)`. All 11 merging operators consume the **exact same 4 expert deltas**. Separate trajectory tracks (`seq_ft`, `seq_replay256`, `mg_clip`, `pal_rls`, `joint_oracle`) follow the exact same split contract.
-3. **Merge Layer:** Parameter-space consolidation via 11 verbatim-parity author operators:
-   - `mean`, `exposure`, `ta_sum`, `ties20`, `magmax` (s=0.5), `magmax_s1` (s=1.0), `tsvm` (CVPR'25), `iso_c` (ICML'25), `opcm` (ICLR'25, alpha=0.5), `dop` (NeurIPS'25, dual-SVD MGDA), `dc_lora` (CVPR'26, r=8).
+2. **Source Layer:** One canonical 4-stage `std_ce` LoRA Q/V (`r=8, alpha=16`) expert bank trained per `(dataset, backbone, protocol, seed)`. All 14 merging operators consume the **exact same 4 expert deltas**. Separate trajectory tracks (`seq_ft`, `seq_replay256`, `mg_clip`, `pal_rls`, `joint_oracle`) follow the exact same split contract.
+3. **Merge Layer:** Parameter-space consolidation via 14 verbatim-parity author operators:
+   - `mean`, `exposure`, `ta_sum`, `ties20`, `magmax` (s=0.5), `magmax_s1` (s=1.0), `knots` (ICLR'25), `tsvm` (CVPR'25), `iso_c` (ICML'25), `iso_cts` (ICML'25), `wudi` (ICML'25), `opcm` (ICLR'25, alpha=0.5), `dop` (NeurIPS'25, dual-SVD MGDA), `dc_lora` (CVPR'26, r=8).
 4. **Readout Layer (Strictly Partitioned by Data/Label Privileges):**
    - **Regime 0 — Weight-Only / Baseline SOTA (`raw`):** Cosine prompt logits at native model scale (and native VLM-CL/Analytic output for `mg_clip` [ICCV'25 Highlight] and `pal_rls` [Analytic MMCIL'25]).
    - **Regime 1A — Zero-Label Post-Hoc Gap/Mean Controls (`gr_clip`, `unlab_center`):** `gr_clip` (NeurIPS'25 linear modality-gap centering) and `unlab_center` using `0` calibration labels.
@@ -25,3 +25,8 @@ Every comparison in this benchmark isolates **exactly one layer** at a time whil
 - **Closed-Set MNAR Metrics:** `Paired Macro-F1` (`8-cls` & `7-cls`), `Text Macro-F1`, `Image Macro-F1`, `3-View Mean Macro-F1`, `Early Recall`, `Late Recall`, and `ECE (P)`.
 - **Open-Vocabulary & Retrieval Restoration:** Zero-shot `Unseen-Prompt OOD Macro-F1` (`Raw -> Re-Anchored`) and cross-modal retrieval `I->T R@1` (`Raw -> Re-Anchored`).
 - **Component Ablation (Fixed Bank + `tsvm`):** `none_vmf`, `prompt_vmf`, `cm_raw_oas`, `cm_sfloor`, `cm_vmf`, `hybrid_vmf`, and `css_ct`.
+- **Visual Diagnostic Figures (`figures/`, PNG 300 DPI + PDF):**
+  - `fig1_same_bank_regimes_{backbone}` — Mean Paired Macro-F1 across all 14 mergers + 5 SOTA/oracle tracks under `raw`, `gr_clip`, `cal_bias`, and `zero_mnar` (`CSS-CT`).
+  - `fig2_mnar_pathology_hubness_{backbone}` — Early vs Late Recall collapse and Sato Excess Gini vs ECE diagnostics.
+  - `fig3_encoder_preservation_pareto_{backbone}` — Raw vs `O(d)` Re-Anchored `I->T R@1` and `Unseen-Prompt OOD F1`.
+  - `fig4_ablation_bootstrap_{backbone}` — Pillar ablation ladder and Paired Bootstrap 95% CIs.
