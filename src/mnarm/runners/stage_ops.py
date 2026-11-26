@@ -19,6 +19,15 @@ from mnarm.methods.vlm_cl_sota import mg_clip_eval_logits
 from mnarm.models.vlm import MultimodalVLM, proto_logits
 
 
+def _make_adamw(params: list[torch.nn.Parameter], lr: float, weight_decay: float, use_fused: bool) -> torch.optim.AdamW:
+    if use_fused and params and all(p.is_cuda for p in params):
+        try:
+            return torch.optim.AdamW(params, lr=float(lr), weight_decay=float(weight_decay), fused=True)
+        except (RuntimeError, TypeError):
+            pass
+    return torch.optim.AdamW(params, lr=float(lr), weight_decay=float(weight_decay))
+
+
 def train_lora_stage(
     *,
     vlm: MultimodalVLM,
@@ -55,12 +64,12 @@ def train_lora_stage(
     accum_steps = eff_bs // micro_bs
 
     specs = tensor_store.make_batch_specs(records, micro_bs, shuffle=True, seed=seed + stage_idx * 101)
-    opt = torch.optim.AdamW(vlm.lora_parameters(), lr=float(lr), weight_decay=float(weight_decay))
+    amp_on = bool(use_amp and vlm.device == "cuda")
+    amp_dtype = torch.bfloat16 if (amp_on and torch.cuda.is_bf16_supported()) else torch.float16
+    opt = _make_adamw(vlm.lora_parameters(), lr=float(lr), weight_decay=float(weight_decay), use_fused=(vlm.device == "cuda" and (not amp_on or amp_dtype == torch.bfloat16)))
     total_steps = max(1, int(epochs) * max(1, math.ceil(len(specs) / max(accum_steps, 1))))
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_steps, eta_min=float(lr) * 0.05)
     rng = random.Random(int(seed) + stage_idx * 101)
-    amp_on = bool(use_amp and vlm.device == "cuda")
-    amp_dtype = torch.bfloat16 if (amp_on and torch.cuda.is_bf16_supported()) else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(amp_on and amp_dtype == torch.float16))
 
     vlm.clip.train()
@@ -69,7 +78,7 @@ def train_lora_stage(
         rng.shuffle(specs)
         for group_start in range(0, len(specs), accum_steps):
             group = specs[group_start : group_start + accum_steps]
-            opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
             denom = float(len(group))
             for views, chunk in group:
                 batch = tensor_store.collate_chunk(views, chunk)
@@ -78,7 +87,7 @@ def train_lora_stage(
                     for k, v in batch.items()
                     if k not in ("label", "sample_id")
                 }
-                y_global = batch["label"].to(vlm.device)
+                y_global = batch["label"].to(vlm.device, non_blocking=True)
                 with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_on):
                     feats: dict[str, torch.Tensor] = {}
                     if "text" in views:
@@ -236,38 +245,30 @@ def encode_prompts_under_payload(
 
 @torch.inference_mode()
 def collect_masked_cal_bundle(
-    *,
-    vlm: MultimodalVLM,
-    kind: str,
-    payload: dict[str, torch.Tensor],
-    cal_recs: list[dict[str, Any]],
-    store: PreprocessedTensorStore,
-    protos_full: torch.Tensor,
-    seen_classes: list[int],
-    batch_size: int,
-    use_amp: bool,
+    *, vlm: MultimodalVLM, kind: str, payload: dict[str, torch.Tensor], cal_recs: list[dict[str, Any]],
+    store: PreprocessedTensorStore, protos_full: torch.Tensor, seen_classes: list[int],
+    batch_size: int, use_amp: bool, cal_cache: dict[tuple[str, ...], torch.Tensor] | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    """Compute masked calibration logits, labels, and normalized tower features in one pass."""
+    """Compute masked calibration logits, labels, and normalized tower features in one cached pass."""
     if not cal_recs:
         return {}, {}, {}
-    if kind == "lora":
-        vlm.restore_base_weights()
-        vlm.load_lora_state(payload)
-    else:
-        vlm.apply_dense_delta(payload)
-    amp_on = bool(use_amp and vlm.device == "cuda")
-    amp_dtype = torch.bfloat16 if (amp_on and torch.cuda.is_bf16_supported()) else torch.float16
-    vlm.clip.eval()
-
+    cache_obj = cal_cache if cal_cache is not None else {}
+    cal_t, cal_i, _ = extract_paired_features_cached(
+        vlm=vlm, kind=kind, payload=payload, records=cal_recs, tensor_store=store,
+        batch_size=batch_size, cache=cache_obj, use_amp=use_amp,
+    )
+    specs = store.make_batch_specs(cal_recs, batch_size=batch_size, shuffle=False)
     sc_parts: dict[str, list[torch.Tensor]] = {"text": [], "image": [], "paired": []}
     lb_parts: dict[str, list[torch.Tensor]] = {"text": [], "image": [], "paired": []}
     fx_parts: dict[str, list[torch.Tensor]] = {"text": [], "image": []}
-    for views, batch in store.iter_batches(cal_recs, batch_size=batch_size, shuffle=False):
-        dev_inp = {k: v.to(vlm.device, non_blocking=True) for k, v in batch.items() if k not in ("label", "sample_id")}
-        lbl = batch["label"].clone()
-        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_on):
-            ut = vlm.encode_text(dev_inp).float().cpu() if "text" in views else None
-            ui = vlm.encode_image(dev_inp).float().cpu() if "image" in views else None
+    t_off = i_off = 0
+    for views, chunk in specs:
+        n_c = len(chunk)
+        lbl = torch.tensor([int(r["label"]) for r in chunk], dtype=torch.long)
+        ut = cal_t[t_off : t_off + n_c] if "text" in views else None
+        ui = cal_i[i_off : i_off + n_c] if "image" in views else None
+        t_off += n_c if "text" in views else 0
+        i_off += n_c if "image" in views else 0
         zt = proto_logits(ut, protos_full, seen_classes, vlm.logit_scale) if ut is not None else None
         zi = proto_logits(ui, protos_full, seen_classes, vlm.logit_scale) if ui is not None else None
         if zt is not None and ut is not None:
@@ -277,7 +278,6 @@ def collect_masked_cal_bundle(
         zp = 0.5 * (zt + zi) if (zt is not None and zi is not None) else (zt if zt is not None else zi)
         if zp is not None:
             sc_parts["paired"].append(zp); lb_parts["paired"].append(lbl)
-
     return (
         {vw: torch.cat(ps, dim=0) for vw, ps in sc_parts.items() if ps},
         {vw: torch.cat(ls, dim=0) for vw, ls in lb_parts.items() if ls},
@@ -287,16 +287,9 @@ def collect_masked_cal_bundle(
 
 @torch.inference_mode()
 def collect_masked_cal_logits(
-    *,
-    vlm: MultimodalVLM,
-    kind: str,
-    payload: dict[str, torch.Tensor],
-    cal_recs: list[dict[str, Any]],
-    store: PreprocessedTensorStore,
-    protos_full: torch.Tensor,
-    seen_classes: list[int],
-    batch_size: int,
-    use_amp: bool,
+    *, vlm: MultimodalVLM, kind: str, payload: dict[str, torch.Tensor], cal_recs: list[dict[str, Any]],
+    store: PreprocessedTensorStore, protos_full: torch.Tensor, seen_classes: list[int],
+    batch_size: int, use_amp: bool,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """Compute zero-hallucination masked calibration logits honoring record modality masks."""
     sc, lb, _ = collect_masked_cal_bundle(
@@ -311,22 +304,27 @@ def collect_mg_clip_cal_logits(
     *, vlm: MultimodalVLM, kind: str, payload: dict[str, torch.Tensor], cal_recs: list[dict[str, Any]],
     store: PreprocessedTensorStore, orig_prompts: list[str], seen_classes: list[int],
     mg_heads: dict[str, Any], batch_size: int, use_amp: bool,
+    cal_cache: dict[tuple[str, ...], torch.Tensor] | None = None, protos_cur: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute MG-CLIP native log-probability cal logits per uniform-mask chunk."""
     if not cal_recs:
         return {}
-    protos_cur = encode_prompts_under_payload(vlm=vlm, kind=kind, payload=payload, prompts=orig_prompts)
-    amp_on = bool(use_amp and vlm.device == "cuda")
-    amp_dtype = torch.bfloat16 if (amp_on and torch.cuda.is_bf16_supported()) else torch.float16
-    vlm.clip.eval()
+    p_cur = protos_cur if protos_cur is not None else encode_prompts_under_payload(vlm=vlm, kind=kind, payload=payload, prompts=orig_prompts)
+    cache_obj = cal_cache if cal_cache is not None else {}
+    cal_t, cal_i, _ = extract_paired_features_cached(
+        vlm=vlm, kind=kind, payload=payload, records=cal_recs, tensor_store=store,
+        batch_size=batch_size, cache=cache_obj, use_amp=use_amp,
+    )
     parts: dict[str, list[torch.Tensor]] = {"text": [], "image": [], "paired": []}
-    for views, batch in store.iter_batches(cal_recs, batch_size=batch_size, shuffle=False):
-        dev_inp = {k: v.to(vlm.device, non_blocking=True) for k, v in batch.items() if k not in ("label", "sample_id")}
-        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_on):
-            ut = vlm.encode_text(dev_inp).float().cpu() if "text" in views else None
-            ui = vlm.encode_image(dev_inp).float().cpu() if "image" in views else None
-        zt = proto_logits(ut, protos_cur, seen_classes, vlm.logit_scale) if ut is not None else None
-        zi = proto_logits(ui, protos_cur, seen_classes, vlm.logit_scale) if ui is not None else None
+    t_off = i_off = 0
+    for views, chunk in store.make_batch_specs(cal_recs, batch_size=batch_size, shuffle=False):
+        n_c = len(chunk)
+        ut = cal_t[t_off : t_off + n_c] if "text" in views else None
+        ui = cal_i[i_off : i_off + n_c] if "image" in views else None
+        t_off += n_c if "text" in views else 0
+        i_off += n_c if "image" in views else 0
+        zt = proto_logits(ut, p_cur, seen_classes, vlm.logit_scale) if ut is not None else None
+        zi = proto_logits(ui, p_cur, seen_classes, vlm.logit_scale) if ui is not None else None
         zp = 0.5 * (zt + zi) if (zt is not None and zi is not None) else (zt if zt is not None else zi)
         b_cross = {k: v for k, v in (("text", zt), ("image", zi), ("paired", zp)) if v is not None}
         mg_b = mg_clip_eval_logits(ut, ui, b_cross, mg_heads, seen_classes, vlm.logit_scale)

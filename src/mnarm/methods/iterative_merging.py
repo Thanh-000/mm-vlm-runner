@@ -74,7 +74,7 @@ def _tower_of(key: str) -> str:
 
 
 def _opcm_merge_tower(deltas: list[dict[str, torch.Tensor]], keys: list[str], alpha: float) -> dict[str, torch.Tensor]:
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dev = torch.device("cpu")
     merged = {k: deltas[0][k].float().to(dev).clone() for k in keys}
     norm0 = float(torch.cat([merged[k].reshape(-1) for k in keys]).norm().item())
     all_norms = [norm0]
@@ -129,8 +129,7 @@ def _opcm_merge(deltas: list[dict[str, torch.Tensor]], keys: list[str], alpha: f
     return out
 
 
-def _dop_factor_truncated(mat: torch.Tensor, svd_eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    u, s, vh = torch.linalg.svd(mat, full_matrices=False)
+def _dop_slice_factor(u: torch.Tensor, s: torch.Tensor, vh: torch.Tensor, svd_eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     pos = max(1, int((s > 1e-7).sum().item()))
     ratio = s.cumsum(dim=0) / s.sum().clamp_min(1e-12)
     k = max(1, min(int(torch.searchsorted(ratio, float(svd_eps)).item()) + 1, pos, int(s.numel())))
@@ -168,11 +167,14 @@ def _dop_merge_pair_batch(
 ) -> torch.Tensor:
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     with torch.no_grad():
-        d0_d = torch.stack([m.detach().float() for m in mats0], dim=0).to(dev)
-        d1_d = torch.stack([m.detach().float() for m in mats1], dim=0).to(dev)
-        b_sz, d_out, d_in = d0_d.shape
-        fac0 = [_dop_factor_truncated(d0_d[i], svd_eps) for i in range(b_sz)]
-        fac1 = [_dop_factor_truncated(d1_d[i], svd_eps) for i in range(b_sz)]
+        d0_cpu = torch.stack([m.detach().float().cpu() for m in mats0], dim=0)
+        d1_cpu = torch.stack([m.detach().float().cpu() for m in mats1], dim=0)
+        b_sz, d_out, d_in = d0_cpu.shape
+        u0_b, s0_b, vh0_b = torch.linalg.svd(d0_cpu, full_matrices=False)
+        u1_b, s1_b, vh1_b = torch.linalg.svd(d1_cpu, full_matrices=False)
+        fac0 = [_dop_slice_factor(u0_b[i], s0_b[i], vh0_b[i], svd_eps) for i in range(b_sz)]
+        fac1 = [_dop_slice_factor(u1_b[i], s1_b[i], vh1_b[i], svd_eps) for i in range(b_sz)]
+        d0_d, d1_d = d0_cpu.to(dev), d1_cpu.to(dev)
         u0, s0, vh0 = _dop_pad_factors(fac0, d_out, d_in, dev, d0_d.dtype)
         u1, s1, vh1 = _dop_pad_factors(fac1, d_out, d_in, dev, d0_d.dtype)
         u0t, vh0t, u1t, vh1t = u0.transpose(1, 2), vh0.transpose(1, 2), u1.transpose(1, 2), vh1.transpose(1, 2)

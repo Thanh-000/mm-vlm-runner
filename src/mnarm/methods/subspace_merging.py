@@ -17,7 +17,7 @@ from mnarm.methods.iterative_merging import (
 
 
 def _svd_dev() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device("cpu")
 
 
 def _tower_group(key: str) -> str:
@@ -34,18 +34,16 @@ def _tsvm_merge_matrix(mats: list[torch.Tensor], rank_per_task: int = 8) -> torc
     if fallback is not None:
         return fallback
     dev = _svd_dev()
-    n = len(active)
-    min_dim = min(active[0].shape)
+    n, min_dim = len(active), min(active[0].shape)
     r_lora = max(1, int(rank_per_task))
     rk = max(1, min(r_lora, min_dim // n)) if n * r_lora > min_dim else max(1, min(r_lora, min_dim))
-    u_parts, s_parts, v_parts = [], [], []
     with torch.no_grad():
-        for mat in active:
-            u, s, vh = torch.linalg.svd(mat.to(dev), full_matrices=False)
-            keep = min(rk, int(s.numel()))
-            u_parts.append(u[:, :keep])
-            s_parts.append(s[:keep])
-            v_parts.append(vh[:keep, :].T)
+        stk = torch.stack([m.to(dev) for m in active], dim=0)
+        u_all, s_all, vh_all = torch.linalg.svd(stk, full_matrices=False)
+        keep = min(rk, int(s_all.shape[-1]))
+        u_parts = [u_all[i, :, :keep] for i in range(n)]
+        s_parts = [s_all[i, :keep] for i in range(n)]
+        v_parts = [vh_all[i, :keep, :].T for i in range(n)]
         uu, _, uhu = torch.linalg.svd(torch.cat(u_parts, dim=1), full_matrices=False)
         uv, _, uhv = torch.linalg.svd(torch.cat(v_parts, dim=1), full_matrices=False)
         return (((uu @ uhu) * torch.cat(s_parts, dim=0).unsqueeze(0)) @ (uv @ uhv).T).float().cpu()
@@ -97,13 +95,12 @@ def _iso_cts_matrix(mats: list[torch.Tensor], rank_per_task: int = 8, k_frac: fl
             return _iso_c_matrix(active, rank_per_task=rank_per_task)
 
         u_cm, s_cm, vh_cm = u[:, :common_s], s[:common_s], vh[:common_s, :]
-        u_ts_list, s_ts_list, vh_ts_list = [], [], []
-        for mat in act_d:
-            delta_hat = mat - u_cm @ (u_cm.T @ mat)
-            u_h, s_h, vh_h = torch.linalg.svd(delta_hat, full_matrices=False)
-            u_ts_list.append(u_h[:, :n_dims_per_task])
-            s_ts_list.append(s_h[:n_dims_per_task])
-            vh_ts_list.append(vh_h[:n_dims_per_task, :])
+        act_stk = torch.stack(act_d, dim=0)
+        delta_hats = act_stk - torch.matmul(u_cm, torch.matmul(u_cm.T, act_stk))
+        u_h, s_h, vh_h = torch.linalg.svd(delta_hats, full_matrices=False)
+        u_ts_list = [u_h[i, :, :n_dims_per_task] for i in range(n)]
+        s_ts_list = [s_h[i, :n_dims_per_task] for i in range(n)]
+        vh_ts_list = [vh_h[i, :n_dims_per_task, :] for i in range(n)]
 
         u_u, _, vh_u = torch.linalg.svd(torch.cat([*u_ts_list, u_cm], dim=1), full_matrices=False)
         u_v, _, vh_v = torch.linalg.svd(torch.cat([*vh_ts_list, vh_cm], dim=0), full_matrices=False)
@@ -170,14 +167,13 @@ def _dc_lora_matrix(mats: list[torch.Tensor], rank_per_task: int = 8) -> torch.T
         return fallback
     dev, n, min_dim = _svd_dev(), len(active), min(active[0].shape)
     lr = max(1, min(int(rank_per_task), min_dim // n)) if n * int(rank_per_task) > min_dim else int(rank_per_task)
-    u_list, v_list, smoothed_vecs = [], [], []
     with torch.no_grad():
-        for mat in active:
-            u, s, vh = torch.linalg.svd(mat.to(dev), full_matrices=False)
-            u_list.append(u[:, :lr])
-            v_list.append(vh[:lr, :])
-            smoothed_e = s[:lr].mean().expand_as(s[:lr])
-            smoothed_vecs.append((u[:, :lr] * smoothed_e.unsqueeze(0)) @ vh[:lr, :])
+        stk_in = torch.stack([m.to(dev) for m in active], dim=0)
+        u_all, s_all, vh_all = torch.linalg.svd(stk_in, full_matrices=False)
+        u_list = [u_all[i, :, :lr] for i in range(n)]
+        v_list = [vh_all[i, :lr, :] for i in range(n)]
+        s_mean = s_all[:, :lr].mean(dim=1, keepdim=True)
+        smoothed_vecs = [(u_all[i, :, :lr] * s_mean[i : i + 1]) @ vh_all[i, :lr, :] for i in range(n)]
         u_u, _, vh_u = torch.linalg.svd(torch.cat(u_list, dim=1), full_matrices=False)
         u_v, _, vh_v = torch.linalg.svd(torch.cat(v_list, dim=0), full_matrices=False)
         cover_u, cover_vt = u_u @ vh_u, u_v @ vh_v

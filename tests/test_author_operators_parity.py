@@ -378,3 +378,116 @@ def test_dc_lora_small_n_knots_global_opcm_tower_and_mg_clip_p4_cal() -> None:
     w_ref = torch.linalg.solve(pal.gram + pal.lam * eye, pal.rhs).float()
     h_q = torch.relu(pal._fill_pair(xq, xq, ("text", "image")) @ pal.w_up).float()
     assert float((pred - h_q @ w_ref).abs().max().item()) < 1e-5
+
+
+def test_lossless_dual_split_reuse_and_cal_cache_exact_equivalence(tmp_path: Path) -> None:
+    from mnarm.data import PreprocessedTensorStore
+    from mnarm.methods import PALRLSClassifier, StreamingClassBank
+    from mnarm.runners.iccv_eval import evaluate_protocol_split, evaluate_protocol_splits
+    from mnarm.runners.stage_ops import collect_masked_cal_bundle
+
+    torch.manual_seed(37)
+
+    class _MiniVLM:
+        def __init__(self) -> None:
+            self.device, self.rank, self.alpha, self.embed_dim, self.logit_scale = "cpu", 4, 8, 12, 10.0
+            self.clip = nn.Module()
+            self.clip.text_model = nn.Module(); self.clip.text_model.l0 = nn.Module(); self.clip.text_model.l0.q_proj = nn.Linear(12, 12, bias=False)
+            self.clip.vision_model = nn.Module(); self.clip.vision_model.l0 = nn.Module(); self.clip.vision_model.l0.q_proj = nn.Linear(12, 12, bias=False)
+            self.qv_modules = attach_qv_lora(self.clip, rank=4, alpha=8)
+            self.base_qv_weights = {n: m.base.weight.detach().clone() for n, m in self.qv_modules.items()}
+
+        def tokenize_texts(self, texts: list[str], **_kw: object) -> dict[str, torch.Tensor]:
+            return {"input_ids": torch.stack([torch.eye(12)[int(t.split("_", 1)[1]) % 4] for t in texts])}
+
+        def processor(self, images: list[Image.Image], return_tensors: str = "pt") -> dict[str, torch.Tensor]:
+            rows = [torch.eye(12)[im.getpixel((0, 0))[0] % 4].view(1, 3, 4).repeat(3, 1, 1) for im in images]
+            return {"pixel_values": torch.stack(rows)}
+
+        def encode_text(self, inp: dict[str, torch.Tensor]) -> torch.Tensor:
+            return self.clip.text_model.l0.q_proj(inp["input_ids"].float())
+
+        def encode_image(self, inp: dict[str, torch.Tensor]) -> torch.Tensor:
+            return self.clip.vision_model.l0.q_proj(inp["pixel_values"].float()[:, 0].reshape(inp["pixel_values"].shape[0], 12))
+
+        @torch.no_grad()
+        def encode_prompts(self, prompts: list[str]) -> torch.Tensor:
+            return torch.eye(12)[: len(prompts)]
+
+        @torch.no_grad()
+        def encode_prompts_current(self, prompts: list[str]) -> torch.Tensor:
+            return torch.nn.functional.normalize(self.clip.text_model.l0.q_proj(self.encode_prompts(prompts)), dim=-1)
+
+        def zero_lora(self) -> None:
+            for m in self.qv_modules.values():
+                m.lora_b.data.zero_()
+
+        def load_lora_state(self, state: dict[str, torch.Tensor]) -> None:
+            self.zero_lora()
+            for n, m in self.qv_modules.items():
+                if f"{n}.lora_a" in state:
+                    m.lora_a.data.copy_(state[f"{n}.lora_a"]); m.lora_b.data.copy_(state[f"{n}.lora_b"])
+
+        def restore_base_weights(self) -> None:
+            for n, m in self.qv_modules.items():
+                m.base.weight.data.copy_(self.base_qv_weights[n])
+
+        def apply_dense_delta(self, delta: dict[str, torch.Tensor]) -> None:
+            self.zero_lora()
+            for n, m in self.qv_modules.items():
+                w0 = self.base_qv_weights[n]
+                m.base.weight.data.copy_(w0 + delta[n] if n in delta else w0)
+
+        def tower_digest(self, tower: str, kind: str, payload: dict[str, torch.Tensor]) -> str:
+            return tower_digest(tower, kind, payload)
+
+    vlm = _MiniVLM()
+    lookup: dict[str, dict[str, object]] = {}
+    cal_recs, dev_recs, test_recs = [], [], []
+    for c in range(4):
+        for k, bucket, mask in ((0, cal_recs, ["image"] if c < 2 else ["text", "image"]), (1, dev_recs, ["text", "image"]), (2, test_recs, ["text", "image"])):
+            uid = f"u_{c}_{k}"
+            img_p = tmp_path / f"{uid}.png"
+            Image.new("RGB", (4, 4), color=(c, c * 10, c * 20)).save(img_p)
+            lookup[uid] = {"uid": uid, "label": c, "text": f"cls_{c}", "image": img_p}
+            bucket.append({"uid": uid, "label": c, "mask": mask})
+    store = PreprocessedTensorStore(lookup, vlm, max_cached_images=32, workers=1)
+    protos = vlm.encode_prompts([f"cls_{c}" for c in range(4)])
+
+    sc0, lb0, fx0 = collect_masked_cal_bundle(vlm=vlm, kind="lora", payload={}, cal_recs=cal_recs, store=store, protos_full=protos, seen_classes=[0, 1, 2, 3], batch_size=2, use_amp=False, cal_cache=None)
+    cc: dict[tuple[str, ...], torch.Tensor] = {}
+    sc1, lb1, fx1 = collect_masked_cal_bundle(vlm=vlm, kind="lora", payload={}, cal_recs=cal_recs, store=store, protos_full=protos, seen_classes=[0, 1, 2, 3], batch_size=2, use_amp=False, cal_cache=cc)
+    for k in sc0:
+        assert float((sc0[k] - sc1[k]).abs().max().item()) == 0.0 and torch.equal(lb0[k], lb1[k])
+    for k in fx0:
+        assert float((fx0[k] - fx1[k]).abs().max().item()) == 0.0
+
+    deltas = [{"text_model.l0.q_proj": torch.zeros(12, 12), "vision_model.l0.q_proj": torch.randn(12, 12) * 0.03} for _ in range(2)] + [
+        {"text_model.l0.q_proj": torch.randn(12, 12) * 0.03, "vision_model.l0.q_proj": torch.randn(12, 12) * 0.03} for _ in range(2)
+    ]
+    bnk = StreamingClassBank()
+    x0 = torch.nn.functional.normalize(torch.randn(16, 12), dim=-1)
+    y0 = torch.arange(4).repeat(4)
+    bnk.update_stage(u_expert_t=x0[8:], u_base_t=x0[8:], y_t=y0[8:], u_expert_i=x0, u_base_i=x0, y_i=y0, paired_base_t=x0[8:], paired_base_i=x0[8:])
+    pal = PALRLSClassifier(embed_dim=12, num_classes=4, lam=1.0, seed=11, auto_lam=True)
+    pal.update(x0[8:], x0[8:], y0[8:], ("text", "image"))
+    pal.update(None, x0[:8], y0[:8], ("image",))
+    ds = {"orig_prompts": [f"cls_{c}" for c in range(4)], "early_classes": [0, 1], "late_classes": [2, 3], "stages": [{"calibration_latest_views": cal_recs}]}
+    cfg_d = {"seed": 11, "lora_rank": 4, "shrinkage": None, "include_mg_clip": False}
+    cfg_t = {**cfg_d, "allow_test": True}
+    common_kw = dict(
+        ds=ds, seen=[0, 1, 2, 3], exp_deltas=deltas, bank=bnk, seq_ft_state={}, seq_bank=bnk,
+        seq_mm_deltas=deltas, seq_mm_bank=bnk, seq_lmnar_state={}, seq_lmnar_bank=bnk,
+        seq_rep_state={}, seq_rep_bank=bnk, mg_state=None, mg_bank=bnk, mg_heads={},
+        joint_state={}, joint_recs=[], joint_bank=bnk, pal=pal, cal0_fx=fx0,
+        vlm=vlm, protos_full=protos, unseen_protos_full=protos, store=store, eff_eval_bs=4, use_amp=False,
+    )
+    joint_res = evaluate_protocol_splits(splits=[("dev", dev_recs, cfg_d, {}), ("test", test_recs, cfg_t, {})], **common_kw)
+    solo_dev = evaluate_protocol_split(config=cfg_d, eval_rows=dev_recs, split_name="dev", feat_cache={}, **common_kw)
+    solo_test = evaluate_protocol_split(config=cfg_t, eval_rows=test_recs, split_name="test", feat_cache={}, **common_kw)
+    for sp, solo in (("dev", solo_dev), ("test", solo_test)):
+        for arm in ALL_MERGE_METHODS + ("seq_ft", "seq_magmax", "seq_lmnar", "seq_replay256", "joint_oracle", "pal_rls"):
+            for reg, rec in solo["arms"][arm]["regimes"].items():
+                assert abs(float(joint_res[sp]["arms"][arm]["regimes"][reg]["paired"]["macro_f1"]) - float(rec["paired"]["macro_f1"])) == 0.0
+        for ab_k, ab_v in solo["ablation_tsvm"].items():
+            assert abs(float(joint_res[sp]["ablation_tsvm"][ab_k]["paired"]["macro_f1"]) - float(ab_v["paired"]["macro_f1"])) == 0.0

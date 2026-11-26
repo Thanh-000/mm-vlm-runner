@@ -1,4 +1,4 @@
-"""Arm evaluation, CSS-CT fitting with O(d) re-anchoring, and PAL-RLS evaluation helpers."""
+"""Arm evaluation orchestration across dev/test splits with shared lossless calibration & fits."""
 
 from __future__ import annotations
 
@@ -7,224 +7,59 @@ from typing import Any
 import torch
 
 from mnarm.data import PreprocessedTensorStore
-from mnarm.eval import Profiler, eval_retrieval_r1, eval_view_suite, measure_cone_drift, paired_bootstrap_diff
+from mnarm.eval import Profiler, eval_retrieval_r1, eval_view_suite, paired_bootstrap_diff
 from mnarm.methods import (
     ALL_MERGE_METHODS,
     PALRLSClassifier,
-    SelfNormalizedBayesTransportHead,
     StreamingClassBank,
     apply_bias,
     apply_reanchor,
     fit_cal_bias,
-    fit_canonical_reanchor,
-    fit_gr_clip_gap,
     fit_unlabeled_center,
-    gr_clip_logits,
     merge_task_deltas,
-    mg_clip_eval_logits,
 )
 from mnarm.models import MultimodalVLM, proto_logits
-from mnarm.runners.stage_ops import (
-    collect_masked_cal_bundle,
-    collect_mg_clip_cal_logits,
-    collect_train_features_by_modality,
-    encode_prompts_under_payload,
-    extract_paired_features_cached,
+from mnarm.runners.iccv_arm_fit import (
+    ABLATION_SPECS,
+    fit_arm_bundle,
+    fit_css_ct_with_reanchor,
+    score_arm_on_split,
 )
-
-ABLATION_SPECS = (
-    ("none_vmf", "none_zero_shot", "isotropic_vmf", False),
-    ("prompt_vmf", "prompt_bridge", "isotropic_vmf", False),
-    ("cm_raw_oas", "cross_modal_transport", "raw_oas", False),
-    ("cm_sfloor", "cross_modal_transport", "spectral_floor", False),
-    ("cm_vmf", "cross_modal_transport", "isotropic_vmf", False),
-    ("hybrid_vmf", "hybrid_bridge", "isotropic_vmf", False),
-    ("css_ct", "conjugate_bayes", "marginal_epistemic", True),
-)
-
-
-def fit_css_ct_with_reanchor(
-    *,
-    bridge_mode: str,
-    partial_cov_mode: str,
-    use_reanchor: bool,
-    vlm: MultimodalVLM,
-    kind: str,
-    payload: dict[str, torch.Tensor],
-    train_recs: list[dict[str, Any]],
-    streaming_bank: StreamingClassBank | None,
-    store: PreprocessedTensorStore,
-    orig_prompts: list[str],
-    protos_full: torch.Tensor,
-    seen_classes: list[int],
-    eval_batch_size: int,
-    use_amp: bool,
-    shrinkage: float | None,
-    cal_recs: list[dict[str, Any]] | None = None,
-    cal0_fx: dict[str, torch.Tensor] | None = None,
-    cal_fx: dict[str, torch.Tensor] | None = None,
-) -> tuple[SelfNormalizedBayesTransportHead, dict[str, Any], dict[str, Any]]:
-    """Fit Pillar 2 O(d) canonical re-anchoring (from P U U_cal, 0 labels) + Pillar 3 CSS-CT in theta_0."""
-    if cal0_fx is None and cal_recs:
-        _, _, cal0_fx = collect_masked_cal_bundle(
-            vlm=vlm, kind="lora", payload={}, cal_recs=cal_recs, store=store,
-            protos_full=protos_full, seen_classes=seen_classes, batch_size=eval_batch_size, use_amp=use_amp,
-        )
-    if cal_fx is None and cal_recs:
-        _, _, cal_fx = collect_masked_cal_bundle(
-            vlm=vlm, kind=kind, payload=payload, cal_recs=cal_recs, store=store,
-            protos_full=protos_full, seen_classes=seen_classes, batch_size=eval_batch_size, use_amp=use_amp,
-        )
-    c0, cm = cal0_fx or {}, cal_fx or {}
-    u0_t, um_t = c0.get("text"), cm.get("text")
-    u0_i, um_i = c0.get("image"), cm.get("image")
-
-    protos_m = encode_prompts_under_payload(vlm=vlm, kind=kind, payload=payload, prompts=orig_prompts)
-    re_t = fit_canonical_reanchor(u0_t, um_t, protos_full, protos_m)
-    re_i = fit_canonical_reanchor(u0_i, um_i)
-
-    head = SelfNormalizedBayesTransportHead(bridge_mode=bridge_mode, partial_cov_mode=partial_cov_mode, shrinkage=shrinkage)
-    if streaming_bank is None:
-        tf = collect_train_features_by_modality(
-            vlm=vlm, kind=kind, payload=payload, records=train_recs, tensor_store=store, batch_size=eval_batch_size, use_amp=use_amp,
-        )
-        tx = apply_reanchor(tf["text_x"], re_t) if (use_reanchor and tf["text_x"] is not None) else tf["text_x"]
-        ix = apply_reanchor(tf["image_x"], re_i) if (use_reanchor and tf["image_x"] is not None) else tf["image_x"]
-        pt = apply_reanchor(tf["paired_t"], re_t) if (use_reanchor and tf["paired_t"] is not None) else tf["paired_t"]
-        pi = apply_reanchor(tf["paired_i"], re_i) if (use_reanchor and tf["paired_i"] is not None) else tf["paired_i"]
-        head.fit(tx, tf["text_y"], ix, tf["image_y"], pt, pi, protos_full, seen_classes, fallback_scale=vlm.logit_scale)
-        return head, re_t, re_i
-
-    if use_reanchor:
-        bstats = streaming_bank.canonical_stats(seen_classes)
-        protos_fit = protos_full
-    else:
-        bstats = streaming_bank.transport_to_target_stats(
-            bridge_u0_t=u0_t, bridge_um_t=um_t, bridge_u0_i=u0_i, bridge_um_i=um_i,
-            seen_classes=seen_classes, protos_0=protos_full, protos_m=protos_m,
-        )
-        protos_fit = protos_m
-    head.fit_from_sufficient_stats(
-        bstats["towers"], None, None, protos_fit, seen_classes,
-        fallback_scale=vlm.logit_scale, paired_moments=bstats["paired_moments"],
-    )
-    return head, re_t, re_i
+from mnarm.runners.stage_ops import extract_paired_features_cached
 
 
 def evaluate_arm_all_regimes(
     *,
-    arm_name: str,
-    kind: str,
-    payload: dict[str, torch.Tensor],
-    vlm: MultimodalVLM,
-    orig_prompts: list[str],
-    protos_full: torch.Tensor,
-    unseen_protos_full: torch.Tensor,
-    seen_classes: list[int],
-    early_classes: list[int],
-    late_classes: list[int],
-    dev_rows: list[dict[str, Any]],
-    cal_recs: list[dict[str, Any]],
-    dev_cache: dict[tuple[str, ...], torch.Tensor],
-    dev0_t: torch.Tensor,
-    dev0_i: torch.Tensor,
-    train_recs: list[dict[str, Any]],
-    streaming_bank: StreamingClassBank | None,
-    cal0_fx: dict[str, torch.Tensor] | None,
-    store: PreprocessedTensorStore,
-    eval_batch_size: int,
-    use_amp: bool,
-    shrinkage: float | None,
-    profiler: Profiler,
-    mg_heads: dict[str, Any] | None = None,
+    arm_name: str, kind: str, payload: dict[str, torch.Tensor], vlm: MultimodalVLM,
+    orig_prompts: list[str], protos_full: torch.Tensor, unseen_protos_full: torch.Tensor,
+    seen_classes: list[int], early_classes: list[int], late_classes: list[int],
+    dev_rows: list[dict[str, Any]], cal_recs: list[dict[str, Any]], dev_cache: dict[tuple[str, ...], torch.Tensor],
+    dev0_t: torch.Tensor, dev0_i: torch.Tensor, train_recs: list[dict[str, Any]],
+    streaming_bank: StreamingClassBank | None, cal0_fx: dict[str, torch.Tensor] | None,
+    store: PreprocessedTensorStore, eval_batch_size: int, use_amp: bool,
+    shrinkage: float | None, profiler: Profiler, mg_heads: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
-    """Evaluate one merged/continual arm across raw, gr_clip, unlab_center, cal_bias, and CSS-CT."""
-    with profiler.track(f"eval_dev:{arm_name}", n_samples=len(dev_rows)):
-        dev_t, dev_i, dev_y = extract_paired_features_cached(
-            vlm=vlm, kind=kind, payload=payload, records=dev_rows,
-            tensor_store=store, batch_size=eval_batch_size, cache=dev_cache, use_amp=use_amp,
-        )
-
-    cone_t, cone_i = measure_cone_drift(dev_t, dev0_t), measure_cone_drift(dev_i, dev0_i)
-    protos_raw = encode_prompts_under_payload(vlm=vlm, kind=kind, payload=payload, prompts=orig_prompts) if mg_heads is not None else protos_full
-    zt_raw, zi_raw = proto_logits(dev_t, protos_raw, seen_classes, vlm.logit_scale), proto_logits(dev_i, protos_raw, seen_classes, vlm.logit_scale)
-    cross_raw = {"text": zt_raw, "image": zi_raw, "paired": 0.5 * (zt_raw + zi_raw)}
-    raw_logits = mg_clip_eval_logits(dev_t, dev_i, cross_raw, mg_heads, seen_classes, vlm.logit_scale) if mg_heads is not None else cross_raw
-    regimes: dict[str, Any] = {"raw": eval_view_suite(raw_logits, dev_y, seen_classes, early_classes, late_classes)}
-    boot_p: dict[str, torch.Tensor] = {"raw": raw_logits["paired"]}
-
-    cal_sc, cal_lb, cal_fx = collect_masked_cal_bundle(
-        vlm=vlm, kind=kind, payload=payload, cal_recs=cal_recs, store=store,
-        protos_full=protos_raw, seen_classes=seen_classes, batch_size=eval_batch_size, use_amp=use_amp,
+    """Evaluate one merged/continual arm across all regimes on a single split."""
+    fitted = fit_arm_bundle(
+        arm_name=arm_name, kind=kind, payload=payload, vlm=vlm, orig_prompts=orig_prompts,
+        protos_full=protos_full, seen_classes=seen_classes, cal_recs=cal_recs, train_recs=train_recs,
+        streaming_bank=streaming_bank, cal0_fx=cal0_fx, store=store, eval_batch_size=eval_batch_size,
+        use_amp=use_amp, shrinkage=shrinkage, profiler=profiler, mg_heads=mg_heads,
     )
-    if mg_heads is not None and cal_recs:
-        cal_sc = collect_mg_clip_cal_logits(
-            vlm=vlm, kind=kind, payload=payload, cal_recs=cal_recs, store=store,
-            orig_prompts=orig_prompts, seen_classes=seen_classes, mg_heads=mg_heads, batch_size=eval_batch_size, use_amp=use_amp,
-        )
-
-    gap_op = fit_gr_clip_gap(cal_fx.get("text"), cal_fx.get("image"))
-    gr_l = gr_clip_logits(dev_t, dev_i, protos_full, seen_classes, vlm.logit_scale, gap_op)
-    regimes["gr_clip"] = eval_view_suite(gr_l, dev_y, seen_classes, early_classes, late_classes)
-    boot_p["gr_clip"] = gr_l["paired"]
-
-    for f_name, pc_m in (("ncm", "isotropic_vmf"), ("oas_lda", "raw_oas")):
-        f_h, _, _ = fit_css_ct_with_reanchor(
-            bridge_mode="none_zero_shot", partial_cov_mode=pc_m, use_reanchor=False, vlm=vlm, kind=kind, payload=payload,
-            train_recs=train_recs, streaming_bank=streaming_bank, store=store, orig_prompts=orig_prompts, protos_full=protos_full,
-            seen_classes=seen_classes, eval_batch_size=eval_batch_size, use_amp=use_amp, shrinkage=shrinkage, cal_recs=cal_recs, cal0_fx=cal0_fx, cal_fx=cal_fx,
-        )
-        f_l = f_h.predict_views(dev_t, dev_i)
-        regimes[f_name], boot_p[f_name] = eval_view_suite(f_l, dev_y, seen_classes, early_classes, late_classes), f_l["paired"]
-
-    if cal_sc:
-        unlab_l = {vw: (apply_bias(raw_logits[vw], fit_unlabeled_center(cal_sc[vw])["bias"]) if vw in cal_sc else raw_logits[vw]) for vw in ("text", "image", "paired")}
-        cal_l = {vw: (apply_bias(raw_logits[vw], fit_cal_bias(cal_sc[vw], cal_lb[vw], seen_classes)["bias"]) if vw in cal_sc else raw_logits[vw]) for vw in ("text", "image", "paired")}
-        regimes["unlab_center"] = eval_view_suite(unlab_l, dev_y, seen_classes, early_classes, late_classes)
-        regimes["cal_bias"] = eval_view_suite(cal_l, dev_y, seen_classes, early_classes, late_classes)
-        boot_p["unlab_center"], boot_p["cal_bias"] = unlab_l["paired"], cal_l["paired"]
-
-    with profiler.track(f"fit_zero_mnar:{arm_name}"):
-        zn_head, re_t, re_i = fit_css_ct_with_reanchor(
-            bridge_mode="conjugate_bayes", partial_cov_mode="marginal_epistemic", use_reanchor=True,
-            vlm=vlm, kind=kind, payload=payload, train_recs=train_recs,
-            streaming_bank=streaming_bank, store=store,
-            orig_prompts=orig_prompts, protos_full=protos_full, seen_classes=seen_classes,
-            eval_batch_size=eval_batch_size, use_amp=use_amp, shrinkage=shrinkage,
-            cal_recs=cal_recs, cal0_fx=cal0_fx, cal_fx=cal_fx,
-        )
-    dev_t_re, dev_i_re = apply_reanchor(dev_t, re_t), apply_reanchor(dev_i, re_i)
-    zn_logits = zn_head.predict_views(dev_t_re, dev_i_re)
-    regimes["zero_mnar"] = {
-        **eval_view_suite(zn_logits, dev_y, seen_classes, early_classes, late_classes),
-        "diagnostics": zn_head.diagnostics,
-        "reanchor": {"text_cos_after": re_t["cos_after"], "image_cos_after": re_i["cos_after"], "bank_floats": streaming_bank.memory_floats() if streaming_bank else 0},
-    }
-    boot_p["zero_mnar"] = zn_logits["paired"]
-
-    zt_u, zi_u = proto_logits(dev_t, unseen_protos_full, seen_classes, vlm.logit_scale), proto_logits(dev_i, unseen_protos_full, seen_classes, vlm.logit_scale)
-    zt_ur, zi_ur = proto_logits(dev_t_re, unseen_protos_full, seen_classes, vlm.logit_scale), proto_logits(dev_i_re, unseen_protos_full, seen_classes, vlm.logit_scale)
-    enc_pres = {
-        "unseen_prompt_paired_f1": float(eval_view_suite({"text": zt_u, "image": zi_u, "paired": 0.5 * (zt_u + zi_u)}, dev_y, seen_classes, early_classes, late_classes)["paired"]["macro_f1"]),
-        "unseen_prompt_reanchored_f1": float(eval_view_suite({"text": zt_ur, "image": zi_ur, "paired": 0.5 * (zt_ur + zi_ur)}, dev_y, seen_classes, early_classes, late_classes)["paired"]["macro_f1"]),
-        "retrieval": eval_retrieval_r1(dev_t, dev_i),
-        "retrieval_reanchored": eval_retrieval_r1(dev_t_re, dev_i_re),
-    }
-    out_arm: dict[str, Any] = {"cone_drift": {"text": cone_t, "image": cone_i}, "regimes": regimes, "encoder_preservation": enc_pres}
-    if mg_heads is not None and getattr(mg_heads.get("text"), "mgp_trace", None):
-        out_arm["mgp_trace"] = dict(mg_heads["text"].mgp_trace)
-    return out_arm, boot_p
+    return score_arm_on_split(
+        fitted, arm_name=arm_name, kind=kind, payload=payload, vlm=vlm, unseen_protos_full=unseen_protos_full,
+        seen_classes=seen_classes, early_classes=early_classes, late_classes=late_classes,
+        eval_rows=dev_rows, eval_cache=dev_cache, eval0_t=dev0_t, eval0_i=dev0_i, store=store,
+        eval_batch_size=eval_batch_size, use_amp=use_amp, profiler=profiler, mg_heads=mg_heads,
+    )
 
 
-def eval_pal_rls_arm(
-    pal: PALRLSClassifier, dev0_t: torch.Tensor, dev0_i: torch.Tensor, dev_y: torch.Tensor,
-    seen: list[int], early: list[int], late: list[int], unseen_protos: torch.Tensor, scale: float,
-    cal_recs: list[dict[str, Any]], vlm: MultimodalVLM, store: PreprocessedTensorStore, eval_bs: int, use_amp: bool,
-) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
-    """Evaluate frozen-feature PAL-RLS analytic baseline across raw and masked cal regimes."""
-    pal_raw = pal.predict_views(dev0_t, dev0_i, seen)
-    regimes: dict[str, Any] = {"raw": eval_view_suite(pal_raw, dev_y, seen, early, late)}
-    boot_p: dict[str, torch.Tensor] = {"raw": pal_raw["paired"]}
+def _fit_pal_cal_biases(
+    pal: PALRLSClassifier, seen: list[int], cal_recs: list[dict[str, Any]],
+    vlm: MultimodalVLM, store: PreprocessedTensorStore, eval_bs: int, use_amp: bool,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    if not cal_recs:
+        return {}, {}
     vlm.restore_base_weights()
     vlm.zero_lora()
     vlm.clip.eval()
@@ -245,11 +80,27 @@ def eval_pal_rls_arm(
                 cal_sc_p["image"].append(pal.predict_batch(None, ui, ("image",), seen)); cal_lb_p["image"].append(lbl)
             if ut is not None or ui is not None:
                 cal_sc_p["paired"].append(pal.predict_batch(ut, ui, views, seen)); cal_lb_p["paired"].append(lbl)
-    if cal_sc_p["paired"]:
-        cal_sc = {vw: torch.cat(ps, dim=0) for vw, ps in cal_sc_p.items() if ps}
-        cal_lb = {vw: torch.cat(ls, dim=0) for vw, ls in cal_lb_p.items() if ls}
-        unlab_p = {vw: (apply_bias(pal_raw[vw], fit_unlabeled_center(cal_sc[vw])["bias"]) if vw in cal_sc else pal_raw[vw]) for vw in ("text", "image", "paired")}
-        cal_p = {vw: (apply_bias(pal_raw[vw], fit_cal_bias(cal_sc[vw], cal_lb[vw], seen)["bias"]) if vw in cal_sc else pal_raw[vw]) for vw in ("text", "image", "paired")}
+    if not cal_sc_p["paired"]:
+        return {}, {}
+    cal_sc = {vw: torch.cat(ps, dim=0) for vw, ps in cal_sc_p.items() if ps}
+    cal_lb = {vw: torch.cat(ls, dim=0) for vw, ls in cal_lb_p.items() if ls}
+    return (
+        {vw: fit_unlabeled_center(cal_sc[vw])["bias"] for vw in cal_sc},
+        {vw: fit_cal_bias(cal_sc[vw], cal_lb[vw], seen)["bias"] for vw in cal_sc},
+    )
+
+
+def _score_pal_rls_on_split(
+    pal: PALRLSClassifier, dev0_t: torch.Tensor, dev0_i: torch.Tensor, dev_y: torch.Tensor,
+    seen: list[int], early: list[int], late: list[int], unseen_protos: torch.Tensor, scale: float,
+    unlab_b: dict[str, torch.Tensor], cal_b: dict[str, torch.Tensor],
+) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+    pal_raw = pal.predict_views(dev0_t, dev0_i, seen)
+    regimes: dict[str, Any] = {"raw": eval_view_suite(pal_raw, dev_y, seen, early, late)}
+    boot_p: dict[str, torch.Tensor] = {"raw": pal_raw["paired"]}
+    if unlab_b and cal_b:
+        unlab_p = {vw: (apply_bias(pal_raw[vw], unlab_b[vw]) if vw in unlab_b else pal_raw[vw]) for vw in ("text", "image", "paired")}
+        cal_p = {vw: (apply_bias(pal_raw[vw], cal_b[vw]) if vw in cal_b else pal_raw[vw]) for vw in ("text", "image", "paired")}
         regimes["unlab_center"] = eval_view_suite(unlab_p, dev_y, seen, early, late)
         regimes["cal_bias"] = eval_view_suite(cal_p, dev_y, seen, early, late)
         boot_p["unlab_center"], boot_p["cal_bias"] = unlab_p["paired"], cal_p["paired"]
@@ -258,6 +109,125 @@ def eval_pal_rls_arm(
     ood_f1 = float(eval_view_suite({"text": zt_u, "image": zi_u, "paired": 0.5 * (zt_u + zi_u)}, dev_y, seen, early, late)["paired"]["macro_f1"])
     enc = {"unseen_prompt_paired_f1": ood_f1, "unseen_prompt_reanchored_f1": ood_f1, "retrieval": r1, "retrieval_reanchored": r1}
     return {"cone_drift": {"text": {"theta_deg": 0.0}, "image": {"theta_deg": 0.0}}, "regimes": regimes, "encoder_preservation": enc}, boot_p
+
+
+def eval_pal_rls_arm(
+    pal: PALRLSClassifier, dev0_t: torch.Tensor, dev0_i: torch.Tensor, dev_y: torch.Tensor,
+    seen: list[int], early: list[int], late: list[int], unseen_protos: torch.Tensor, scale: float,
+    cal_recs: list[dict[str, Any]], vlm: MultimodalVLM, store: PreprocessedTensorStore, eval_bs: int, use_amp: bool,
+) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+    """Evaluate frozen-feature PAL-RLS analytic baseline across raw and masked cal regimes."""
+    unlab_b, cal_b = _fit_pal_cal_biases(pal, seen, cal_recs, vlm, store, eval_bs, use_amp)
+    return _score_pal_rls_on_split(pal, dev0_t, dev0_i, dev_y, seen, early, late, unseen_protos, scale, unlab_b, cal_b)
+
+
+def evaluate_protocol_splits(
+    *,
+    splits: list[tuple[str, list[dict[str, Any]], dict[str, Any], dict[tuple[str, ...], torch.Tensor]]],
+    ds: dict[str, Any], seen: list[int], exp_deltas: list[dict[str, torch.Tensor]], bank: StreamingClassBank,
+    seq_ft_state: dict[str, torch.Tensor] | None, seq_bank: StreamingClassBank,
+    seq_mm_deltas: list[dict[str, torch.Tensor]], seq_mm_bank: StreamingClassBank,
+    seq_lmnar_state: dict[str, torch.Tensor] | None, seq_lmnar_bank: StreamingClassBank,
+    seq_rep_state: dict[str, torch.Tensor] | None, seq_rep_bank: StreamingClassBank,
+    mg_state: dict[str, torch.Tensor] | None, mg_bank: StreamingClassBank, mg_heads: dict[str, Any],
+    joint_state: dict[str, torch.Tensor], joint_recs: list[dict[str, Any]], joint_bank: StreamingClassBank, pal: PALRLSClassifier,
+    cal0_fx: dict[str, torch.Tensor], vlm: MultimodalVLM, protos_full: torch.Tensor, unseen_protos_full: torch.Tensor,
+    store: PreprocessedTensorStore, eff_eval_bs: int, use_amp: bool,
+) -> dict[str, dict[str, Any]]:
+    """Merge & fit once per arm, then score identically across all requested splits (dev and/or test)."""
+    del joint_recs
+    cal_recs = ds["stages"][-1]["calibration_latest_views"]
+    base_cfg = splits[0][2]
+    lora_rank_eff = int(getattr(vlm, "rank", base_cfg.get("lora_rank", 8)))
+    cal_cache: dict[tuple[str, ...], torch.Tensor] = {}
+
+    sp_state: dict[str, dict[str, Any]] = {}
+    for sp_name, rows, cfg, cache in splits:
+        prof = Profiler()
+        e0_t, e0_i, e_y = extract_paired_features_cached(
+            vlm=vlm, kind="lora", payload={}, records=rows, tensor_store=store, batch_size=eff_eval_bs, cache=cache, use_amp=use_amp,
+        )
+        sp_state[sp_name] = {
+            "rows": rows, "cfg": cfg, "cache": cache, "prof": prof, "e0_t": e0_t, "e0_i": e0_i, "y": e_y,
+            "arms": {}, "boot": {}, "ablation": {},
+        }
+
+    fit_prof = sp_state[splits[0][0]]["prof"]
+
+    def _run_arm(aname: str, akind: str, apayload: dict[str, torch.Tensor], bnk: StreamingClassBank | None, mgh: dict[str, Any] | None) -> None:
+        fitted = fit_arm_bundle(
+            arm_name=aname, kind=akind, payload=apayload, vlm=vlm, orig_prompts=ds["orig_prompts"],
+            protos_full=protos_full, seen_classes=seen, cal_recs=cal_recs, train_recs=[],
+            streaming_bank=bnk, cal0_fx=cal0_fx, store=store, eval_batch_size=eff_eval_bs, use_amp=use_amp,
+            shrinkage=base_cfg.get("shrinkage"), profiler=fit_prof, mg_heads=mgh, cal_cache=cal_cache,
+            include_ablations=(aname == "tsvm"),
+        )
+        fit_rec = fit_prof.records.get(f"fit_zero_mnar:{aname}")
+        for sp_name, st in sp_state.items():
+            if fit_rec is not None and f"fit_zero_mnar:{aname}" not in st["prof"].records:
+                st["prof"].records[f"fit_zero_mnar:{aname}"] = dict(fit_rec)
+            arec, blogits = score_arm_on_split(
+                fitted, arm_name=aname, kind=akind, payload=apayload, vlm=vlm, unseen_protos_full=unseen_protos_full,
+                seen_classes=seen, early_classes=ds["early_classes"], late_classes=ds["late_classes"],
+                eval_rows=st["rows"], eval_cache=st["cache"], eval0_t=st["e0_t"], eval0_i=st["e0_i"],
+                store=store, eval_batch_size=eff_eval_bs, use_amp=use_amp, profiler=st["prof"], mg_heads=mgh,
+            )
+            st["arms"][aname], st["boot"][aname] = arec, blogits
+            if aname == "tsvm":
+                tsvm_t, tsvm_i, _ = extract_paired_features_cached(
+                    vlm=vlm, kind="delta", payload=apayload, records=st["rows"], tensor_store=store,
+                    batch_size=eff_eval_bs, cache=st["cache"], use_amp=use_amp,
+                )
+                for ab_name, (ab_h, use_re) in fitted["ablation_heads"].items():
+                    tx_ab, ix_ab = (apply_reanchor(tsvm_t, fitted["re_t"]), apply_reanchor(tsvm_i, fitted["re_i"])) if use_re else (tsvm_t, tsvm_i)
+                    st["ablation"][ab_name] = eval_view_suite(ab_h.predict_views(tx_ab, ix_ab), st["y"], seen, ds["early_classes"], ds["late_classes"])
+
+    for m in ALL_MERGE_METHODS:
+        with fit_prof.track(f"merge:{m}"):
+            delta_m = merge_task_deltas(exp_deltas, m, rank_per_task=lora_rank_eff)
+        m_rec = fit_prof.records[f"merge:{m}"]
+        for st in sp_state.values():
+            st["prof"].records[f"merge:{m}"] = dict(m_rec)
+        _run_arm(m, "delta", delta_m, bank, None)
+        del delta_m
+
+    seq_mm_merged = merge_task_deltas(seq_mm_deltas, "magmax", rank_per_task=lora_rank_eff)
+    traj_specs: list[tuple[str, str, dict[str, torch.Tensor], StreamingClassBank | None, dict[str, Any] | None]] = [
+        ("seq_ft", "lora", seq_ft_state or {}, seq_bank, None),
+        ("seq_magmax", "delta", seq_mm_merged, seq_mm_bank, None),
+        ("seq_lmnar", "lora", seq_lmnar_state or {}, seq_lmnar_bank, None),
+        ("seq_replay256", "lora", seq_rep_state or {}, seq_rep_bank, None),
+        *([("mg_clip", "lora", mg_state, mg_bank, mg_heads)] if bool(base_cfg.get("include_mg_clip", True)) and mg_state is not None else []),
+        ("joint_oracle", "lora", joint_state, joint_bank, None),
+    ]
+    for aname, akind, apayload, bnk, mgh in traj_specs:
+        _run_arm(aname, akind, apayload, bnk, mgh)
+
+    unlab_pal, cal_pal = _fit_pal_cal_biases(pal, seen, cal_recs, vlm, store, eff_eval_bs, use_amp)
+    out_by_split: dict[str, dict[str, Any]] = {}
+    for sp_name, _, cfg, _ in splits:
+        st = sp_state[sp_name]
+        pal_rec, pal_boot = _score_pal_rls_on_split(
+            pal, st["e0_t"], st["e0_i"], st["y"], seen, ds["early_classes"], ds["late_classes"],
+            unseen_protos_full, vlm.logit_scale, unlab_pal, cal_pal,
+        )
+        st["arms"]["pal_rls"], st["boot"]["pal_rls"] = pal_rec, pal_boot
+        anchor, boot_map = st["boot"]["tsvm"]["zero_mnar"], st["boot"]
+        boot_refs = [
+            ("tsvm:zero_mnar_vs_tsvm:raw", boot_map["tsvm"]["raw"]), ("tsvm:zero_mnar_vs_tsvm:gr_clip", boot_map["tsvm"].get("gr_clip")),
+            ("tsvm:zero_mnar_vs_tsvm:cal_bias", boot_map["tsvm"].get("cal_bias")), ("tsvm:zero_mnar_vs_knots:cal_bias", boot_map["knots"].get("cal_bias")),
+            ("tsvm:zero_mnar_vs_iso_c:cal_bias", boot_map["iso_c"].get("cal_bias")), ("tsvm:zero_mnar_vs_iso_cts:cal_bias", boot_map["iso_cts"].get("cal_bias")),
+            ("tsvm:zero_mnar_vs_wudi:cal_bias", boot_map["wudi"].get("cal_bias")), ("tsvm:zero_mnar_vs_dop:cal_bias", boot_map["dop"].get("cal_bias")),
+            ("tsvm:zero_mnar_vs_dc_lora:cal_bias", boot_map["dc_lora"].get("cal_bias")), ("tsvm:zero_mnar_vs_tsvm:ncm", boot_map["tsvm"].get("ncm")),
+            ("tsvm:zero_mnar_vs_seq_magmax:ncm", boot_map.get("seq_magmax", {}).get("ncm")), ("tsvm:zero_mnar_vs_seq_lmnar:raw", boot_map["seq_lmnar"].get("raw")),
+            ("tsvm:zero_mnar_vs_mg_clip:raw", boot_map.get("mg_clip", {}).get("raw")), ("tsvm:zero_mnar_vs_pal_rls:raw", boot_map["pal_rls"].get("raw")),
+        ]
+        bootstrap = {lbl: paired_bootstrap_diff(anchor, ref, st["y"], seen, seed=int(cfg["seed"])) for lbl, ref in boot_refs if ref is not None}
+        out_by_split[sp_name] = {
+            "schema": "mnarm-iccv-protocol-v2", "split": sp_name, "config": cfg, "arms": st["arms"],
+            "ablation_tsvm": st["ablation"], "bootstrap": bootstrap, "theta0_preservation": dict(pal_rec["encoder_preservation"]), "profiling": st["prof"].records,
+        }
+    return out_by_split
 
 
 def evaluate_protocol_split(
@@ -274,76 +244,11 @@ def evaluate_protocol_split(
     store: PreprocessedTensorStore, feat_cache: dict[tuple[str, ...], torch.Tensor], eff_eval_bs: int, use_amp: bool,
 ) -> dict[str, Any]:
     """Evaluate all 14 mergers + continual/SOTA tracks + ablations + bootstrap on one split (dev or test)."""
-    profiler, seed = Profiler(), int(config["seed"])
-    st_last = ds["stages"][-1]
-    cal_recs = st_last["calibration_latest_views"]
-    lora_rank_eff = int(getattr(vlm, "rank", config.get("lora_rank", 8)))
-    eval0_t, eval0_i, eval_y = extract_paired_features_cached(
-        vlm=vlm, kind="lora", payload={}, records=eval_rows, tensor_store=store,
-        batch_size=eff_eval_bs, cache=feat_cache, use_amp=use_amp,
-    )
-    arms_out: dict[str, Any] = {}
-    boot_map: dict[str, dict[str, torch.Tensor]] = {}
-    tsvm_delta: dict[str, torch.Tensor] | None = None
-
-    def _eval_one(aname: str, akind: str, apayload: dict[str, torch.Tensor], tr_recs: list[dict[str, Any]], bnk: StreamingClassBank | None, mgh: dict[str, Any] | None) -> None:
-        arec, blogits = evaluate_arm_all_regimes(
-            arm_name=aname, kind=akind, payload=apayload, vlm=vlm, orig_prompts=ds["orig_prompts"], protos_full=protos_full,
-            unseen_protos_full=unseen_protos_full, seen_classes=seen, early_classes=ds["early_classes"], late_classes=ds["late_classes"],
-            dev_rows=eval_rows, cal_recs=cal_recs, dev_cache=feat_cache, dev0_t=eval0_t, dev0_i=eval0_i, train_recs=tr_recs, streaming_bank=bnk,
-            cal0_fx=cal0_fx, store=store, eval_batch_size=eff_eval_bs, use_amp=use_amp, shrinkage=config.get("shrinkage"), profiler=profiler, mg_heads=mgh,
-        )
-        arms_out[aname], boot_map[aname] = arec, blogits
-
-    for m in ALL_MERGE_METHODS:
-        with profiler.track(f"merge:{m}"):
-            delta_m = merge_task_deltas(exp_deltas, m, rank_per_task=lora_rank_eff)
-        _eval_one(m, "delta", delta_m, [], bank, None)
-        if m == "tsvm":
-            tsvm_delta = delta_m
-        else:
-            del delta_m
-
-    del joint_recs
-    seq_mm_merged = merge_task_deltas(seq_mm_deltas, "magmax", rank_per_task=lora_rank_eff)
-    traj_specs: list[tuple[str, str, dict[str, torch.Tensor], list[dict[str, Any]], StreamingClassBank | None, dict[str, Any] | None]] = [
-        ("seq_ft", "lora", seq_ft_state or {}, [], seq_bank, None),
-        ("seq_magmax", "delta", seq_mm_merged, [], seq_mm_bank, None),
-        ("seq_lmnar", "lora", seq_lmnar_state or {}, [], seq_lmnar_bank, None),
-        ("seq_replay256", "lora", seq_rep_state or {}, [], seq_rep_bank, None),
-        *([("mg_clip", "lora", mg_state, [], mg_bank, mg_heads)] if bool(config.get("include_mg_clip", True)) and mg_state is not None else []),
-        ("joint_oracle", "lora", joint_state, [], joint_bank, None),
-    ]
-    for spec in traj_specs:
-        _eval_one(*spec)
-
-    pal_rec, pal_boot = eval_pal_rls_arm(pal, eval0_t, eval0_i, eval_y, seen, ds["early_classes"], ds["late_classes"], unseen_protos_full, vlm.logit_scale, cal_recs, vlm, store, eff_eval_bs, use_amp)
-    arms_out["pal_rls"], boot_map["pal_rls"] = pal_rec, pal_boot
-    tsvm_delta = tsvm_delta if tsvm_delta is not None else merge_task_deltas(exp_deltas, "tsvm", rank_per_task=lora_rank_eff)
-    tsvm_t, tsvm_i, _ = extract_paired_features_cached(vlm=vlm, kind="delta", payload=tsvm_delta, records=eval_rows, tensor_store=store, batch_size=eff_eval_bs, cache=feat_cache, use_amp=use_amp)
-    _, _, cal_tsvm_fx = collect_masked_cal_bundle(vlm=vlm, kind="delta", payload=tsvm_delta, cal_recs=cal_recs, store=store, protos_full=protos_full, seen_classes=seen, batch_size=eff_eval_bs, use_amp=use_amp)
-    ablation_out: dict[str, Any] = {}
-    for ab_name, bmode, pcmode, use_re in ABLATION_SPECS:
-        ab_h, rt_ab, ri_ab = fit_css_ct_with_reanchor(
-            bridge_mode=bmode, partial_cov_mode=pcmode, use_reanchor=use_re, vlm=vlm, kind="delta", payload=tsvm_delta, train_recs=[],
-            streaming_bank=bank, store=store, orig_prompts=ds["orig_prompts"], protos_full=protos_full, seen_classes=seen,
-            eval_batch_size=eff_eval_bs, use_amp=use_amp, shrinkage=config.get("shrinkage"), cal_recs=cal_recs, cal0_fx=cal0_fx, cal_fx=cal_tsvm_fx,
-        )
-        tx_ab, ix_ab = (apply_reanchor(tsvm_t, rt_ab), apply_reanchor(tsvm_i, ri_ab)) if use_re else (tsvm_t, tsvm_i)
-        ablation_out[ab_name] = eval_view_suite(ab_h.predict_views(tx_ab, ix_ab), eval_y, seen, ds["early_classes"], ds["late_classes"])
-
-    anchor = boot_map["tsvm"]["zero_mnar"]
-    boot_refs = [
-        ("tsvm:zero_mnar_vs_tsvm:raw", boot_map["tsvm"]["raw"]), ("tsvm:zero_mnar_vs_tsvm:gr_clip", boot_map["tsvm"].get("gr_clip")),
-        ("tsvm:zero_mnar_vs_tsvm:cal_bias", boot_map["tsvm"].get("cal_bias")), ("tsvm:zero_mnar_vs_knots:cal_bias", boot_map["knots"].get("cal_bias")),
-        ("tsvm:zero_mnar_vs_iso_c:cal_bias", boot_map["iso_c"].get("cal_bias")), ("tsvm:zero_mnar_vs_iso_cts:cal_bias", boot_map["iso_cts"].get("cal_bias")),
-        ("tsvm:zero_mnar_vs_wudi:cal_bias", boot_map["wudi"].get("cal_bias")), ("tsvm:zero_mnar_vs_dop:cal_bias", boot_map["dop"].get("cal_bias")),
-        ("tsvm:zero_mnar_vs_dc_lora:cal_bias", boot_map["dc_lora"].get("cal_bias")), ("tsvm:zero_mnar_vs_tsvm:ncm", boot_map["tsvm"].get("ncm")),
-        ("tsvm:zero_mnar_vs_seq_magmax:ncm", boot_map.get("seq_magmax", {}).get("ncm")), ("tsvm:zero_mnar_vs_seq_lmnar:raw", boot_map["seq_lmnar"].get("raw")),
-        ("tsvm:zero_mnar_vs_mg_clip:raw", boot_map.get("mg_clip", {}).get("raw")), ("tsvm:zero_mnar_vs_pal_rls:raw", boot_map["pal_rls"].get("raw")),
-    ]
-    bootstrap = {lbl: paired_bootstrap_diff(anchor, ref, eval_y, seen, seed=seed) for lbl, ref in boot_refs if ref is not None}
-    return {
-        "schema": "mnarm-iccv-protocol-v2", "split": split_name, "config": config, "arms": arms_out,
-        "ablation_tsvm": ablation_out, "bootstrap": bootstrap, "theta0_preservation": dict(pal_rec["encoder_preservation"]), "profiling": profiler.records,
-    }
+    return evaluate_protocol_splits(
+        splits=[(split_name, eval_rows, config, feat_cache)], ds=ds, seen=seen, exp_deltas=exp_deltas, bank=bank,
+        seq_ft_state=seq_ft_state, seq_bank=seq_bank, seq_mm_deltas=seq_mm_deltas, seq_mm_bank=seq_mm_bank,
+        seq_lmnar_state=seq_lmnar_state, seq_lmnar_bank=seq_lmnar_bank, seq_rep_state=seq_rep_state, seq_rep_bank=seq_rep_bank,
+        mg_state=mg_state, mg_bank=mg_bank, mg_heads=mg_heads, joint_state=joint_state, joint_recs=joint_recs, joint_bank=joint_bank,
+        pal=pal, cal0_fx=cal0_fx, vlm=vlm, protos_full=protos_full, unseen_protos_full=unseen_protos_full, store=store,
+        eff_eval_bs=eff_eval_bs, use_amp=use_amp,
+    )[split_name]

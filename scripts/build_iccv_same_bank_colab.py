@@ -486,9 +486,29 @@ def build() -> None:
             vram_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
             sys_ram_gib = ((os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024 ** 3)) if hasattr(os, "sysconf") else 32.0
             gpu_name = torch.cuda.get_device_name(0)
+            if not PARALLEL_BACKBONES:
+                max_slots = 1
+            elif vram_gib >= 88.0 and sys_ram_gib >= 60.0:
+                max_slots = 8
+            elif vram_gib >= 68.0 and sys_ram_gib >= 44.0:
+                max_slots = 6
+            elif vram_gib >= 36.0 and sys_ram_gib >= 28.0:
+                max_slots = 4
+            elif vram_gib >= 20.0 and sys_ram_gib >= 18.0:
+                max_slots = 2
+            else:
+                max_slots = 1
+            cpu_threads = str(max(2, min(6, (os.cpu_count() or 8) // max(max_slots, 1))))
+            run_env["OMP_NUM_THREADS"] = cpu_threads
+            run_env["MKL_NUM_THREADS"] = cpu_threads
+            cost_map = {"crisismmd": 10.2, "dmd": 6.5, "disaster_m3": 4.5, "incidents_vqa": 2.5} if vram_gib >= 36.0 else {"crisismmd": 4.5, "dmd": 3.5, "disaster_m3": 3.0, "incidents_vqa": 2.2}
+            budget_gib = max(10.5, vram_gib * 0.88)
+
             CKPT_ZIP = Path("/content/ICCV_CHECKPOINT_LATEST.zip")
-            ran_jobs = []
-            for ds_name, (seq_p, img_p) in DATASET_PATHS.items():
+            ds_order = [d for d in ("crisismmd", "dmd", "disaster_m3", "incidents_vqa") if d in DATASET_PATHS] + [d for d in DATASET_PATHS if d not in ("crisismmd", "dmd", "disaster_m3", "incidents_vqa")]
+            ran_jobs, group_meta, rem_cnt, queue_tasks = [], {}, {}, []
+            for ds_name in ds_order:
+                seq_p, img_p = DATASET_PATHS[ds_name]
                 ds_jobs = []
                 if RUN_CLIP:
                     sub = "clip_same_bank" if ds_name == "crisismmd" else f"{ds_name}/clip_same_bank"
@@ -496,40 +516,54 @@ def build() -> None:
                 if RUN_SIGLIP:
                     sub = "siglip_same_bank" if ds_name == "crisismmd" else f"{ds_name}/siglip_same_bank"
                     ds_jobs.append((f"{ds_name.upper()}:SIGLIP", f"configs/iccv_{ds_name}_siglip.yaml", seq_p, img_p, sub, "siglip_b16"))
-                max_w = 1
-                if PARALLEL_BACKBONES:
-                    if vram_gib >= 88.0 and sys_ram_gib >= 60.0:
-                        max_w = 6 if ds_name == "crisismmd" else 8
-                    elif vram_gib >= 70.0 and sys_ram_gib >= 44.0:
-                        max_w = 4 if ds_name == "crisismmd" else 6
-                    elif vram_gib >= 36.0 and sys_ram_gib >= 28.0:
-                        max_w = 2 if ds_name == "crisismmd" else 4
-                    elif vram_gib >= 20.0 and sys_ram_gib >= 20.0:
-                        max_w = 1 if ds_name == "crisismmd" else 2
-                if max_w >= 4 and len(sel_protos) > 1:
-                    proto_tasks = [
-                        (f"{tag}:{pr}", cfg_rel, seq_p2, img_p2, sub, bb, [pr], True, False)
-                        for tag, cfg_rel, seq_p2, img_p2, sub, bb in ds_jobs
-                        for pr in sel_protos
-                    ]
-                    print(f"[TURBO-PARALLEL:{ds_name}] Launching {len(proto_tasks)} tasks (max_workers={max_w}) on {gpu_name} ({vram_gib:.1f} GiB VRAM)", flush=True)
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as pool:
-                        for fut in [pool.submit(_run_job, *t) for t in proto_tasks]:
-                            fut.result()
-                    for tag, cfg_rel, seq_p2, img_p2, sub, bb in ds_jobs:
-                        _run_job(f"{tag}:SUMMARY", cfg_rel, seq_p2, img_p2, sub, bb, sel_protos, False, True)
-                elif max_w > 1 and len(ds_jobs) > 1:
-                    print(f"[PARALLEL:{ds_name}] Running CLIP + SigLIP ({','.join(sel_protos)}) on {gpu_name} ({vram_gib:.1f} GiB VRAM)", flush=True)
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_w, len(ds_jobs))) as pool:
-                        for fut in [pool.submit(_run_job, *j) for j in ds_jobs]:
-                            fut.result()
-                else:
-                    for j in ds_jobs:
-                        _run_job(*j)
                 ran_jobs.extend(ds_jobs)
-                write_ecosystem_master_summary(OUT_DIR)
-                _pack_results_zip(CKPT_ZIP)
-                print(f"[CHECKPOINT SAVED] {ds_name} -> {CKPT_ZIP} ({CKPT_ZIP.stat().st_size} bytes)", flush=True)
+                for tag, cfg_rel, sp2, ip2, sub, bb in ds_jobs:
+                    k_grp = (ds_name, sub)
+                    group_meta[k_grp] = {"tag": tag, "cfg": cfg_rel, "seq": sp2, "img": ip2, "sub": sub, "bb": bb}
+                    rem_cnt[k_grp] = len(sel_protos)
+                    for pr in sel_protos:
+                        queue_tasks.append({"group": k_grp, "vram": cost_map.get(ds_name, 5.0), "args": (f"{tag}:{pr}", cfg_rel, sp2, ip2, sub, bb, [pr], len(sel_protos) > 1, False)})
+
+            if max_slots >= 2 and len(queue_tasks) > 1:
+                print(f"[VRAM-QUEUE] {len(queue_tasks)} tasks across {len(ds_order)} datasets | slots={max_slots} budget={budget_gib:.1f}/{vram_gib:.1f} GiB CPU_threads={cpu_threads}/worker ({gpu_name})", flush=True)
+                pending, in_flight, used_vram = deque(queue_tasks), {}, 0.0
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_slots) as pool:
+                    while pending or in_flight:
+                        launched = False
+                        for idx in range(len(pending)):
+                            t_cand = pending[idx]
+                            c_gib = t_cand["vram"]
+                            if len(in_flight) < max_slots and (len(in_flight) == 0 or used_vram + c_gib <= budget_gib):
+                                del pending[idx]
+                                used_vram += c_gib
+                                fut = pool.submit(_run_job, *t_cand["args"])
+                                in_flight[fut] = t_cand
+                                launched = True
+                                break
+                        if launched:
+                            continue
+                        done_futs, _ = concurrent.futures.wait(in_flight.keys(), return_when=concurrent.futures.FIRST_COMPLETED)
+                        for df in done_futs:
+                            done_t = in_flight.pop(df)
+                            used_vram = max(0.0, used_vram - done_t["vram"])
+                            df.result()
+                            k_grp = done_t["group"]
+                            rem_cnt[k_grp] -= 1
+                            if rem_cnt[k_grp] == 0:
+                                g_meta = group_meta[k_grp]
+                                if len(sel_protos) > 1:
+                                    _run_job(f"{g_meta['tag']}:SUMMARY", g_meta["cfg"], g_meta["seq"], g_meta["img"], g_meta["sub"], g_meta["bb"], sel_protos, False, True)
+                                write_ecosystem_master_summary(OUT_DIR)
+                                _pack_results_zip(CKPT_ZIP)
+                                print(f"[CHECKPOINT SAVED] {k_grp[0]}:{g_meta['bb']} -> {CKPT_ZIP} ({CKPT_ZIP.stat().st_size} bytes)", flush=True)
+            else:
+                for ds_name in ds_order:
+                    for tag, cfg_rel, sp2, ip2, sub, bb in ran_jobs:
+                        if (sub == "clip_same_bank" or sub == "siglip_same_bank" if ds_name == "crisismmd" else sub.startswith(f"{ds_name}/")):
+                            _run_job(tag, cfg_rel, sp2, ip2, sub, bb, sel_protos, False, False)
+                    write_ecosystem_master_summary(OUT_DIR)
+                    _pack_results_zip(CKPT_ZIP)
+                    print(f"[CHECKPOINT SAVED] {ds_name} -> {CKPT_ZIP} ({CKPT_ZIP.stat().st_size} bytes)", flush=True)
 
             master_md = write_ecosystem_master_summary(OUT_DIR)
             display(Markdown(master_md.read_text(encoding="utf8")))

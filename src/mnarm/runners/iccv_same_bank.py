@@ -14,7 +14,7 @@ from mnarm.core import build_run_lock, load_yaml, seed_everything, write_json_at
 from mnarm.data import PreprocessedTensorStore, load_benchmark_contracts
 from mnarm.methods import PALRLSClassifier, StreamingClassBank, train_mg_clip_stage
 from mnarm.models import MultimodalVLM
-from mnarm.runners.iccv_eval import evaluate_protocol_split
+from mnarm.runners.iccv_eval import evaluate_protocol_splits
 from mnarm.runners.iccv_report import render_protocol_report, write_ecosystem_master_summary, write_same_bank_suite_outputs
 from mnarm.runners.stage_ops import collect_masked_cal_bundle, collect_train_features_by_modality, train_lora_stage
 
@@ -69,7 +69,8 @@ def run_single_protocol_same_bank(
     seed = int(config["seed"])
     seed_everything(seed, deterministic=bool(config.get("deterministic", True)))
     use_amp = bool(config.get("use_amp", True)) and vlm.device == "cuda"
-    eff_eval_bs = max(int(config["eval_batch_size"]), 512) if (vlm.device == "cuda" and torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory >= 36 * (1024 ** 3)) else int(config["eval_batch_size"])
+    vram_bytes = torch.cuda.get_device_properties(0).total_memory if (vlm.device == "cuda" and torch.cuda.is_available()) else 0
+    eff_eval_bs = max(int(config["eval_batch_size"]), 1024 if vram_bytes >= 40 * (1024 ** 3) else (512 if vram_bytes >= 22 * (1024 ** 3) else int(config["eval_batch_size"])))
     b0_cache = base0_cache if base0_cache is not None else {"text": {}, "image": {}}
     ds = load_benchmark_contracts(str(config.get("dataset", "crisismmd")), seq_inputs, images_dir, config["protocol"], allow_test=allow_test, seed=seed)
     lock_cfg = {**config, "allow_test": allow_test, **({"method_freeze": "CSS-CT-v2.2-fair"} if allow_test else {})}
@@ -185,16 +186,18 @@ def run_single_protocol_same_bank(
         joint_state=joint_state, joint_recs=joint_recs, joint_bank=joint_bank, pal=pal, cal0_fx=cal0_fx,
         vlm=vlm, protos_full=protos_full, unseen_protos_full=unseen_protos_full, store=store, eff_eval_bs=eff_eval_bs, use_amp=use_amp,
     )
-    payload_out = evaluate_protocol_split(config={**config, "allow_test": False}, eval_rows=dev_rows, split_name="dev", feat_cache=dev_cache, **common_eval)
+    splits_spec: list[tuple[str, list[dict[str, Any]], dict[str, Any], dict[tuple[str, ...], torch.Tensor]]] = [
+        ("dev", dev_rows, {**config, "allow_test": False}, dev_cache),
+    ]
+    if allow_test and ds.get("test"):
+        splits_spec.append(("test", [r for r in ds["test"] if int(r["label"]) in set(seen)], lock_cfg, {}))
+    split_outs = evaluate_protocol_splits(splits=splits_spec, **common_eval)
+    payload_out = split_outs["dev"]
     write_json_atomic(out_dir / "ICCV_PROTOCOL_RESULTS.json", payload_out)
     render_protocol_report(payload_out, out_dir / "ICCV_PROTOCOL_REPORT.md")
-
-    if allow_test and ds.get("test"):
-        test_rows = [r for r in ds["test"] if int(r["label"]) in set(seen)]
-        test_cache: dict[tuple[str, ...], torch.Tensor] = {}
-        test_out = evaluate_protocol_split(config=lock_cfg, eval_rows=test_rows, split_name="test", feat_cache=test_cache, **common_eval)
-        write_json_atomic(out_dir / "ICCV_PROTOCOL_TEST_RESULTS.json", test_out)
-        render_protocol_report(test_out, out_dir / "ICCV_PROTOCOL_TEST_REPORT.md")
+    if "test" in split_outs:
+        write_json_atomic(out_dir / "ICCV_PROTOCOL_TEST_RESULTS.json", split_outs["test"])
+        render_protocol_report(split_outs["test"], out_dir / "ICCV_PROTOCOL_TEST_REPORT.md")
     return payload_out
 
 

@@ -151,9 +151,15 @@ def _mean_proto_logits(feats_by_mod: dict[str, torch.Tensor], p_ord: torch.Tenso
 @torch.inference_mode()
 def _measure_mean_neg_by_mask(
     vlm: MultimodalVLM, specs: list[tuple[tuple[str, ...], list[dict[str, Any]]]], tensor_store: PreprocessedTensorStore,
-    p_ord: torch.Tensor, cls_map: dict[int, int], n_cls: int, amp_dtype: torch.dtype, amp_on: bool,
+    p_ord: torch.Tensor, cls_lut: torch.Tensor | dict[int, int], n_cls: int, amp_dtype: torch.dtype, amp_on: bool,
 ) -> dict[tuple[str, ...], float]:
     vlm.clip.eval()
+    if isinstance(cls_lut, dict):
+        lut = torch.zeros(max((int(k) for k in cls_lut), default=0) + 1, dtype=torch.long, device=vlm.device)
+        for c_k, c_v in cls_lut.items():
+            lut[int(c_k)] = int(c_v)
+    else:
+        lut = cls_lut
     neg_sums: dict[tuple[str, ...], float] = defaultdict(float)
     neg_cnts: dict[tuple[str, ...], int] = defaultdict(int)
     with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_on):
@@ -162,11 +168,20 @@ def _measure_mean_neg_by_mask(
             dev_inp = {k: v.to(vlm.device, non_blocking=True) for k, v in batch.items() if k not in ("label", "sample_id")}
             feats = {m: (vlm.encode_text(dev_inp) if m == "text" else vlm.encode_image(dev_inp)) for m in views}
             z = _mean_proto_logits(feats, p_ord, vlm.logit_scale)
-            y_loc = torch.tensor([cls_map[int(v)] for v in batch["label"].tolist()], dtype=torch.long, device=vlm.device)
+            y_loc = lut.index_select(0, batch["label"].to(vlm.device, non_blocking=True))
             neg_mask = 1.0 - F.one_hot(y_loc, num_classes=n_cls).float()
             neg_sums[views] += float(((z * neg_mask).sum(dim=1) / neg_mask.sum(dim=1).clamp_min(1.0)).sum().detach().cpu().item())
             neg_cnts[views] += int(len(chunk))
     return {vw: float(neg_sums[vw] / max(neg_cnts[vw], 1)) for vw in neg_sums}
+
+
+def _make_adam(params: list[torch.Tensor], lr: float, weight_decay: float, use_fused: bool) -> torch.optim.Adam:
+    if use_fused and params and all(p.is_cuda for p in params):
+        try:
+            return torch.optim.Adam(params, lr=float(lr), weight_decay=float(weight_decay), fused=True)
+        except (RuntimeError, TypeError):
+            pass
+    return torch.optim.Adam(params, lr=float(lr), weight_decay=float(weight_decay))
 
 
 def train_mg_clip_stage(
@@ -192,6 +207,9 @@ def train_mg_clip_stage(
     old_ord, new_ord = [int(c) for c in old_classes], [int(c) for c in new_classes]
     cls_ord = old_ord + new_ord
     cls_map = {c: i for i, c in enumerate(cls_ord)}
+    cls_lut = torch.zeros(int(protos_full.shape[0]), dtype=torch.long, device=vlm.device)
+    for c_k, c_v in cls_map.items():
+        cls_lut[c_k] = c_v
     p_ord = l2_normalize(protos_full[cls_ord].float())
     tok_p_dev = {k: v.to(vlm.device) for k, v in vlm.tokenize_texts([orig_prompts[c] for c in cls_ord]).items()} if orig_prompts is not None else None
     eff_bs = max(1, int(effective_batch_size))
@@ -203,13 +221,14 @@ def train_mg_clip_stage(
     amp_on = bool(use_amp and vlm.device == "cuda")
     amp_dtype = torch.bfloat16 if (amp_on and torch.cuda.is_bf16_supported()) else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(amp_on and amp_dtype == torch.float16))
+    can_fuse = bool(vlm.device == "cuda" and (not scaler.is_enabled()))
 
     saved_state = vlm.lora_state()
     vlm.zero_lora()
-    neg0 = _measure_mean_neg_by_mask(vlm, eval_specs, tensor_store, p_ord, cls_map, len(cls_ord), amp_dtype, amp_on)
+    neg0 = _measure_mean_neg_by_mask(vlm, eval_specs, tensor_store, p_ord, cls_lut, len(cls_ord), amp_dtype, amp_on)
     vlm.load_lora_state(saved_state)
 
-    opt = torch.optim.Adam(vlm.lora_parameters(), lr=float(lr), weight_decay=float(weight_decay))
+    opt = _make_adam(vlm.lora_parameters(), lr=float(lr), weight_decay=float(weight_decay), use_fused=can_fuse)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, int(epochs)), eta_min=float(lr) * 0.01)
     rng = random.Random(int(seed) + stage_idx * 23)
     train_specs = list(specs)
@@ -218,12 +237,12 @@ def train_mg_clip_stage(
         rng.shuffle(train_specs)
         for gs in range(0, len(train_specs), accum_steps):
             group = train_specs[gs : gs + accum_steps]
-            opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
             denom = float(len(group))
             for views, chunk in group:
                 batch = tensor_store.collate_chunk(views, chunk)
                 dev_inp = {k: v.to(vlm.device, non_blocking=True) for k, v in batch.items() if k not in ("label", "sample_id")}
-                y_loc = torch.tensor([cls_map[int(v)] for v in batch["label"].tolist()], dtype=torch.long, device=vlm.device)
+                y_loc = cls_lut.index_select(0, batch["label"].to(vlm.device, non_blocking=True))
                 with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_on):
                     p_cur = l2_normalize(vlm.encode_text(tok_p_dev)) if tok_p_dev is not None else p_ord
                     feats = {m: (vlm.encode_text(dev_inp) if m == "text" else vlm.encode_image(dev_inp)) for m in views}
@@ -235,7 +254,7 @@ def train_mg_clip_stage(
             scaler.update()
         sched.step()
     p_fin = l2_normalize(vlm.encode_prompts_current([orig_prompts[c] for c in cls_ord])) if orig_prompts is not None else p_ord
-    neg_ep = _measure_mean_neg_by_mask(vlm, eval_specs, tensor_store, p_fin, cls_map, len(cls_ord), amp_dtype, amp_on)
+    neg_ep = _measure_mean_neg_by_mask(vlm, eval_specs, tensor_store, p_fin, cls_lut, len(cls_ord), amp_dtype, amp_on)
     rel_drift = max((abs(neg_ep[vw] - neg0[vw]) / max(abs(neg0[vw]), 1e-6) for vw in neg_ep), default=0.0)
     mg_heads["text"].mgp_trace[int(stage_idx)] = {
         "neg0": {"+".join(vw): round(val, 4) for vw, val in neg0.items()},
@@ -269,14 +288,14 @@ def train_mg_clip_stage(
         y_all = torch.tensor([cls_map[c] for c in obs_tw for _ in feat_bank[tw][c]], dtype=torch.long, device=vlm.device)
         bs_c = max(1, min(int(mgc_bs), int(x_all.shape[0])))
         n_batches = max(1, math.ceil(int(x_all.shape[0]) / bs_c))
-        opt_c = torch.optim.Adam([clf.weight], lr=float(mgc_lr))
+        opt_c = _make_adam([clf.weight], lr=float(mgc_lr), weight_decay=0.0, use_fused=(vlm.device == "cuda"))
         sched_c = torch.optim.lr_scheduler.CosineAnnealingLR(opt_c, T_max=max(1, int(mgc_epochs) * n_batches), eta_min=float(mgc_lr) * 0.01)
         g_c = torch.Generator(device="cpu").manual_seed(int(seed) + stage_idx * 31)
         for _ in range(int(mgc_epochs)):
             perm = torch.randperm(int(x_all.shape[0]), generator=g_c).to(vlm.device)
             for start in range(0, int(x_all.shape[0]), bs_c):
                 idx = perm[start : start + bs_c]
-                opt_c.zero_grad()
+                opt_c.zero_grad(set_to_none=True)
                 loss_cl = _intra_cls_loss(clf(x_all[idx], cls_ord), y_all[idx], old_count=len(old_ord))
                 loss_cl.backward()
                 if old_ord and clf.weight.grad is not None:
