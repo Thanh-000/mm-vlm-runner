@@ -77,7 +77,8 @@ def build() -> None:
             #@title Configuration {{ display-mode: "form" }}
             REPO_GIT_URL = {DEFAULT_GIT_URL!r}  # @param {{type:"string"}}
             REPO_BRANCH = "main"  # @param {{type:"string"}}
-            RUN_CRISISMMD = False  # @param {{type:"boolean"}}
+            CONFIRM_FREEZE_TEST = True  # @param {{type:"boolean"}}
+            RUN_CRISISMMD = True  # @param {{type:"boolean"}}
             RUN_DMD = True  # @param {{type:"boolean"}}
             RUN_INCIDENTS_VQA = True  # @param {{type:"boolean"}}
             RUN_DISASTER_M3 = True  # @param {{type:"boolean"}}
@@ -309,7 +310,8 @@ def build() -> None:
                 manifest = json.loads((SEQ_DIR / "manifest.json").read_bytes())
                 if (IMG_DIR / "CrisisMMD_v2.0" / "data_image").is_dir():
                     IMG_DIR = IMG_DIR / "CrisisMMD_v2.0"
-                req_set = {{r["image"] for sp in ("train", "dev") for r in manifest["rows"][sp]}}
+                active_sp = ("train", "dev", "test") if CONFIRM_FREEZE_TEST else ("train", "dev")
+                req_set = {{r["image"] for sp in active_sp for r in manifest["rows"][sp]}}
                 has_splits = (SEQ_DIR / "splits.zip").is_file() or (IMG_DIR / "crisismmd_datasplit_all.zip").is_file() or (IMG_DIR.parent / "CrisisMMD_v2.0" / "crisismmd_datasplit_all.zip").is_file()
                 if (not has_splits) or any(not (IMG_DIR / p).is_file() for p in req_set):
                     arc_cands = [Path("/content/crisismmd_v2.tar"), Path("/content/CrisisMMD_v2.0.tar.gz"), Path("/content/CrisisMMD_v2.0.zip")]
@@ -340,8 +342,9 @@ def build() -> None:
                         if not fp.is_file() or hashlib.sha256(fp.read_bytes()).hexdigest() != exp:
                             raise RuntimeError(f"CrisisMMD contract verification failed for {{fn}}")
 
-                test_only = {{r["image"] for r in manifest["rows"]["test"]}} - req_set
-                sum(1 for rel_t in test_only if (IMG_DIR / rel_t).is_file() and ((IMG_DIR / rel_t).unlink() or True))
+                if not CONFIRM_FREEZE_TEST:
+                    test_only = {{r["image"] for r in manifest["rows"]["test"]}} - req_set
+                    sum(1 for rel_t in test_only if (IMG_DIR / rel_t).is_file() and ((IMG_DIR / rel_t).unlink() or True))
                 req_imgs = sorted(p for p in req_set if not (IMG_DIR / p).is_file())
                 if req_imgs and shutil.which("aria2c"):
                     m_lines = []
@@ -458,6 +461,8 @@ def build() -> None:
                     "--seq-inputs", str(seq_p), "--images", str(img_p),
                     "--out", str(out_path), "--protocols", *p_args,
                 ]
+                if CONFIRM_FREEZE_TEST:
+                    cmd.append("--confirm-freeze")
                 if RESUME_COMPLETED or not skip_suite:
                     cmd.append("--resume")
                 if skip_suite:
@@ -519,14 +524,19 @@ def build() -> None:
                         _run_job(*j)
                 ran_jobs.extend(ds_jobs)
 
+            from mnarm.runners.iccv_report import write_ecosystem_master_summary
+            master_md = write_ecosystem_master_summary(OUT_DIR)
+            display(Markdown(master_md.read_text(encoding="utf8")))
             for _, _, _, _, out_sub, bb_name in ran_jobs:
-                sum_md = OUT_DIR / out_sub / f"ICCV_SAME_BANK_{bb_name}_SUMMARY.md"
+                suf = "_TEST" if CONFIRM_FREEZE_TEST else ""
+                fig_sub = "figures_test" if CONFIRM_FREEZE_TEST else "figures"
+                sum_md = OUT_DIR / out_sub / f"ICCV_SAME_BANK_{bb_name}{suf}_SUMMARY.md"
                 if sum_md.is_file():
                     display(Markdown(sum_md.read_text(encoding="utf8")))
-                for fig_png in sorted((OUT_DIR / out_sub / "figures").glob("*.png")):
+                for fig_png in sorted((OUT_DIR / out_sub / fig_sub).glob("*.png")):
                     display(IPyImage(filename=str(fig_png)))
 
-            RES_ZIP = Path("/content/ICCV_SAME_BANK_DEV_RESULTS.zip")
+            RES_ZIP = Path("/content/ICCV_FINAL_DEV_AND_TEST_RESULTS.zip" if CONFIRM_FREEZE_TEST else "/content/ICCV_SAME_BANK_DEV_RESULTS.zip")
             with zipfile.ZipFile(RES_ZIP, "w", compression=zipfile.ZIP_DEFLATED) as zout:
                 for fp in sorted(OUT_DIR.rglob("*")):
                     if fp.is_file():

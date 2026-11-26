@@ -30,8 +30,10 @@ def render_protocol_report(results: dict[str, Any], out_path: Path) -> None:
     """Write single-protocol Markdown report comparing 14 mergers + VLM-CL/Analytic SOTA + CSS-CT."""
     cfg = results["config"]
     ds_name = str(cfg.get("dataset", "crisismmd"))
+    split_name = str(results.get("split", "dev"))
+    split_tag = "Confirmatory Test, Frozen CSS-CT v2.1" if split_name == "test" else "dev-Only, Strict Layer Isolation"
     lines = [
-        f"# ICCV Same-Bank Report — {ds_name} {cfg['backbone']} {cfg['protocol']} (dev-Only, Strict Layer Isolation)\n",
+        f"# ICCV Same-Bank Report — {ds_name} {cfg['backbone']} {cfg['protocol']} ({split_tag})\n",
         "- **Regimes:** `raw` · `gr_clip` (NeurIPS'25, 0-label) · `unlab_center` (0-label) · `zero_mnar` (**CSS-CT Ours: 0 D_cal labels, 0 exemplars**) · `cal_bias` (100% D_cal labels)\n",
         "| Arm | Track / Privilege | Raw (P) | +GR-CLIP (P) | +unlab (P) | +cal (P) | **+CSS-CT (P)** | +CSS-CT 3-View | Early Rec (Raw->CSS) | ECE (CSS) | Unseen OOD (Raw->Re) | I->T R@1 (Raw->Re) | thT/thI |",
         "|---|---|---:|---:|---:|---:|---:|---:|---|---:|---|---|---:|",
@@ -78,15 +80,18 @@ def render_protocol_report(results: dict[str, Any], out_path: Path) -> None:
     out_path.write_text(text, encoding="utf8")
 
 
-def write_same_bank_suite_outputs(config: dict[str, Any], per_proto: dict[str, dict[str, Any]], out_dir: Path) -> dict[str, Any]:
+def write_same_bank_suite_outputs(
+    config: dict[str, Any], per_proto: dict[str, dict[str, Any]], out_dir: Path, split_name: str = "dev",
+) -> dict[str, Any]:
     """Export unified P1-P4 summary Markdown, booktabs LaTeX table, and machine-readable JSON."""
-    backbone = str(config["backbone"])
-    ds_name = str(config.get("dataset", "crisismmd"))
+    backbone, ds_name = str(config["backbone"]), str(config.get("dataset", "crisismmd"))
+    is_test = str(split_name) == "test"
+    split_hdr = "`test` Confirmatory, Same Source Bank" if is_test else "`dev`, Same Source Bank"
     protos = [p for p in ("P1", "P2", "P3", "P4") if p in per_proto] + [p for p in per_proto if p not in ("P1", "P2", "P3", "P4")]
     hdr_cols = " | ".join(f"{p} (Raw / +GR / +cal / **CSS-CT**)" for p in protos)
     sep_cols = " | ".join("---:" for _ in protos)
     lines = [
-        f"# ICCV Same-Bank Summary — {ds_name} {backbone} (`dev`, Same Source Bank)\n",
+        f"# ICCV Same-Bank Summary — {ds_name} {backbone} ({split_hdr})\n",
         f"- **Protocols:** `{', '.join(protos)}` | **Zero `D_cal` labels & O(|Y|d + d^2) moments** in `CSS-CT` (`zero_mnar`)\n",
         f"| Arm | {hdr_cols} | Mean (Raw / +GR / +cal / **CSS-CT**) |",
         f"|---|{sep_cols}|---:|",
@@ -131,13 +136,14 @@ def write_same_bank_suite_outputs(config: dict[str, Any], per_proto: dict[str, d
     md_text = "\n".join(lines) + "\n"
     if "$" in md_text:
         raise AssertionError("Forbidden dollar character detected in ICCV_SAME_BANK summary markdown")
-    (out_dir / f"ICCV_SAME_BANK_{backbone}_SUMMARY.md").write_text(md_text, encoding="utf8")
+    suf = "_TEST" if is_test else ""
+    (out_dir / f"ICCV_SAME_BANK_{backbone}{suf}_SUMMARY.md").write_text(md_text, encoding="utf8")
 
     tex_cols = "l" + "rrr" * len(protos) + "rrr"
     p_hdr = " & ".join(f"\\multicolumn{{3}}{{c}}{{{p}}}" for p in protos) + " & \\multicolumn{3}{c}{Mean}"
     sub_hdr = " & ".join("Raw & +cal & CSS-CT" for _ in range(len(protos) + 1))
     tex_body = "\n".join([
-        "% Auto-generated booktabs table (Paired Macro-F1 % across identical expert bank)",
+        f"% Auto-generated booktabs table ({split_name} Paired Macro-F1 % across identical expert bank)",
         f"\\begin{{tabular}}{{{tex_cols}}}",
         "\\toprule",
         f"Method & {p_hdr} \\\\",
@@ -147,15 +153,94 @@ def write_same_bank_suite_outputs(config: dict[str, Any], per_proto: dict[str, d
         "\\bottomrule",
         "\\end{tabular}",
     ]) + "\n"
-    (out_dir / f"ICCV_SAME_BANK_{backbone}_TABLE.tex").write_text(tex_body, encoding="utf8")
+    (out_dir / f"ICCV_SAME_BANK_{backbone}{suf}_TABLE.tex").write_text(tex_body, encoding="utf8")
 
-    fig_paths = generate_iccv_suite_figures(config, per_proto, out_dir / "figures")
+    fig_paths = generate_iccv_suite_figures(config, per_proto, out_dir / ("figures_test" if is_test else "figures"))
     payload = {
         "schema": "mnarm-iccv-same-bank-v2",
         "backbone": backbone,
-        "allow_test": False,
+        "split": str(split_name),
+        "allow_test": bool(is_test),
         "protocols": compact_protocols,
         "figures": [p.name for p in fig_paths],
     }
-    write_json_atomic(out_dir / f"ICCV_SAME_BANK_{backbone}_RESULTS.json", payload)
+    write_json_atomic(out_dir / f"ICCV_SAME_BANK_{backbone}{suf}_RESULTS.json", payload)
     return payload
+
+
+def write_ecosystem_master_summary(out_root: Path) -> Path:
+    """Aggregate 4-dataset x 2-backbone x 4-protocol dev & test results into ICCV master tables."""
+    import json
+    master_data: dict[str, list[dict[str, Any]]] = {"dev": [], "test": []}
+    for sp, fname in (("dev", "ICCV_PROTOCOL_RESULTS.json"), ("test", "ICCV_PROTOCOL_TEST_RESULTS.json")):
+        for ds in ("crisismmd", "dmd", "incidents_vqa", "disaster_m3"):
+            for bb in ("clip_b16", "siglip_b16"):
+                bdir = "clip_same_bank" if bb == "clip_b16" else "siglip_same_bank"
+                sdir = (out_root / bdir) if (ds == "crisismmd" and (out_root / bdir).is_dir()) else (out_root / ds / bdir)
+                p_jsons = [(p, sdir / f"{bb}_{p.lower()}" / fname) for p in ("P1", "P2", "P3", "P4") if (sdir / f"{bb}_{p.lower()}" / fname).is_file()]
+                if not p_jsons:
+                    continue
+                vals = {k: [] for k in ("raw", "gr_clip", "unlab_center", "cal_bias", "zero_mnar")}
+                v3 = {k: [] for k in ("cal_bias", "zero_mnar")}
+                wins = {"raw": 0, "gr_clip": 0, "cal_bias": 0, "tot": 0}
+                refs = {k: [] for k in ("tsvm_css", "lmnar_css", "mg_clip", "pal_rls", "joint_raw")}
+                for _, jp in p_jsons:
+                    res = json.loads(jp.read_text(encoding="utf8"))
+                    arms = res.get("arms", {})
+                    for m in ALL_MERGE_METHODS:
+                        rg = arms[m]["regimes"]
+                        zp = rg["zero_mnar"]["paired"]["macro_f1"]
+                        wins["tot"] += 1
+                        for wk in ("raw", "gr_clip", "cal_bias"):
+                            if zp > rg[wk]["paired"]["macro_f1"]:
+                                wins[wk] += 1
+                        for k in vals:
+                            vals[k].append(rg[k]["paired"]["macro_f1"] * 100.0)
+                        for k in v3:
+                            v3[k].append(rg[k]["summary"]["view3_mean_f1"] * 100.0)
+                    refs["tsvm_css"].append(arms["tsvm"]["regimes"]["zero_mnar"]["paired"]["macro_f1"] * 100.0)
+                    refs["lmnar_css"].append(arms["seq_lmnar"]["regimes"]["zero_mnar"]["paired"]["macro_f1"] * 100.0)
+                    if "mg_clip" in arms:
+                        refs["mg_clip"].append(arms["mg_clip"]["regimes"]["raw"]["paired"]["macro_f1"] * 100.0)
+                    if "pal_rls" in arms:
+                        refs["pal_rls"].append(arms["pal_rls"]["regimes"]["raw"]["paired"]["macro_f1"] * 100.0)
+                    refs["joint_raw"].append(arms["joint_oracle"]["regimes"]["raw"]["paired"]["macro_f1"] * 100.0)
+                avg = lambda xs: (sum(xs) / len(xs)) if xs else 0.0
+                master_data[sp].append({
+                    "dataset": ds, "backbone": bb, "n_protocols": len(p_jsons),
+                    "raw": avg(vals["raw"]), "gr_clip": avg(vals["gr_clip"]), "unlab_center": avg(vals["unlab_center"]),
+                    "cal_bias": avg(vals["cal_bias"]), "css_ct": avg(vals["zero_mnar"]),
+                    "v3_cal": avg(v3["cal_bias"]), "v3_css": avg(v3["zero_mnar"]),
+                    "wins": wins, **{k: avg(v) for k, v in refs.items()},
+                })
+
+    md_lines = ["# ICCV 4-Benchmark Multi-Altitude Ecosystem Master Summary (`CSS-CT` v2.1)\n"]
+    tex_lines = ["% Auto-generated 4-benchmark ICCV Master Booktabs Table", "\\begin{tabular}{llrrrrrrrrrr}", "\\toprule", "Split / Dataset & Backbone & Raw & +GR & +cal & **CSS-CT** & 3V-cal & 3V-CSS & TSV+CSS & MG-CLIP & PAL-RLS & Joint \\\\", "\\midrule"]
+    for sp in ("test", "dev"):
+        rows = master_data[sp]
+        if not rows:
+            continue
+        md_lines.append(f"## Split: `{sp}` ({'Confirmatory Frozen Test' if sp == 'test' else 'Validation Dev'})\n")
+        md_lines.append("| Dataset | Backbone | Raw | +GR-CLIP | +unlab | +cal (100% D_cal) | **CSS-CT (0 D_cal)** | 3-View (+cal -> CSS) | Wins (vs Raw / GR / cal) | TSV+CSS | LMNAR+CSS | MG-CLIP | PAL-RLS | Joint |")
+        md_lines.append("|---|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|")
+        for r in rows:
+            w = r["wins"]
+            md_lines.append(
+                f"| `{r['dataset']}` | `{r['backbone']}` | {r['raw']:.2f} | {r['gr_clip']:.2f} | {r['unlab_center']:.2f} | {r['cal_bias']:.2f} | **{r['css_ct']:.2f}** | "
+                f"{r['v3_cal']:.2f} -> **{r['v3_css']:.2f}** | {w['raw']}/{w['tot']} · {w['gr_clip']}/{w['tot']} · {w['cal_bias']}/{w['tot']} | "
+                f"{r['tsvm_css']:.2f} | {r['lmnar_css']:.2f} | {r['mg_clip']:.2f} | {r['pal_rls']:.2f} | {r['joint_raw']:.2f} |"
+            )
+            ds_tex, bb_tex = r["dataset"].replace("_", "\\_"), r["backbone"].replace("_", "\\_")
+            tex_lines.append(
+                f"{sp}:\\texttt{{{ds_tex}}} & \\texttt{{{bb_tex}}} & {r['raw']:.2f} & {r['gr_clip']:.2f} & {r['cal_bias']:.2f} & \\textbf{{{r['css_ct']:.2f}}} & {r['v3_cal']:.2f} & \\textbf{{{r['v3_css']:.2f}}} & {r['tsvm_css']:.2f} & {r['mg_clip']:.2f} & {r['pal_rls']:.2f} & {r['joint_raw']:.2f} \\\\"
+            )
+        md_lines.append("")
+    tex_lines.extend(["\\bottomrule", "\\end{tabular}", ""])
+    md_text = "\n".join(md_lines) + "\n"
+    if "$" in md_text:
+        raise AssertionError("Forbidden dollar character detected in ICCV_ECOSYSTEM_MASTER_SUMMARY.md")
+    md_path = out_root / "ICCV_ECOSYSTEM_MASTER_SUMMARY.md"
+    md_path.write_text(md_text, encoding="utf8")
+    (out_root / "ICCV_ECOSYSTEM_MASTER_TABLE.tex").write_text("\n".join(tex_lines), encoding="utf8")
+    write_json_atomic(out_root / "ICCV_ECOSYSTEM_MASTER_RESULTS.json", master_data)
+    return md_path

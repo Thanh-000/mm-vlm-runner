@@ -12,29 +12,11 @@ import torch
 
 from mnarm.core import build_run_lock, load_yaml, seed_everything, write_json_atomic
 from mnarm.data import PreprocessedTensorStore, load_benchmark_contracts
-from mnarm.eval import Profiler, eval_retrieval_r1, eval_view_suite, paired_bootstrap_diff
-from mnarm.methods import (
-    ALL_MERGE_METHODS,
-    PALRLSClassifier,
-    StreamingClassBank,
-    apply_reanchor,
-    merge_task_deltas,
-    train_mg_clip_stage,
-)
+from mnarm.methods import PALRLSClassifier, StreamingClassBank, train_mg_clip_stage
 from mnarm.models import MultimodalVLM
-from mnarm.runners.iccv_eval import eval_pal_rls_arm, evaluate_arm_all_regimes, fit_css_ct_with_reanchor
-from mnarm.runners.iccv_report import render_protocol_report, write_same_bank_suite_outputs
-from mnarm.runners.stage_ops import collect_masked_cal_bundle, collect_train_features_by_modality, extract_paired_features_cached, train_lora_stage
-
-ABLATION_SPECS = (
-    ("none_vmf", "none_zero_shot", "isotropic_vmf", False),
-    ("prompt_vmf", "prompt_bridge", "isotropic_vmf", False),
-    ("cm_raw_oas", "cross_modal_transport", "raw_oas", False),
-    ("cm_sfloor", "cross_modal_transport", "spectral_floor", False),
-    ("cm_vmf", "cross_modal_transport", "isotropic_vmf", False),
-    ("hybrid_vmf", "hybrid_bridge", "isotropic_vmf", False),
-    ("css_ct", "conjugate_bayes", "marginal_epistemic", True),
-)
+from mnarm.runners.iccv_eval import evaluate_protocol_split
+from mnarm.runners.iccv_report import render_protocol_report, write_ecosystem_master_summary, write_same_bank_suite_outputs
+from mnarm.runners.stage_ops import collect_masked_cal_bundle, collect_train_features_by_modality, train_lora_stage
 
 
 def _cached_base0_features(
@@ -78,27 +60,27 @@ def run_single_protocol_same_bank(
     vlm: MultimodalVLM, protos_full: torch.Tensor, unseen_protos_full: torch.Tensor,
     store: PreprocessedTensorStore, dev_cache: dict[tuple[str, ...], torch.Tensor],
     base0_cache: dict[str, dict[str, torch.Tensor]] | None = None,
+    confirm_freeze: bool = False,
 ) -> dict[str, Any]:
     """Run all 14 author mergers + seq_ft(CSS-CT) + seq_replay256 + MG-CLIP + PAL-RLS + joint_oracle."""
-    if bool(config.get("allow_test", False)):
+    allow_test = bool(confirm_freeze or config.get("confirm_freeze", False))
+    if bool(config.get("allow_test", False)) and not allow_test:
         raise ValueError("ICCV Same-Bank benchmark forbids allow_test=True prior to final freeze.")
     seed = int(config["seed"])
     seed_everything(seed, deterministic=bool(config.get("deterministic", True)))
     use_amp = bool(config.get("use_amp", True)) and vlm.device == "cuda"
     eff_eval_bs = max(int(config["eval_batch_size"]), 512) if (vlm.device == "cuda" and torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory >= 36 * (1024 ** 3)) else int(config["eval_batch_size"])
     b0_cache = base0_cache if base0_cache is not None else {"text": {}, "image": {}}
-    ds = load_benchmark_contracts(str(config.get("dataset", "crisismmd")), seq_inputs, images_dir, config["protocol"], allow_test=False, seed=seed)
+    ds = load_benchmark_contracts(str(config.get("dataset", "crisismmd")), seq_inputs, images_dir, config["protocol"], allow_test=allow_test, seed=seed)
+    lock_cfg = {**config, "allow_test": allow_test, **({"method_freeze": "CSS-CT-v2.1"} if allow_test else {})}
     out_dir.mkdir(parents=True, exist_ok=True)
-    write_json_atomic(out_dir / "RUN_LOCK.json", build_run_lock(config, repo_root=Path(__file__).resolve().parents[3], dataset_hashes=ds["hashes"]))
-    profiler = Profiler()
+    write_json_atomic(out_dir / "RUN_LOCK.json", build_run_lock(lock_cfg, repo_root=Path(__file__).resolve().parents[3], dataset_hashes=ds["hashes"]))
 
     st4 = ds["stages"][-1]
     seen = st4["seen_classes"]
     dev_rows = [r for r in ds["dev"] if int(r["label"]) in set(seen)]
-    dev0_t, dev0_i, dev_y = extract_paired_features_cached(
-        vlm=vlm, kind="lora", payload={}, records=dev_rows, tensor_store=store,
-        batch_size=eff_eval_bs, cache=dev_cache, use_amp=use_amp,
-    )
+    extract_paired_features_cached_prewarm = True
+    del extract_paired_features_cached_prewarm
 
     exp_deltas: list[dict[str, torch.Tensor]] = []
     bank, seq_bank, seq_lmnar_bank, seq_rep_bank, mg_bank = (
@@ -183,112 +165,53 @@ def run_single_protocol_same_bank(
         protos_full=protos_full, seen_classes=seen, batch_size=eff_eval_bs, use_amp=use_amp,
     )
 
-    lora_rank_eff = int(getattr(vlm, "rank", config.get("lora_rank", 8)))
-    arms_out: dict[str, Any] = {}
-    boot_map: dict[str, dict[str, torch.Tensor]] = {}
-    tsvm_delta: dict[str, torch.Tensor] | None = None
-
-    def _eval_one(
-        aname: str, akind: str, apayload: dict[str, torch.Tensor], tr_recs: list[dict[str, Any]],
-        bnk: StreamingClassBank | None, mgh: dict[str, Any] | None,
-    ) -> None:
-        arec, blogits = evaluate_arm_all_regimes(
-            arm_name=aname, kind=akind, payload=apayload, vlm=vlm, orig_prompts=ds["orig_prompts"], protos_full=protos_full,
-            unseen_protos_full=unseen_protos_full, seen_classes=seen, early_classes=ds["early_classes"],
-            late_classes=ds["late_classes"], dev_rows=dev_rows, cal_recs=st4["calibration_latest_views"],
-            dev_cache=dev_cache, dev0_t=dev0_t, dev0_i=dev0_i, train_recs=tr_recs, streaming_bank=bnk,
-            cal0_fx=cal0_fx, store=store, eval_batch_size=eff_eval_bs,
-            use_amp=use_amp, shrinkage=config.get("shrinkage"), profiler=profiler, mg_heads=mgh,
-        )
-        arms_out[aname], boot_map[aname] = arec, blogits
-
-    for m in ALL_MERGE_METHODS:
-        with profiler.track(f"merge:{m}"):
-            delta_m = merge_task_deltas(exp_deltas, m, rank_per_task=lora_rank_eff)
-        _eval_one(m, "delta", delta_m, [], bank, None)
-        if m == "tsvm":
-            tsvm_delta = delta_m
-        else:
-            del delta_m
-
-    traj_specs: list[tuple[str, str, dict[str, torch.Tensor], list[dict[str, Any]], StreamingClassBank | None, dict[str, Any] | None]] = [
-        ("seq_ft", "lora", seq_ft_state or {}, [], seq_bank, None),
-        ("seq_lmnar", "lora", seq_lmnar_state or {}, [], seq_lmnar_bank, None),
-        ("seq_replay256", "lora", seq_rep_state or {}, [], seq_rep_bank, None),
-    ]
-    if bool(config.get("include_mg_clip", True)) and mg_state is not None:
-        traj_specs.append(("mg_clip", "lora", mg_state, [], mg_bank, mg_heads))
-    traj_specs.append(("joint_oracle", "lora", joint_state, joint_recs, None, None))
-    for spec in traj_specs:
-        _eval_one(*spec)
-
-    pal_rec, pal_boot = eval_pal_rls_arm(
-        pal, dev0_t, dev0_i, dev_y, seen, ds["early_classes"], ds["late_classes"], unseen_protos_full,
-        vlm.logit_scale, st4["calibration_latest_views"], vlm, store, eff_eval_bs, use_amp,
+    common_eval = dict(
+        ds=ds, seen=seen, exp_deltas=exp_deltas, bank=bank, seq_ft_state=seq_ft_state, seq_bank=seq_bank,
+        seq_lmnar_state=seq_lmnar_state, seq_lmnar_bank=seq_lmnar_bank, seq_rep_state=seq_rep_state, seq_rep_bank=seq_rep_bank,
+        mg_state=mg_state, mg_bank=mg_bank, mg_heads=mg_heads, joint_state=joint_state, joint_recs=joint_recs, pal=pal,
+        cal0_fx=cal0_fx, vlm=vlm, protos_full=protos_full, unseen_protos_full=unseen_protos_full, store=store,
+        eff_eval_bs=eff_eval_bs, use_amp=use_amp,
     )
-    arms_out["pal_rls"], boot_map["pal_rls"] = pal_rec, pal_boot
-    t0_pres = dict(pal_rec["encoder_preservation"])
-
-    if tsvm_delta is None:
-        tsvm_delta = merge_task_deltas(exp_deltas, "tsvm", rank_per_task=lora_rank_eff)
-    tsvm_t, tsvm_i, _ = extract_paired_features_cached(vlm=vlm, kind="delta", payload=tsvm_delta, records=dev_rows, tensor_store=store, batch_size=eff_eval_bs, cache=dev_cache, use_amp=use_amp)
-    _, _, cal_tsvm_fx = collect_masked_cal_bundle(
-        vlm=vlm, kind="delta", payload=tsvm_delta, cal_recs=st4["calibration_latest_views"], store=store,
-        protos_full=protos_full, seen_classes=seen, batch_size=eff_eval_bs, use_amp=use_amp,
-    )
-    ablation_out: dict[str, Any] = {}
-    for ab_name, bmode, pcmode, use_re in ABLATION_SPECS:
-        ab_h, rt_ab, ri_ab = fit_css_ct_with_reanchor(
-            bridge_mode=bmode, partial_cov_mode=pcmode, use_reanchor=use_re, vlm=vlm, kind="delta", payload=tsvm_delta,
-            train_recs=[], streaming_bank=bank, store=store, orig_prompts=ds["orig_prompts"],
-            protos_full=protos_full, seen_classes=seen, eval_batch_size=eff_eval_bs, use_amp=use_amp, shrinkage=config.get("shrinkage"),
-            cal_recs=st4["calibration_latest_views"], cal0_fx=cal0_fx, cal_fx=cal_tsvm_fx,
-        )
-        tx_ab, ix_ab = (apply_reanchor(tsvm_t, rt_ab), apply_reanchor(tsvm_i, ri_ab)) if use_re else (tsvm_t, tsvm_i)
-        ablation_out[ab_name] = eval_view_suite(ab_h.predict_views(tx_ab, ix_ab), dev_y, seen, ds["early_classes"], ds["late_classes"])
-
-    bootstrap: dict[str, Any] = {}
-    anchor = boot_map["tsvm"]["zero_mnar"]
-    for label, ref in [
-        ("tsvm:zero_mnar_vs_tsvm:raw", boot_map["tsvm"]["raw"]),
-        ("tsvm:zero_mnar_vs_tsvm:gr_clip", boot_map["tsvm"].get("gr_clip")),
-        ("tsvm:zero_mnar_vs_tsvm:cal_bias", boot_map["tsvm"].get("cal_bias")),
-        ("tsvm:zero_mnar_vs_knots:cal_bias", boot_map["knots"].get("cal_bias")),
-        ("tsvm:zero_mnar_vs_iso_c:cal_bias", boot_map["iso_c"].get("cal_bias")),
-        ("tsvm:zero_mnar_vs_iso_cts:cal_bias", boot_map["iso_cts"].get("cal_bias")),
-        ("tsvm:zero_mnar_vs_wudi:cal_bias", boot_map["wudi"].get("cal_bias")),
-        ("tsvm:zero_mnar_vs_dop:cal_bias", boot_map["dop"].get("cal_bias")),
-        ("tsvm:zero_mnar_vs_dc_lora:cal_bias", boot_map["dc_lora"].get("cal_bias")),
-        ("tsvm:zero_mnar_vs_seq_lmnar:raw", boot_map["seq_lmnar"].get("raw")),
-        ("tsvm:zero_mnar_vs_mg_clip:raw", boot_map.get("mg_clip", {}).get("raw")),
-        ("tsvm:zero_mnar_vs_pal_rls:raw", boot_map["pal_rls"].get("raw")),
-    ]:
-        if ref is not None:
-            bootstrap[label] = paired_bootstrap_diff(anchor, ref, dev_y, seen, seed=seed)
-
-    payload_out = {
-        "schema": "mnarm-iccv-protocol-v2", "config": config, "arms": arms_out,
-        "ablation_tsvm": ablation_out, "bootstrap": bootstrap, "theta0_preservation": t0_pres, "profiling": profiler.records,
-    }
+    payload_out = evaluate_protocol_split(config={**config, "allow_test": False}, eval_rows=dev_rows, split_name="dev", feat_cache=dev_cache, **common_eval)
     write_json_atomic(out_dir / "ICCV_PROTOCOL_RESULTS.json", payload_out)
     render_protocol_report(payload_out, out_dir / "ICCV_PROTOCOL_REPORT.md")
+
+    if allow_test and ds.get("test"):
+        test_rows = [r for r in ds["test"] if int(r["label"]) in set(seen)]
+        test_cache: dict[tuple[str, ...], torch.Tensor] = {}
+        test_out = evaluate_protocol_split(config=lock_cfg, eval_rows=test_rows, split_name="test", feat_cache=test_cache, **common_eval)
+        write_json_atomic(out_dir / "ICCV_PROTOCOL_TEST_RESULTS.json", test_out)
+        render_protocol_report(test_out, out_dir / "ICCV_PROTOCOL_TEST_REPORT.md")
     return payload_out
+
+
+def _is_v21_valid(p_json: Path) -> dict[str, Any] | None:
+    if not p_json.is_file():
+        return None
+    cached_p = json.loads(p_json.read_text(encoding="utf8"))
+    tsvm_rg = cached_p.get("arms", {}).get("tsvm", {}).get("regimes", {})
+    ok = (
+        cached_p.get("schema") == "mnarm-iccv-protocol-v2"
+        and "balanced_ece" in tsvm_rg.get("raw", {}).get("paired", {})
+        and "cone_scale_p" in tsvm_rg.get("zero_mnar", {}).get("diagnostics", {}).get("towers", {}).get("text", {})
+    )
+    return cached_p if ok else None
 
 
 def run_iccv_same_bank(
     config: dict[str, Any], seq_inputs: Path, images_dir: Path, out_dir: Path,
     protocols: list[str] | tuple[str, ...] | None = None, resume: bool = False,
     model_override: str | None = None, vlm: MultimodalVLM | None = None, store: PreprocessedTensorStore | None = None,
-    write_suite: bool = True,
+    write_suite: bool = True, confirm_freeze: bool = False,
 ) -> dict[str, Any]:
     """Run unified Same-Bank ICCV evaluation across requested protocols sharing 1 VLM and cache."""
-    if bool(config.get("allow_test", False)):
+    allow_test = bool(confirm_freeze or config.get("confirm_freeze", False))
+    if bool(config.get("allow_test", False)) and not allow_test:
         raise ValueError("ICCV Same-Bank benchmark forbids allow_test=True prior to final freeze.")
     protos = [str(p).upper() for p in (protocols or ("P4", "P3", "P2", "P1"))]
-    device = str(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
-    backbone = str(config["backbone"])
+    device, backbone = str(config.get("device", "cuda" if torch.cuda.is_available() else "cpu")), str(config["backbone"])
     out_dir.mkdir(parents=True, exist_ok=True)
-    base_ds = load_benchmark_contracts(str(config.get("dataset", "crisismmd")), seq_inputs, images_dir, "P4", allow_test=False, seed=int(config.get("seed", 11)))
+    base_ds = load_benchmark_contracts(str(config.get("dataset", "crisismmd")), seq_inputs, images_dir, "P4", allow_test=allow_test, seed=int(config.get("seed", 11)))
     vlm = vlm or MultimodalVLM(backbone, model_override or config["model_id"], device=device, rank=int(config["lora_rank"]), alpha=int(config["lora_alpha"]), revision=None if model_override else config.get("revision"), local_files_only=bool(model_override))
     protos_full, unseen_protos = vlm.encode_prompts(base_ds["orig_prompts"]), vlm.encode_prompts(base_ds["unseen_prompts"])
     store = store or PreprocessedTensorStore(base_ds["lookup"], vlm, max_cached_images=int(config.get("max_cached_images", 25000)), workers=int(config.get("workers", 0)))
@@ -296,28 +219,31 @@ def run_iccv_same_bank(
     base0_cache: dict[str, dict[str, torch.Tensor]] = {"text": {}, "image": {}}
 
     per_proto: dict[str, dict[str, Any]] = {}
+    per_proto_test: dict[str, dict[str, Any]] = {}
     for p in protos:
         p_out = out_dir / f"{backbone}_{p.lower()}"
-        p_json = p_out / "ICCV_PROTOCOL_RESULTS.json"
-        cached_p = json.loads(p_json.read_text(encoding="utf8")) if (resume and p_json.is_file()) else None
-        cached_tsvm = cached_p.get("arms", {}).get("tsvm", {}).get("regimes", {}) if cached_p else {}
-        is_b1_valid = bool(
-            cached_p
-            and cached_p.get("schema") == "mnarm-iccv-protocol-v2"
-            and "balanced_ece" in cached_tsvm.get("raw", {}).get("paired", {})
-            and "cone_scale_p" in cached_tsvm.get("zero_mnar", {}).get("diagnostics", {}).get("towers", {}).get("text", {})
-        )
-        if is_b1_valid:
-            assert cached_p is not None
-            per_proto[p] = cached_p
+        c_dev = _is_v21_valid(p_out / "ICCV_PROTOCOL_RESULTS.json") if resume else None
+        c_tst = _is_v21_valid(p_out / "ICCV_PROTOCOL_TEST_RESULTS.json") if (resume and allow_test) else None
+        if c_dev is not None and ((not allow_test) or (c_tst is not None)):
+            per_proto[p] = c_dev
+            if c_tst is not None:
+                per_proto_test[p] = c_tst
         else:
             pcfg = {**config, "protocol": p, "experiment": f"iccv_same_bank_{config.get('dataset', 'crisismmd')}_{backbone}_{p.lower()}"}
-            per_proto[p] = run_single_protocol_same_bank(pcfg, seq_inputs, images_dir, p_out, vlm, protos_full, unseen_protos, store, dev_cache, base0_cache=base0_cache)
+            per_proto[p] = run_single_protocol_same_bank(pcfg, seq_inputs, images_dir, p_out, vlm, protos_full, unseen_protos, store, dev_cache, base0_cache=base0_cache, confirm_freeze=allow_test)
+            if allow_test:
+                loaded_t = _is_v21_valid(p_out / "ICCV_PROTOCOL_TEST_RESULTS.json")
+                if loaded_t is not None:
+                    per_proto_test[p] = loaded_t
         if write_suite:
-            write_same_bank_suite_outputs(config, per_proto, out_dir)
+            write_same_bank_suite_outputs(config, per_proto, out_dir, split_name="dev")
+            if allow_test and per_proto_test:
+                write_same_bank_suite_outputs({**config, "allow_test": True}, per_proto_test, out_dir, split_name="test")
     if write_suite:
-        return write_same_bank_suite_outputs(config, per_proto, out_dir)
-    return {"schema": "mnarm-iccv-same-bank-v2", "backbone": backbone, "allow_test": False, "protocols": list(per_proto.keys())}
+        if allow_test and per_proto_test:
+            write_same_bank_suite_outputs({**config, "allow_test": True}, per_proto_test, out_dir, split_name="test")
+        return write_same_bank_suite_outputs(config, per_proto, out_dir, split_name="dev")
+    return {"schema": "mnarm-iccv-same-bank-v2", "backbone": backbone, "allow_test": allow_test, "protocols": list(per_proto.keys())}
 
 
 def main() -> None:
@@ -329,9 +255,10 @@ def main() -> None:
     ap.add_argument("--protocols", nargs="+", default=["P4", "P3", "P2", "P1"])
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--skip-suite-summary", action="store_true")
+    ap.add_argument("--confirm-freeze", action="store_true")
     ap.add_argument("--model-path", type=str, default=None)
     args = ap.parse_args()
-    summary = run_iccv_same_bank(load_yaml(args.config), args.seq_inputs, args.images, args.out, protocols=args.protocols, resume=args.resume, model_override=args.model_path, write_suite=not args.skip_suite_summary)
+    summary = run_iccv_same_bank(load_yaml(args.config), args.seq_inputs, args.images, args.out, protocols=args.protocols, resume=args.resume, model_override=args.model_path, write_suite=not args.skip_suite_summary, confirm_freeze=args.confirm_freeze)
     p_done = list(summary["protocols"].keys()) if isinstance(summary["protocols"], dict) else list(summary["protocols"])
     print(f"[ICCV SAME-BANK DONE] {summary['backbone']} -> {p_done}")
 

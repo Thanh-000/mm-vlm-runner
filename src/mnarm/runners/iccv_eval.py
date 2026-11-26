@@ -7,8 +7,9 @@ from typing import Any
 import torch
 
 from mnarm.data import PreprocessedTensorStore
-from mnarm.eval import Profiler, eval_retrieval_r1, eval_view_suite, measure_cone_drift
+from mnarm.eval import Profiler, eval_retrieval_r1, eval_view_suite, measure_cone_drift, paired_bootstrap_diff
 from mnarm.methods import (
+    ALL_MERGE_METHODS,
     PALRLSClassifier,
     SelfNormalizedBayesTransportHead,
     StreamingClassBank,
@@ -19,6 +20,7 @@ from mnarm.methods import (
     fit_gr_clip_gap,
     fit_unlabeled_center,
     gr_clip_logits,
+    merge_task_deltas,
     mg_clip_eval_logits,
 )
 from mnarm.models import MultimodalVLM, proto_logits
@@ -27,6 +29,16 @@ from mnarm.runners.stage_ops import (
     collect_train_features_by_modality,
     encode_prompts_under_payload,
     extract_paired_features_cached,
+)
+
+ABLATION_SPECS = (
+    ("none_vmf", "none_zero_shot", "isotropic_vmf", False),
+    ("prompt_vmf", "prompt_bridge", "isotropic_vmf", False),
+    ("cm_raw_oas", "cross_modal_transport", "raw_oas", False),
+    ("cm_sfloor", "cross_modal_transport", "spectral_floor", False),
+    ("cm_vmf", "cross_modal_transport", "isotropic_vmf", False),
+    ("hybrid_vmf", "hybrid_bridge", "isotropic_vmf", False),
+    ("css_ct", "conjugate_bayes", "marginal_epistemic", True),
 )
 
 
@@ -234,3 +246,87 @@ def eval_pal_rls_arm(
     ood_f1 = float(eval_view_suite({"text": zt_u, "image": zi_u, "paired": 0.5 * (zt_u + zi_u)}, dev_y, seen, early, late)["paired"]["macro_f1"])
     enc = {"unseen_prompt_paired_f1": ood_f1, "unseen_prompt_reanchored_f1": ood_f1, "retrieval": r1, "retrieval_reanchored": r1}
     return {"cone_drift": {"text": {"theta_deg": 0.0}, "image": {"theta_deg": 0.0}}, "regimes": regimes, "encoder_preservation": enc}, boot_p
+
+
+def evaluate_protocol_split(
+    *,
+    config: dict[str, Any], ds: dict[str, Any], eval_rows: list[dict[str, Any]], split_name: str,
+    seen: list[int], exp_deltas: list[dict[str, torch.Tensor]], bank: StreamingClassBank,
+    seq_ft_state: dict[str, torch.Tensor] | None, seq_bank: StreamingClassBank,
+    seq_lmnar_state: dict[str, torch.Tensor] | None, seq_lmnar_bank: StreamingClassBank,
+    seq_rep_state: dict[str, torch.Tensor] | None, seq_rep_bank: StreamingClassBank,
+    mg_state: dict[str, torch.Tensor] | None, mg_bank: StreamingClassBank, mg_heads: dict[str, Any],
+    joint_state: dict[str, torch.Tensor], joint_recs: list[dict[str, Any]], pal: PALRLSClassifier,
+    cal0_fx: dict[str, torch.Tensor], vlm: MultimodalVLM, protos_full: torch.Tensor, unseen_protos_full: torch.Tensor,
+    store: PreprocessedTensorStore, feat_cache: dict[tuple[str, ...], torch.Tensor], eff_eval_bs: int, use_amp: bool,
+) -> dict[str, Any]:
+    """Evaluate all 14 mergers + continual/SOTA tracks + ablations + bootstrap on one split (dev or test)."""
+    profiler, seed = Profiler(), int(config["seed"])
+    st_last = ds["stages"][-1]
+    cal_recs = st_last["calibration_latest_views"]
+    lora_rank_eff = int(getattr(vlm, "rank", config.get("lora_rank", 8)))
+    eval0_t, eval0_i, eval_y = extract_paired_features_cached(
+        vlm=vlm, kind="lora", payload={}, records=eval_rows, tensor_store=store,
+        batch_size=eff_eval_bs, cache=feat_cache, use_amp=use_amp,
+    )
+    arms_out: dict[str, Any] = {}
+    boot_map: dict[str, dict[str, torch.Tensor]] = {}
+    tsvm_delta: dict[str, torch.Tensor] | None = None
+
+    def _eval_one(aname: str, akind: str, apayload: dict[str, torch.Tensor], tr_recs: list[dict[str, Any]], bnk: StreamingClassBank | None, mgh: dict[str, Any] | None) -> None:
+        arec, blogits = evaluate_arm_all_regimes(
+            arm_name=aname, kind=akind, payload=apayload, vlm=vlm, orig_prompts=ds["orig_prompts"], protos_full=protos_full,
+            unseen_protos_full=unseen_protos_full, seen_classes=seen, early_classes=ds["early_classes"], late_classes=ds["late_classes"],
+            dev_rows=eval_rows, cal_recs=cal_recs, dev_cache=feat_cache, dev0_t=eval0_t, dev0_i=eval0_i, train_recs=tr_recs, streaming_bank=bnk,
+            cal0_fx=cal0_fx, store=store, eval_batch_size=eff_eval_bs, use_amp=use_amp, shrinkage=config.get("shrinkage"), profiler=profiler, mg_heads=mgh,
+        )
+        arms_out[aname], boot_map[aname] = arec, blogits
+
+    for m in ALL_MERGE_METHODS:
+        with profiler.track(f"merge:{m}"):
+            delta_m = merge_task_deltas(exp_deltas, m, rank_per_task=lora_rank_eff)
+        _eval_one(m, "delta", delta_m, [], bank, None)
+        if m == "tsvm":
+            tsvm_delta = delta_m
+        else:
+            del delta_m
+
+    traj_specs: list[tuple[str, str, dict[str, torch.Tensor], list[dict[str, Any]], StreamingClassBank | None, dict[str, Any] | None]] = [
+        ("seq_ft", "lora", seq_ft_state or {}, [], seq_bank, None),
+        ("seq_lmnar", "lora", seq_lmnar_state or {}, [], seq_lmnar_bank, None),
+        ("seq_replay256", "lora", seq_rep_state or {}, [], seq_rep_bank, None),
+        *([("mg_clip", "lora", mg_state, [], mg_bank, mg_heads)] if bool(config.get("include_mg_clip", True)) and mg_state is not None else []),
+        ("joint_oracle", "lora", joint_state, joint_recs, None, None),
+    ]
+    for spec in traj_specs:
+        _eval_one(*spec)
+
+    pal_rec, pal_boot = eval_pal_rls_arm(pal, eval0_t, eval0_i, eval_y, seen, ds["early_classes"], ds["late_classes"], unseen_protos_full, vlm.logit_scale, cal_recs, vlm, store, eff_eval_bs, use_amp)
+    arms_out["pal_rls"], boot_map["pal_rls"] = pal_rec, pal_boot
+    tsvm_delta = tsvm_delta if tsvm_delta is not None else merge_task_deltas(exp_deltas, "tsvm", rank_per_task=lora_rank_eff)
+    tsvm_t, tsvm_i, _ = extract_paired_features_cached(vlm=vlm, kind="delta", payload=tsvm_delta, records=eval_rows, tensor_store=store, batch_size=eff_eval_bs, cache=feat_cache, use_amp=use_amp)
+    _, _, cal_tsvm_fx = collect_masked_cal_bundle(vlm=vlm, kind="delta", payload=tsvm_delta, cal_recs=cal_recs, store=store, protos_full=protos_full, seen_classes=seen, batch_size=eff_eval_bs, use_amp=use_amp)
+    ablation_out: dict[str, Any] = {}
+    for ab_name, bmode, pcmode, use_re in ABLATION_SPECS:
+        ab_h, rt_ab, ri_ab = fit_css_ct_with_reanchor(
+            bridge_mode=bmode, partial_cov_mode=pcmode, use_reanchor=use_re, vlm=vlm, kind="delta", payload=tsvm_delta, train_recs=[],
+            streaming_bank=bank, store=store, orig_prompts=ds["orig_prompts"], protos_full=protos_full, seen_classes=seen,
+            eval_batch_size=eff_eval_bs, use_amp=use_amp, shrinkage=config.get("shrinkage"), cal_recs=cal_recs, cal0_fx=cal0_fx, cal_fx=cal_tsvm_fx,
+        )
+        tx_ab, ix_ab = (apply_reanchor(tsvm_t, rt_ab), apply_reanchor(tsvm_i, ri_ab)) if use_re else (tsvm_t, tsvm_i)
+        ablation_out[ab_name] = eval_view_suite(ab_h.predict_views(tx_ab, ix_ab), eval_y, seen, ds["early_classes"], ds["late_classes"])
+
+    anchor = boot_map["tsvm"]["zero_mnar"]
+    boot_refs = [
+        ("tsvm:zero_mnar_vs_tsvm:raw", boot_map["tsvm"]["raw"]), ("tsvm:zero_mnar_vs_tsvm:gr_clip", boot_map["tsvm"].get("gr_clip")),
+        ("tsvm:zero_mnar_vs_tsvm:cal_bias", boot_map["tsvm"].get("cal_bias")), ("tsvm:zero_mnar_vs_knots:cal_bias", boot_map["knots"].get("cal_bias")),
+        ("tsvm:zero_mnar_vs_iso_c:cal_bias", boot_map["iso_c"].get("cal_bias")), ("tsvm:zero_mnar_vs_iso_cts:cal_bias", boot_map["iso_cts"].get("cal_bias")),
+        ("tsvm:zero_mnar_vs_wudi:cal_bias", boot_map["wudi"].get("cal_bias")), ("tsvm:zero_mnar_vs_dop:cal_bias", boot_map["dop"].get("cal_bias")),
+        ("tsvm:zero_mnar_vs_dc_lora:cal_bias", boot_map["dc_lora"].get("cal_bias")), ("tsvm:zero_mnar_vs_seq_lmnar:raw", boot_map["seq_lmnar"].get("raw")),
+        ("tsvm:zero_mnar_vs_mg_clip:raw", boot_map.get("mg_clip", {}).get("raw")), ("tsvm:zero_mnar_vs_pal_rls:raw", boot_map["pal_rls"].get("raw")),
+    ]
+    bootstrap = {lbl: paired_bootstrap_diff(anchor, ref, eval_y, seen, seed=seed) for lbl, ref in boot_refs if ref is not None}
+    return {
+        "schema": "mnarm-iccv-protocol-v2", "split": split_name, "config": config, "arms": arms_out,
+        "ablation_tsvm": ablation_out, "bootstrap": bootstrap, "theta0_preservation": dict(pal_rec["encoder_preservation"]), "profiling": profiler.records,
+    }

@@ -113,7 +113,7 @@ def test_logit_controls_and_retrieval_r1() -> None:
 def test_run_iccv_same_bank_end_to_end_mock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from mnarm.runners import iccv_same_bank as sb_mod
 
-    seq_dir, img_dir, out_dir = tmp_path / "seq", tmp_path / "imgs", tmp_path / "iccv_out"
+    seq_dir, img_dir, out_dir = tmp_path / "seq", tmp_path / "imgs", tmp_path / "iccv_out" / "clip_same_bank"
     seq_dir.mkdir(); img_dir.mkdir()
 
     def _mk_row(idx: int, label: int, prefix: str, write_img: bool = True) -> dict[str, object]:
@@ -273,3 +273,29 @@ def test_run_iccv_same_bank_end_to_end_mock(tmp_path: Path, monkeypatch: pytest.
         assert (fig_dir / f"{stem}.png").stat().st_size > 1000
         assert (fig_dir / f"{stem}.pdf").stat().st_size > 1000
     assert len(res.get("figures", [])) == 8
+
+    # Guardrail: allow_test=True without explicit confirm_freeze=True must raise
+    with pytest.raises(ValueError, match="forbids allow_test=True"):
+        sb_mod.run_iccv_same_bank({**cfg, "allow_test": True}, seq_dir, img_dir, out_dir, protocols=["P4"])
+
+    # Unlock confirmatory test with actual test images + TSV and verify dual dev+test + master summary
+    for tr_r in test_rows:
+        tp = img_dir / tr_r["image"]; tp.parent.mkdir(parents=True, exist_ok=True)
+        c = int(tr_r["label"])
+        Image.new("RGB", (8, 8), color=((c * 31 + 17) % 250, (c * 67 + 43) % 250, (c * 97 + 71) % 250)).save(tp)
+    with zipfile.ZipFile(seq_dir / "splits.zip", "w") as zf:
+        for sp, rlist in (("train", train_rows), ("dev", dev_rows), ("test", test_rows)):
+            zf.writestr(f"task_humanitarian_text_img_{sp}.tsv", "\n".join(["tweet_id\timage_id\ttweet_text"] + [f"{r['tweet_id']}\t{r['image_id']}\t{r['tweet_text']}" for r in rlist]))
+    res_cf = sb_mod.run_iccv_same_bank(cfg, seq_dir, img_dir, out_dir, protocols=["P4", "P3"], resume=True, confirm_freeze=True)
+    assert res_cf["allow_test"] is False  # returns dev suite summary while also writing test outputs
+    for p in ("P4", "P3"):
+        t_res = json.loads((out_dir / f"clip_b16_{p.lower()}" / "ICCV_PROTOCOL_TEST_RESULTS.json").read_text(encoding="utf8"))
+        assert t_res["split"] == "test" and t_res["config"]["allow_test"] is True
+        assert "$" not in (out_dir / f"clip_b16_{p.lower()}" / "ICCV_PROTOCOL_TEST_REPORT.md").read_text(encoding="utf8")
+    assert (out_dir / "ICCV_SAME_BANK_clip_b16_TEST_TABLE.tex").is_file()
+    assert "$" not in (out_dir / "ICCV_SAME_BANK_clip_b16_TEST_SUMMARY.md").read_text(encoding="utf8")
+    assert (out_dir / "figures_test" / "fig1_same_bank_regimes_clip_b16.pdf").is_file()
+    from mnarm.runners.iccv_report import write_ecosystem_master_summary
+    m_md = write_ecosystem_master_summary(out_dir.parent)
+    assert m_md.is_file() and "$" not in m_md.read_text(encoding="utf8")
+    assert (out_dir.parent / "ICCV_ECOSYSTEM_MASTER_TABLE.tex").is_file()

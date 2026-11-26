@@ -1,6 +1,6 @@
-# Method Freeze & Unified Same-Bank ICCV Evaluation Protocol (`CSS-CT`)
+# Method Freeze & Unified Same-Bank ICCV Evaluation Protocol (`CSS-CT` v2.1)
 
-> **Status:** FROZEN (`METHOD_FREEZE`, `CSS-CT` v2 Canonical Specification — see `docs/FRAMEWORK_SPECIFICATION.md`). No hyperparameter sweeps, post-hoc dataset patches, or `test` split reads are permitted prior to final confirmatory reporting.
+> **Status:** OFFICIAL POST-DEV FREEZE (`CSS-CT` v2.1 Canonical Specification — see `docs/FRAMEWORK_SPECIFICATION.md`). Hyperparameters, `Sim(d)` cone-aperture Procrustes, spectral-floored marginal epistemic precision, and all-class `Sigma_OAS` stat-OOF temperature scaling are permanently frozen after `dev` validation across all 4 multi-altitude disaster benchmarks. Confirmatory `test` evaluation runs **once** via `--confirm-freeze` on the identical trained `train + cal` expert bank, writing separate `dev` (`ICCV_PROTOCOL_RESULTS.json`) and confirmatory `test` (`ICCV_PROTOCOL_TEST_RESULTS.json`) artifacts plus `ICCV_ECOSYSTEM_MASTER_SUMMARY.md`.
 
 ## 1. Four-Layer Scientific Separation & Information Regimes
 
