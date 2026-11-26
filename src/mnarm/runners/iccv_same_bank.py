@@ -300,10 +300,12 @@ def run_iccv_same_bank(
         p_out = out_dir / f"{backbone}_{p.lower()}"
         p_json = p_out / "ICCV_PROTOCOL_RESULTS.json"
         cached_p = json.loads(p_json.read_text(encoding="utf8")) if (resume and p_json.is_file()) else None
+        cached_tsvm = cached_p.get("arms", {}).get("tsvm", {}).get("regimes", {}) if cached_p else {}
         is_b1_valid = bool(
             cached_p
             and cached_p.get("schema") == "mnarm-iccv-protocol-v2"
-            and "balanced_ece" in cached_p.get("arms", {}).get("tsvm", {}).get("regimes", {}).get("raw", {}).get("paired", {})
+            and "balanced_ece" in cached_tsvm.get("raw", {}).get("paired", {})
+            and "cone_scale_p" in cached_tsvm.get("zero_mnar", {}).get("diagnostics", {}).get("towers", {}).get("text", {})
         )
         if is_b1_valid:
             assert cached_p is not None

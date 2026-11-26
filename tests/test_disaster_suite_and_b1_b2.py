@@ -385,3 +385,62 @@ def test_truncated_jpeg_and_mixed_mask_base0_pal_alignment(tmp_path: Path) -> No
     for m_views, (m_t, m_i, m_y) in tf_b0["by_mask"].items():
         pal.update(m_t, m_i, m_y, m_views)
     assert pal._dirty and pal.mod_count["text"] == len(st1_fit)
+
+
+def test_v21_small_sample_high_dim_epistemic_spectrum_and_cone_aperture() -> None:
+    """Verify v2.1 spectral floor + all-|Y| stat-OOF tau + Sim(d) cone scaling when n_obs << d."""
+    g = torch.Generator().manual_seed(11)
+    d, classes, obs_cls = 512, list(range(6)), [2, 3, 4, 5]
+    basis, _ = torch.linalg.qr(torch.randn(d, d, dtype=torch.float64, generator=g))
+    eig_prof = torch.cat([torch.linspace(0.015, 0.002, 28, dtype=torch.float64), torch.full((d - 28,), 0.00002, dtype=torch.float64)])
+    sqrt_cov = basis * eig_prof.sqrt().unsqueeze(0)
+
+    cone_t = basis[:, 0] * 0.88
+    cone_i = basis[:, 28] * 0.84
+    cone_p = F.normalize(0.75 * basis[:, 0] + 0.66 * basis[:, 29], dim=-1) * 0.72
+    sem_c = torch.stack([F.normalize(torch.randn(20, dtype=torch.float64, generator=g), dim=-1) for _ in classes], dim=0)
+    sem = torch.stack([basis[:, 1:21] @ sem_c[c] for c in classes], dim=0)
+    true_t = torch.stack([F.normalize(cone_t + 0.22 * sem[c], dim=-1) for c in classes], dim=0)
+    true_i = torch.stack([F.normalize(cone_i + 0.25 * (basis[:, 29:49] @ sem_c[c]), dim=-1) for c in classes], dim=0)
+    protos = torch.stack([F.normalize(cone_p + 0.55 * (0.85 * sem[c] + 0.3 * (basis[:, 49:69] @ F.normalize(torch.randn(20, dtype=torch.float64, generator=g), dim=-1))), dim=-1) for c in classes], dim=0).float()
+
+    bank = StreamingClassBank()
+    for grp, paired in (([0, 1], False), ([2, 3], True), ([4, 5], True)):
+        xi_l, yi_l, xt_l, yt_l = [], [], [], []
+        for c in grp:
+            n_c = 25  # n_obs = 100 << d = 512
+            zi = 0.045 * torch.randn(n_c, d, dtype=torch.float64, generator=g)
+            xi_l.append(l2_normalize((true_i[c].unsqueeze(0) + zi).float()))
+            yi_l.append(torch.full((n_c,), c, dtype=torch.long))
+            zt = torch.randn(n_c, d, dtype=torch.float64, generator=g) @ sqrt_cov.T
+            xt_l.append(l2_normalize((true_t[c].unsqueeze(0) + zt).float()))
+            yt_l.append(torch.full((n_c,), c, dtype=torch.long))
+        xi, yi = torch.cat(xi_l, 0), torch.cat(yi_l, 0)
+        xt, yt = torch.cat(xt_l, 0), torch.cat(yt_l, 0)
+        bank.update_stage(
+            u_expert_t=xt if paired else None, u_base_t=xt if paired else None, y_t=yt if paired else None,
+            u_expert_i=xi, u_base_i=xi, y_i=yi,
+            paired_base_t=xt if paired else None, paired_base_i=xi if paired else None,
+        )
+    # Inject small orthogonal tail offset onto image centroids so cross-modal map leaks slightly outside text manifold
+    for c in [0, 1]:
+        bank.class_centroids["image"][c] = F.normalize(bank.class_centroids["image"][c] + 0.14 * (basis[:, 60:120] @ F.normalize(torch.randn(60, dtype=torch.float64), dim=-1)), dim=-1)
+
+    cstats = bank.canonical_stats(classes)
+    head_v21 = SelfNormalizedBayesTransportHead(bridge_mode="conjugate_bayes", partial_cov_mode="marginal_epistemic").fit_from_sufficient_stats(
+        cstats["towers"], None, None, protos, classes, paired_moments=cstats["paired_moments"]
+    )
+    head_raw = SelfNormalizedBayesTransportHead(bridge_mode="cross_modal_transport", partial_cov_mode="raw_oas").fit_from_sufficient_stats(
+        cstats["towers"], None, None, protos, classes, paired_moments=cstats["paired_moments"]
+    )
+    dev_t = torch.cat([l2_normalize((true_t[c].unsqueeze(0) + torch.randn(30, d, dtype=torch.float64, generator=g) @ sqrt_cov.T).float()) for c in classes], 0)
+    dev_i = torch.cat([l2_normalize((true_i[c].unsqueeze(0) + 0.045 * torch.randn(30, d, dtype=torch.float64, generator=g)).float()) for c in classes], 0)
+    dev_y = torch.arange(6).repeat_interleave(30)
+
+    ev_v21 = eval_view_suite(head_v21.predict_views(dev_t, dev_i), dev_y, classes, [0, 1], obs_cls)
+    ev_raw = eval_view_suite(head_raw.predict_views(dev_t, dev_i), dev_y, classes, [0, 1], obs_cls)
+    t_diag = head_v21.diagnostics["towers"]["text"]
+    assert ev_raw["text"]["early_recall"] < 0.25
+    assert ev_v21["paired"]["early_recall"] > 0.65
+    assert ev_v21["paired"]["nll"] < 0.90
+    assert t_diag["cone_scale_p"] < 0.85 and t_diag["r_p_eff"] > 0.30 and t_diag["w_p"] > 0.30

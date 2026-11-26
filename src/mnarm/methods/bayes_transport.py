@@ -131,6 +131,7 @@ class SelfNormalizedBayesTransportHead:
             )
             t_key = f"{other_tw}_to_{tw}"
             conj = _estimate_conjugate_weights(obs, st["centroids"], p_all, other_st["centroids"], cross_maps.get(t_key), self.anchor_weight)
+            gam_p, gam_cm = float(conj.get("cone_scale_p", 1.0)), float(conj.get("cone_scale_cm", 1.0))
             r_best = max(float(conj.get("r_p_eff", 0.0)), float(conj.get("r_cm_eff", 0.0)))
             miss_frac = 1.0 - float(len(obs)) / float(max(len(self.seen_classes), 1))
             alpha_ep = min(1.0, max(miss_frac, 1.0 - r_best * r_best)) if is_partial else 0.0
@@ -139,7 +140,7 @@ class SelfNormalizedBayesTransportHead:
             mu_by_class, transported_cls, obs_local_idx = [], [], []
             counts_m = st.get("counts", {})
             for idx, cls in enumerate(self.seen_classes):
-                cand_p = _scale_to_norm(m_bar + rot_p @ (p_all[cls] - p_bar), mean_norm)
+                cand_p = _scale_to_norm(m_bar + gam_p * (rot_p @ (p_all[cls] - p_bar)), mean_norm)
                 if cls in obs_set:
                     obs_local_idx.append(idx)
                     mu_obs = st["centroids"][cls]
@@ -157,7 +158,7 @@ class SelfNormalizedBayesTransportHead:
                     cand_cm = None
                     if t_key in cross_maps and cls in other_st["centroids"]:
                         rot_cm, src_m, dst_m = cross_maps[t_key]
-                        cand_cm = _scale_to_norm(dst_m + rot_cm @ (other_st["centroids"][cls] - src_m), mean_norm)
+                        cand_cm = _scale_to_norm(dst_m + gam_cm * (rot_cm @ (other_st["centroids"][cls] - src_m)), mean_norm)
                     if self.bridge_mode == "prompt_bridge" or cand_cm is None:
                         mu_est = cand_p
                     elif self.bridge_mode == "cross_modal_transport":
@@ -181,9 +182,12 @@ class SelfNormalizedBayesTransportHead:
                 obs_idx_set = set(obs_local_idx)
                 extra_c = [mu_by_class[i] for i in range(len(self.seen_classes)) if i not in obs_idx_set]
                 d_dim = int(p_all.shape[-1])
-                trans_std = math.sqrt(max(1.0 - r_best * r_best, 1e-4) * max(1.0 - min(mean_norm, 0.999) ** 2, 1e-4) / float(d_dim))
+                obs_mat = torch.stack([st["centroids"][c] for c in obs], dim=0)
+                obs_rad2 = float((obs_mat - obs_mat.mean(dim=0, keepdim=True)).square().sum(dim=-1).mean().item()) if len(obs) >= 2 else max(1.0 - min(mean_norm, 0.999) ** 2, 1e-4)
+                trans_std = math.sqrt(max(1.0 - r_best * r_best, 1e-4) * max(obs_rad2, 1e-4) / float(d_dim))
+                stat_cov = st.get("cov") if st.get("cov") is not None else st.get("raw_sample_cov")
                 tau_m = _fit_stat_oof_tau(
-                    st["centroids"], st.get("counts", {}), st.get("raw_sample_cov"), prec, is_partial,
+                    st["centroids"], st.get("counts", {}), stat_cov, prec, is_partial,
                     self.partial_cov_mode, calib_folds=self.calib_folds, extra_centroids=extra_c, trans_std=trans_std,
                 )
 

@@ -98,7 +98,7 @@ def write_same_bank_suite_outputs(config: dict[str, Any], per_proto: dict[str, d
     }
 
     for arm in list(ALL_MERGE_METHODS) + list(SEQ_ORACLE_ARMS):
-        cells, raw_vals, cal_vals, our_vals, tex_cells = [], [], [], [], []
+        cells, raw_vals, gr_vals, cal_vals, our_vals, tex_cells = [], [], [], [], [], []
         for p in protos:
             arec = per_proto[p]["arms"].get(arm)
             if not arec:
@@ -108,6 +108,8 @@ def write_same_bank_suite_outputs(config: dict[str, Any], per_proto: dict[str, d
             r2 = arec["regimes"]["cal_bias"]["paired"]["macro_f1"] * 100.0 if "cal_bias" in arec["regimes"] else float("nan")
             r1 = arec["regimes"]["zero_mnar"]["paired"]["macro_f1"] * 100.0 if "zero_mnar" in arec["regimes"] else float("nan")
             raw_vals.append(r0)
+            if rg == rg:
+                gr_vals.append(rg)
             if r2 == r2:
                 cal_vals.append(r2)
             if r1 == r1:
@@ -116,9 +118,10 @@ def write_same_bank_suite_outputs(config: dict[str, Any], per_proto: dict[str, d
             cells.append(f"{r0:.2f} / {rg_s} / {r2_s} / {r1_s}")
             tex_cells.extend([f"{r0:.2f}", r2_s, f"\\textbf{{{r1:.2f}}}" if r1 == r1 else "--"])
         m_raw = f"{sum(raw_vals)/len(raw_vals):.2f}" if raw_vals else "--"
+        m_gr = f"{sum(gr_vals)/len(gr_vals):.2f}" if gr_vals else "--"
         m_cal = f"{sum(cal_vals)/len(cal_vals):.2f}" if cal_vals else "--"
         m_our = f"**{sum(our_vals)/len(our_vals):.2f}**" if our_vals else "--"
-        lines.append(f"| `{arm}` | {' | '.join(cells)} | {m_raw} / {m_cal} / {m_our} |")
+        lines.append(f"| `{arm}` | {' | '.join(cells)} | {m_raw} / {m_gr} / {m_cal} / {m_our} |")
         tex_label = arm.replace("_", "\\_")
         m_our_tex = f"\\textbf{{{sum(our_vals)/len(our_vals):.2f}}}" if our_vals else "--"
         tex_rows.append(f"\\texttt{{{tex_label}}} & {' & '.join(tex_cells)} & {m_raw} & {m_cal} & {m_our_tex} \\\\")
