@@ -59,12 +59,109 @@ def extract_archive_safe(archive_path: Path, dest_dir: Path) -> None:
     raise ValueError(f"Unsupported or corrupt archive format: {archive_path}")
 
 
-def _sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
+def _digest_file(path: Path, alg: str) -> str:
+    h = hashlib.new(alg)
     with path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def is_valid_binary_archive(path: Path, min_bytes: int = 128) -> bool:
+    """Return True if path exists, meets min_bytes, and is not an HTML error/quota page."""
+    if not path.is_file() or path.stat().st_size < min_bytes:
+        return False
+    with path.open("rb") as fh:
+        head = fh.read(256).lower()
+    return (b"<html" not in head) and (b"<!doctype" not in head)
+
+
+def _verify_checksum(path: Path, checksum: str) -> bool:
+    cs = checksum.strip().lower()
+    if not cs:
+        return True
+    alg, _, expected = cs.partition("=")
+    if not expected:
+        return True
+    norm_alg = "sha256" if alg in ("sha-256", "sha256") else alg
+    return _digest_file(path, norm_alg) == expected.strip()
+
+
+def _aria2_single_pass(
+    urls: list[str],
+    dest_path: Path,
+    *,
+    conn: int,
+    max_tries: int,
+    retry_wait: int,
+    headers: dict[str, str] | None = None,
+    checksum: str = "",
+) -> None:
+    cmd = [
+        "aria2c", f"-x{conn}", f"-s{conn}", "-k1M", "--min-split-size=1M",
+        "--file-allocation=none", "--optimize-concurrent-downloads=true",
+        "--connect-timeout=15", "--timeout=45",
+        f"--max-tries={max_tries}", f"--retry-wait={retry_wait}",
+        "--auto-file-renaming=false", "--allow-overwrite=true", "--console-log-level=warn",
+        "-d", str(dest_path.parent), "-o", dest_path.name,
+    ]
+    cs = checksum.strip().lower()
+    if cs.startswith(("md5=", "sha-256=")):
+        cmd.append(f"--checksum={cs}")
+    elif cs.startswith("sha256="):
+        cmd.append(f"--checksum=sha-256={cs.split('=', 1)[1]}")
+    for k, v in (headers or {}).items():
+        cmd.append(f"--header={k}: {v}")
+    cmd.extend(urls)
+    subprocess.run(cmd, check=False)
+
+
+def aria2_download_file(
+    urls: str | list[str],
+    dest_path: Path,
+    *,
+    headers: dict[str, str] | None = None,
+    checksum: str = "",
+    min_bytes: int = 128,
+    max_conn: int = 16,
+) -> Path:
+    """Download file at max aria2c speed with automatic web-throttle backoff and HTML/checksum guard."""
+    url_list = [urls.strip()] if isinstance(urls, str) else [u.strip() for u in urls if u.strip()]
+    if not url_list:
+        raise ValueError(f"Empty download URL list for {dest_path.name}")
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    if is_valid_binary_archive(dest_path, min_bytes) and _verify_checksum(dest_path, checksum):
+        return dest_path
+
+    aria2_ctrl = dest_path.with_name(dest_path.name + ".aria2")
+    hdrs = headers or {}
+    if shutil.which("aria2c"):
+        _aria2_single_pass(url_list, dest_path, conn=max_conn, max_tries=3, retry_wait=2, headers=hdrs, checksum=checksum)
+        if not (is_valid_binary_archive(dest_path, min_bytes) and _verify_checksum(dest_path, checksum)) and max_conn > 4:
+            dest_path.unlink(missing_ok=True)
+            aria2_ctrl.unlink(missing_ok=True)
+            _aria2_single_pass([url_list[0]], dest_path, conn=4, max_tries=4, retry_wait=5, headers=hdrs, checksum=checksum)
+
+    if not (is_valid_binary_archive(dest_path, min_bytes) and _verify_checksum(dest_path, checksum)):
+        dest_path.unlink(missing_ok=True)
+        aria2_ctrl.unlink(missing_ok=True)
+        if shutil.which("curl") and not url_list[0].startswith("file://"):
+            cmd_c = ["curl", "-fL", "--retry", "4", url_list[0], "-o", str(dest_path)]
+            for k, v in hdrs.items():
+                cmd_c.extend(["-H", f"{k}: {v}"])
+            subprocess.run(cmd_c, check=False)
+        if not (is_valid_binary_archive(dest_path, min_bytes) and _verify_checksum(dest_path, checksum)):
+            dest_path.unlink(missing_ok=True)
+            with urllib.request.urlopen(urllib.request.Request(url_list[0], headers={"User-Agent": "Mozilla/5.0", **hdrs}), timeout=120) as r:
+                dest_path.write_bytes(r.read())
+
+    if not is_valid_binary_archive(dest_path, min_bytes):
+        dest_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Downloaded file invalid, HTML error page, or below min_bytes={min_bytes}: {dest_path}")
+    if not _verify_checksum(dest_path, checksum):
+        dest_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Checksum mismatch ({checksum}) for downloaded file: {dest_path}")
+    return dest_path
 
 
 def _lfs_batch_resolve(
@@ -135,18 +232,29 @@ def hf_lfs_batch_download(
     if not direct_items:
         return
     if shutil.which("aria2c"):
-        lines: list[str] = []
-        for url, hmap, oid, dst in direct_items:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            lines.extend([url, f"  dir={dst.parent}", f"  out={dst.name}"])
-            for hk, hv in hmap.items():
-                lines.append(f"  header={hk}: {hv}")
-            if oid:
-                lines.append(f"  checksum=sha-256={oid}")
-        mf = dest_dir / ".aria2_lfs_manifest.txt"
-        mf.write_text("\n".join(lines) + "\n", encoding="utf8")
-        subprocess.run(["aria2c", f"--input-file={mf}", "-j", "32", "-x", "4", "-s", "4", "-k", "1M", "--check-integrity=true", "--retry-wait=3", "--max-tries=6", "--auto-file-renaming=false", "--allow-overwrite=true", "--console-log-level=warn"], check=False)
-        mf.unlink(missing_ok=True)
+        def _run_batch(items: list[tuple[str, dict[str, str], str, Path]], j: int, x: int, wait_s: int, tries: int) -> None:
+            lines: list[str] = []
+            for url, hmap, oid, dst in items:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                lines.extend([url, f"  dir={dst.parent}", f"  out={dst.name}"])
+                for hk, hv in hmap.items():
+                    lines.append(f"  header={hk}: {hv}")
+                if oid:
+                    lines.append(f"  checksum=sha-256={oid}")
+            mf = dest_dir / ".aria2_lfs_manifest.txt"
+            mf.write_text("\n".join(lines) + "\n", encoding="utf8")
+            subprocess.run(
+                ["aria2c", f"--input-file={mf}", f"-j{j}", f"-x{x}", f"-s{x}", "-k1M", "--file-allocation=none",
+                 "--check-integrity=true", f"--retry-wait={wait_s}", f"--max-tries={tries}",
+                 "--auto-file-renaming=false", "--allow-overwrite=true", "--console-log-level=warn"],
+                check=False,
+            )
+            mf.unlink(missing_ok=True)
+
+        _run_batch(direct_items, j=32, x=8, wait_s=3, tries=4)
+        rem_t1 = [it for it in direct_items if not is_valid_binary_archive(it[3], 1)]
+        if rem_t1:
+            _run_batch(rem_t1, j=6, x=2, wait_s=5, tries=5)
 
     rem = [(u, hmap, oid, dst) for u, hmap, oid, dst in direct_items if not dst.is_file()]
     if rem:
@@ -156,7 +264,7 @@ def hf_lfs_batch_download(
             tmp = dst.with_name(dst.name + ".partial")
             with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", **hmap}), timeout=60) as r:
                 tmp.write_bytes(r.read())
-            if oid and _sha256_file(tmp) != oid:
+            if oid and _digest_file(tmp, "sha256") != oid:
                 tmp.unlink(missing_ok=True)
                 raise ValueError(f"SHA-256 mismatch for {dst}")
             tmp.replace(dst)

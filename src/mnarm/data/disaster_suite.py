@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from mnarm.data.archive_ops import extract_archive_safe, hf_lfs_batch_download
+from mnarm.data.archive_ops import aria2_download_file, extract_archive_safe, hf_lfs_batch_download
 from mnarm.data.crisismmd import load_crisismmd_contracts
 from mnarm.data.protocol_builder import build_p1_p4_contracts
 
@@ -105,13 +105,7 @@ def prepare_dmd(dest_dir: Path, archive_path: Path | None = None) -> Path:
         return dest_dir
     arc = archive_path
     if arc is None:
-        arc = dest_dir / "dmd_uci_456.zip"
-        if shutil.which("curl"):
-            subprocess.run(["curl", "-fL", "--retry", "4", DMD_UCI_URL, "-o", str(arc)], check=True)
-        else:
-            import urllib.request
-            with urllib.request.urlopen(urllib.request.Request(DMD_UCI_URL, headers={"User-Agent": "Mozilla/5.0"}), timeout=120) as r:
-                arc.write_bytes(r.read())
+        arc = aria2_download_file(DMD_UCI_URL, dest_dir / "dmd_uci_456.zip", min_bytes=500_000)
     extract_archive_safe(arc, dest_dir)
     for sub_zip in list(dest_dir.rglob("*.zip")):
         if sub_zip.resolve() != arc.resolve():

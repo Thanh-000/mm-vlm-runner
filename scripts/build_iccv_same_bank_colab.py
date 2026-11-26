@@ -139,7 +139,7 @@ def build() -> None:
                 subprocess.run(["git", "clone", "--depth", "1", "--branch", git_branch, clone_url, str(CODE_DIR)], check=True)
 
             def _pip_deps():
-                subprocess.run([sys.executable, "-m", "pip", "install", "-q", "transformers==4.57.6", "datasets==3.2.0", "PyYAML", "scipy", "pillow", "matplotlib>=3.8.0", "huggingface_hub", "pytest", "wheel", "gdown"], check=True)
+                subprocess.run([sys.executable, "-m", "pip", "install", "-q", "transformers==4.57.6", "datasets==3.2.0", "PyYAML", "scipy", "pillow", "matplotlib>=3.8.0", "huggingface_hub", "hf_transfer", "pytest", "wheel", "gdown"], check=True)
                 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-build-isolation", "--no-deps", "-e", str(CODE_DIR)], check=True)
 
             def _apt_deps():
@@ -183,7 +183,16 @@ def build() -> None:
             IMG_DIR.mkdir(parents=True, exist_ok=True)
             site.addsitedir(str(CODE_DIR / "src"))
             importlib.invalidate_caches()
-            from mnarm.data import extract_contracts_from_a2z_zip, prepare_disaster_m3, prepare_dmd, prepare_incidents_vqa
+            os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+            from mnarm.data import (
+                aria2_download_file,
+                extract_contracts_from_a2z_zip,
+                hf_lfs_batch_download,
+                is_valid_binary_archive,
+                prepare_disaster_m3,
+                prepare_dmd,
+                prepare_incidents_vqa,
+            )
 
             hf_tok = os.environ.get("HF_TOKEN", "").strip()
             if not hf_tok:
@@ -234,13 +243,6 @@ def build() -> None:
                     return f"https://{{uc_host}}/download?" + urllib.parse.urlencode(inputs), ck
                 return probe, ck
 
-            def _is_valid_binary(p: Path, min_bytes: int) -> bool:
-                if not p.is_file() or p.stat().st_size <= min_bytes:
-                    return False
-                with p.open("rb") as fh:
-                    head = fh.read(128).lower()
-                return (b"<html" not in head) and (b"<!doctype" not in head)
-
             def _download_archive_aria2(url_in: str, dst: Path, min_bytes: int = 1000) -> Path:
                 u = url_in.strip()
                 if not u:
@@ -249,20 +251,16 @@ def build() -> None:
                 host_in = urllib.parse.urlparse(u).netloc.lower()
                 is_drive = "drive" in host_in and host_in.endswith("google.com")
                 direct_u, cookie_hdr = _resolve_drive_direct_url(u)
-                if shutil.which("aria2c"):
-                    cmd = ["aria2c", "-x16", "-s16", "-k4M", "--file-allocation=none", "--allow-overwrite=true", "--max-tries=4", "--retry-wait=3", direct_u, "-d", str(dst.parent), "-o", dst.name]
-                    if cookie_hdr:
-                        cmd.append(f"--header=Cookie: {{cookie_hdr}}")
-                    subprocess.run(cmd, check=False)
-                if not _is_valid_binary(dst, min_bytes):
+                hdrs = {{"Cookie": cookie_hdr}} if cookie_hdr else None
+                try:
+                    return aria2_download_file(direct_u, dst, headers=hdrs, min_bytes=min_bytes, max_conn=16)
+                except Exception:
                     dst.unlink(missing_ok=True)
                     if is_drive:
                         subprocess.run([sys.executable, "-m", "gdown", "--fuzzy", u, "-O", str(dst)], check=True)
-                    else:
-                        subprocess.run(["curl", "-fL", "--retry", "4", u, "-o", str(dst)], check=True)
-                if not _is_valid_binary(dst, min_bytes):
-                    raise RuntimeError(f"Downloaded file invalid or too small: {{dst}}")
-                return dst
+                    if not is_valid_binary_archive(dst, min_bytes):
+                        raise
+                    return dst
 
             def _unpack_to_dir(arc: Path, dest_dir: Path) -> None:
                 dest_dir.mkdir(parents=True, exist_ok=True)
@@ -318,11 +316,14 @@ def build() -> None:
                     archive_path = next((p for p in arc_cands if p.is_file() and p.stat().st_size > 100_000_000), None)
                     tar_u = str(CRISISMMA_TAR_URL).strip()
                     if archive_path is None and tar_u:
-                        archive_path = _download_archive_aria2(tar_u, Path("/content/crisismmd_archive.dl"), min_bytes=100_000_000)
+                        try:
+                            archive_path = _download_archive_aria2(tar_u, Path("/content/crisismmd_archive.dl"), min_bytes=100_000_000)
+                        except Exception as exc_cm_dl:
+                            print(f"[WARN] CrisisMMD Drive link failed ({{exc_cm_dl}}); trying QCRI/HF aria2c fallback.", flush=True)
                     if archive_path is None and shutil.which("aria2c"):
                         dl_qcri = Path("/content/crisismmd_qcri.tar.gz")
                         subprocess.run(["aria2c", "-x16", "-s16", "-k4M", "--connect-timeout=15", "--timeout=30", "--max-tries=2", "--allow-overwrite=true", "https://crisisnlp.qcri.org/data/crisismmd/CrisisMMD_v2.0.tar.gz", "-d", "/content", "-o", dl_qcri.name], check=False)
-                        if _is_valid_binary(dl_qcri, 100_000_000):
+                        if is_valid_binary_archive(dl_qcri, 100_000_000):
                             archive_path = dl_qcri
                     if archive_path is not None:
                         _unpack_to_dir(archive_path, IMG_DIR)
@@ -346,33 +347,8 @@ def build() -> None:
                     test_only = {{r["image"] for r in manifest["rows"]["test"]}} - req_set
                     sum(1 for rel_t in test_only if (IMG_DIR / rel_t).is_file() and ((IMG_DIR / rel_t).unlink() or True))
                 req_imgs = sorted(p for p in req_set if not (IMG_DIR / p).is_file())
-                if req_imgs and shutil.which("aria2c"):
-                    m_lines = []
-                    for rel_p in req_imgs:
-                        dst = IMG_DIR / rel_p; dst.parent.mkdir(parents=True, exist_ok=True)
-                        m_lines.extend(["https://huggingface.co/datasets/QCRI/CrisisMMD/resolve/{CRISISMMA_HF_REV}/" + urllib.parse.quote(rel_p, safe="/"), f"  dir={{dst.parent}}", f"  out={{dst.name}}"])
-                    mf = Path("/content/hf_aria2_manifest.txt"); mf.write_text("\\n".join(m_lines) + "\\n", encoding="utf8")
-                    cmd = ["aria2c", f"--input-file={{mf}}", "-j", "16", "-x", "4", "-s", "4", "--retry-wait=5", "--max-tries=8", "--auto-file-renaming=false", "--allow-overwrite=true", "--console-log-level=warn"]
-                    if hf_tok:
-                        cmd.append(f"--header=Authorization: Bearer {{hf_tok}}")
-                    subprocess.run(cmd, check=False); mf.unlink(missing_ok=True)
-                req_imgs = sorted(p for p in req_set if not (IMG_DIR / p).is_file())
                 if req_imgs:
-                    sess = requests.Session()
-                    if hf_tok:
-                        sess.headers["Authorization"] = f"Bearer {{hf_tok}}"
-                    def _fetch(rel_p):
-                        dst = IMG_DIR / rel_p; dst.parent.mkdir(parents=True, exist_ok=True)
-                        url = "https://huggingface.co/datasets/QCRI/CrisisMMD/resolve/{CRISISMMA_HF_REV}/" + urllib.parse.quote(rel_p, safe="/")
-                        for att in range(5):
-                            r = sess.get(url, timeout=(20, 60))
-                            if r.status_code == 429 or r.status_code >= 500:
-                                time.sleep(min(60, 2 * (2 ** att))); continue
-                            r.raise_for_status(); dst.write_bytes(r.content); return
-                        raise RuntimeError(f"Failed {{rel_p}}")
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-                        for fut in concurrent.futures.as_completed([pool.submit(_fetch, p) for p in req_imgs]):
-                            fut.result()
+                    hf_lfs_batch_download("QCRI/CrisisMMD", "{CRISISMMA_HF_REV}", req_imgs, IMG_DIR, hf_token=hf_tok)
                 DATASET_PATHS["crisismmd"] = (SEQ_DIR, IMG_DIR)
                 print("[READY] crisismmd:", IMG_DIR, flush=True)
 
@@ -381,12 +357,14 @@ def build() -> None:
                 if marker_check(ds_dir):
                     print(f"[REUSE] {{stem}} already unpacked at {{ds_dir}}", flush=True)
                     return ds_dir
-                arc = next((p for p in (Path(f"/content/{{stem}}.tar"), Path(f"/content/{{stem}}.tar.gz"), Path(f"/content/{{stem}}.zip")) if _is_valid_binary(p, 1_000_000)), None)
+                arc = next((p for p in (Path(f"/content/{{stem}}.tar"), Path(f"/content/{{stem}}.tar.gz"), Path(f"/content/{{stem}}.zip")) if is_valid_binary_archive(p, 1_000_000)), None)
                 u_str = url_val.strip()
-                if arc is None and not u_str:
-                    u_str = input(f"Paste Google Drive / .tar URL for '{{stem}}' (or press Enter for direct CDN): ").strip()
                 if arc is None and u_str:
-                    arc = _download_archive_aria2(u_str, Path(f"/content/{{stem}}_dl.tar"), min_bytes=1_000_000)
+                    try:
+                        arc = _download_archive_aria2(u_str, Path(f"/content/{{stem}}_dl.tar"), min_bytes=1_000_000)
+                    except Exception as exc_dl:
+                        print(f"[WARN] Archive link failed for {{stem}} ({{exc_dl}}); falling back to direct Web/HF aria2c CDN.", flush=True)
+                        arc = None
                 out_dir = prep_fn(ds_dir, archive_path=arc)
                 if arc is not None and arc.parent == Path("/content"):
                     arc.unlink(missing_ok=True)

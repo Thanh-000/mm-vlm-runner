@@ -38,6 +38,7 @@ def build() -> None:
             2. **MG-CLIP (ICCV 2025 Highlight, `arXiv:2507.09118`, `linlany/MindtheGap`) (Exp 2):** Verbatim author execution (`order0`, `lr=1e-3`, dynamic text LoRA, MGC `3` epochs) vs. `mnarm` current YAML config (`lr=3e-5`, frozen `theta_0` prompts) vs. author-matched `mnarm` config (`lr=1e-3`, dynamic prompts).
             3. **MagMax (ECCV 2024, `arXiv:2407.06322`, `danielm1405/magmax`) + TSV-M + Iso-C (Exp 3):** Verbatim `default_class_order`, `18`-template head, `lr=1e-5`, `epochs=10`, `Ind-FT (theta_0)` vs `Seq-FT (theta_{t-1})`, verifying published Table 1 & Table 3 (`Zero-Shot = 66.91%`, `Seq-FT MagMax = 80.41%`).
             4. **LoRA Learning Rate & Readout Head Confound Matrix (Exp 4):** Quantifies how `Readout Head` (`Prompt Raw` vs `NCM none_vmf` vs `CSS-CT`) and `LoRA lr` (`3e-5` vs `3e-4`) behave on standard `P1`-like streams without MNAR missingness.
+            - **Zero Manual Upload / Max-Speed `aria2c` Fetch:** Dataset (`CIFAR-100`, ~169 MB) and OpenAI `ViT-B-16.pt` (~351 MB) / HF `CLIP ViT-B/16` weights are downloaded directly into `/dev/shm` via **16-connection `aria2c -x16 -s16` + `pigz`** (with automatic web-overload backoff `-x4 -s4` and optional Google Drive `.tar` support via `CIFAR100_ARCHIVE_URL`).
             """,
             kind="markdown",
             cid="parity-cell-0",
@@ -49,14 +50,16 @@ def build() -> None:
             RUN_MG_CLIP_CIFAR100 = True  # @param {type:"boolean"}
             RUN_MAGMAX_CIFAR100 = True  # @param {type:"boolean"}
             RUN_LORA_CONFOUND_MATRIX = True  # @param {type:"boolean"}
+            CIFAR100_ARCHIVE_URL = ""  # @param {type:"string"}
             AUTO_DOWNLOAD = True  # @param {type:"boolean"}
             """,
             cid="parity-cell-1",
         ),
         _cell(
             f"""
-            import importlib, os, shutil, site, subprocess, sys
+            import concurrent.futures, html, importlib, os, re, shutil, site, subprocess, sys, urllib.parse
             from pathlib import Path
+            import requests
             import torch
             import torchvision
 
@@ -65,6 +68,7 @@ def build() -> None:
 
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+            os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
             WS = Path("/content/parity_ws")
             WS.mkdir(parents=True, exist_ok=True)
@@ -79,35 +83,117 @@ def build() -> None:
 
             pkgs = [
                 "setuptools<81", "packaging", "open_clip_torch", "ftfy", "regex",
-                "transformers==4.57.6", "scipy", "PyYAML", "omegaconf", "hydra-core", "continuum",
+                "transformers==4.57.6", "scipy", "PyYAML", "omegaconf", "hydra-core",
+                "continuum", "gdown", "hf_transfer",
             ]
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", *pkgs], check=True)
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "git+https://github.com/openai/CLIP.git"], check=True)
+            def _pip_and_repos():
+                subprocess.run([sys.executable, "-m", "pip", "install", "-q", *pkgs], check=True)
+                subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "git+https://github.com/openai/CLIP.git"], check=True)
+                REPOS = {{
+                    "mm_vlm_runner": {RUNNER_REPO_URL!r},
+                    "MindtheGap": "https://github.com/linlany/MindtheGap.git",
+                    "magmax": "https://github.com/danielm1405/magmax.git",
+                    "iso_merging": "https://github.com/danielm1405/iso-merging.git",
+                }}
+                for name, url in REPOS.items():
+                    dst = WS / name
+                    if (dst / ".git").is_dir():
+                        subprocess.run(["git", "-C", str(dst), "fetch", "--depth", "1", "origin"], check=True)
+                        subprocess.run(["git", "-C", str(dst), "reset", "--hard", "FETCH_HEAD"], check=True)
+                    else:
+                        shutil.rmtree(dst, ignore_errors=True)
+                        subprocess.run(["git", "clone", "--depth", "1", url, str(dst)], check=True)
+                subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-build-isolation", "--no-deps", "-e", str(WS / "mm_vlm_runner")], check=True)
 
-            REPOS = {{
-                "mm_vlm_runner": {RUNNER_REPO_URL!r},
-                "MindtheGap": "https://github.com/linlany/MindtheGap.git",
-                "magmax": "https://github.com/danielm1405/magmax.git",
-                "iso_merging": "https://github.com/danielm1405/iso-merging.git",
-            }}
-            for name, url in REPOS.items():
-                dst = WS / name
-                if (dst / ".git").is_dir():
-                    subprocess.run(["git", "-C", str(dst), "fetch", "--depth", "1", "origin"], check=True)
-                    subprocess.run(["git", "-C", str(dst), "reset", "--hard", "FETCH_HEAD"], check=True)
-                else:
-                    shutil.rmtree(dst, ignore_errors=True)
-                    subprocess.run(["git", "clone", "--depth", "1", url, str(dst)], check=True)
+            def _apt_aria2():
+                if any(shutil.which(b) is None for b in ("aria2c", "pigz", "unzip")) and shutil.which("apt-get"):
+                    subprocess.run(["apt-get", "-qq", "update"], check=False)
+                    subprocess.run(["apt-get", "-qq", "install", "-y", "aria2", "pigz", "unzip"], check=False)
 
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-build-isolation", "--no-deps", "-e", str(WS / "mm_vlm_runner")], check=True)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                f_pip, f_apt = pool.submit(_pip_and_repos), pool.submit(_apt_aria2)
+                f_pip.result(); f_apt.result()
+
             site.addsitedir(str(WS / "mm_vlm_runner" / "src"))
             importlib.invalidate_caches()
             import mnarm
+            from mnarm.data import aria2_download_file, extract_archive_safe, is_valid_binary_archive
             print("[READY] mnarm:", mnarm.__file__, flush=True)
 
-            torchvision.datasets.CIFAR100(str(DATA_DIR), train=True, download=True)
-            torchvision.datasets.CIFAR100(str(DATA_DIR), train=False, download=True)
-            print("[READY] CIFAR-100 cached at", DATA_DIR, flush=True)
+            def _resolve_drive_direct_url(url_in: str) -> tuple[str, dict[str, str]]:
+                u = url_in.strip()
+                host = urllib.parse.urlparse(u).netloc.lower()
+                if "drive" not in host or not host.endswith("google.com"):
+                    return u, {{}}
+                uc_host = "drive." + "usercontent.google.com"
+                if uc_host in host and "confirm=" in u and ("uuid=" in u or "at=" in u):
+                    return u, {{}}
+                m = re.search(r"/file/d/([A-Za-z0-9_-]+)", u)
+                fid = m.group(1) if m else urllib.parse.parse_qs(urllib.parse.urlparse(u).query).get("id", [""])[0]
+                if not fid:
+                    return u, {{}}
+                sess = requests.Session()
+                sess.headers["User-Agent"] = "Mozilla/5.0"
+                probe = f"https://{{uc_host}}/download?id={{fid}}&export=download&confirm=t"
+                with sess.get(probe, stream=True, timeout=30, allow_redirects=True) as r:
+                    ck = "; ".join(f"{{k}}={{v}}" for k, v in sess.cookies.get_dict().items())
+                    hdr = {{"Cookie": ck}} if ck else {{}}
+                    if "text/html" not in (r.headers.get("Content-Type") or "").lower():
+                        return r.url, hdr
+                    body = r.text
+                inputs = {{}}
+                for tag in re.findall(r"<input[^>]+>", body, flags=re.I):
+                    mn = re.search(r'name=["\\\']([^"\\\']+)["\\\']', tag, flags=re.I)
+                    mv = re.search(r'value=["\\\']([^"\\\']*)["\\\']', tag, flags=re.I)
+                    if mn and mv:
+                        inputs[mn.group(1)] = html.unescape(mv.group(1))
+                return (f"https://{{uc_host}}/download?" + urllib.parse.urlencode(inputs) if inputs else probe), hdr
+
+            def _ensure_cifar100_aria2(data_dir: Path, custom_url: str) -> None:
+                py_dir = data_dir / "cifar-100-python"
+                if (py_dir / "train").is_file() and (py_dir / "test").is_file():
+                    print("[REUSE] CIFAR-100 already cached in", data_dir, flush=True)
+                    return
+                u_custom = custom_url.strip()
+                if u_custom:
+                    direct_u, hdrs = _resolve_drive_direct_url(u_custom)
+                    dl_p = data_dir / "cifar100_stage.dl"
+                    try:
+                        aria2_download_file(direct_u, dl_p, headers=hdrs, min_bytes=100_000_000, max_conn=16)
+                    except Exception:
+                        subprocess.run([sys.executable, "-m", "gdown", "--fuzzy", u_custom, "-O", str(dl_p)], check=True)
+                    extract_archive_safe(dl_p, data_dir)
+                    dl_p.unlink(missing_ok=True)
+                else:
+                    tgz_url = "https://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz"
+                    tgz_p = data_dir / "cifar-100-python.tar.gz"
+                    try:
+                        aria2_download_file(
+                            tgz_url, tgz_p, checksum="md5=eb9058c3a382ffc7106e4002c42a8d85",
+                            min_bytes=160_000_000, max_conn=16,
+                        )
+                        extract_archive_safe(tgz_p, data_dir)
+                        tgz_p.unlink(missing_ok=True)
+                    except Exception as exc_web:
+                        print(f"[WARN] Direct aria2c web pull throttled/failed ({{exc_web}})", flush=True)
+                        fb_url = input("Web source overloaded; paste Google Drive CIFAR100_ARCHIVE_URL from Stage_Disaster_Datasets_To_Drive.ipynb (or Enter to retry torchvision): ").strip()
+                        if fb_url:
+                            _ensure_cifar100_aria2(data_dir, fb_url)
+                            return
+                        torchvision.datasets.CIFAR100(str(data_dir), train=True, download=True)
+                        torchvision.datasets.CIFAR100(str(data_dir), train=False, download=True)
+                torchvision.datasets.CIFAR100(str(data_dir), train=True, download=False)
+                torchvision.datasets.CIFAR100(str(data_dir), train=False, download=False)
+
+            _ensure_cifar100_aria2(DATA_DIR, str(CIFAR100_ARCHIVE_URL))
+            clip_pt = Path.home() / ".cache" / "clip" / "ViT-B-16.pt"
+            aria2_download_file(
+                "https://openaipublic.azureedge.net/clip/models/5806e77cd80f8b59890b7e101eabd078d9fb84e6937f9e85e4ecb61988df416f/ViT-B-16.pt",
+                clip_pt,
+                checksum="sha-256=5806e77cd80f8b59890b7e101eabd078d9fb84e6937f9e85e4ecb61988df416f",
+                min_bytes=340_000_000, max_conn=16,
+            )
+            print("[READY] CIFAR-100 & CLIP ViT-B-16.pt cached via aria2c at", DATA_DIR, flush=True)
 
             AUDIT_RESULTS = {{}}
             """,

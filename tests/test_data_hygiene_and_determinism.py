@@ -11,7 +11,13 @@ import torch
 from PIL import Image
 
 from mnarm.core import seed_everything
-from mnarm.data import assert_zero_split_overlap, load_crisismmd_contracts, uid_hash
+from mnarm.data import (
+    aria2_download_file,
+    assert_zero_split_overlap,
+    is_valid_binary_archive,
+    load_crisismmd_contracts,
+    uid_hash,
+)
 from mnarm.models import tower_digest
 
 
@@ -448,5 +454,49 @@ def test_run_pilot_f1_end_to_end_p4_mock_vlm(tmp_path: Path, monkeypatch: pytest
     assert set(suite["protocols"].keys()) == {"P4", "P3"}
     assert (suite_out / "CRISISMMD_P1_P4_clip_b16_SUMMARY.md").is_file()
     assert "$" not in (suite_out / "CRISISMMD_P1_P4_clip_b16_SUMMARY.md").read_text(encoding="utf8")
+
+
+def test_aria2_download_file_checksum_and_html_guard(tmp_path: Path, monkeypatch) -> None:
+    import hashlib
+    import mnarm.data.archive_ops as aops
+
+    html_f = tmp_path / "quota.tar"
+    html_f.write_bytes(b"<!DOCTYPE html><html><body>Quota exceeded</body></html>" + b"x" * 200)
+    assert not is_valid_binary_archive(html_f, min_bytes=64)
+
+    payload = b"TAR_HEADER_TEST_BYTES_" * 16
+    md5_hex = hashlib.md5(payload).hexdigest()
+    sha_hex = hashlib.sha256(payload).hexdigest()
+    src_bin = tmp_path / "source.bin"
+    src_bin.write_bytes(payload)
+    assert is_valid_binary_archive(src_bin, min_bytes=64)
+
+    class _FakeResp:
+        def __init__(self, data: bytes) -> None:
+            self._data = data
+        def read(self) -> bytes:
+            return self._data
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+
+    calls: list[int] = []
+    monkeypatch.setattr(aops.shutil, "which", lambda _cmd: None)
+    monkeypatch.setattr(aops.urllib.request, "urlopen", lambda req, timeout=120: calls.append(1) or _FakeResp(payload))
+
+    out = aria2_download_file("https://example.com/archive.tar", tmp_path / "dl.tar", checksum=f"md5={md5_hex}", min_bytes=64)
+    assert out.read_bytes() == payload and len(calls) == 1
+
+    # Second call with valid cache short-circuits cleanly without extra download
+    out2 = aria2_download_file("https://example.com/archive.tar", out, checksum=f"sha-256={sha_hex}", min_bytes=64)
+    assert out2 == out and len(calls) == 1
+
+    with pytest.raises(RuntimeError, match="Checksum mismatch"):
+        aria2_download_file("https://example.com/bad.tar", tmp_path / "bad.tar", checksum="sha-256=" + ("0" * 64), min_bytes=64)
+
+    monkeypatch.setattr(aops.urllib.request, "urlopen", lambda req, timeout=120: _FakeResp(b"<html>bad</html>" + b"y" * 200))
+    with pytest.raises(RuntimeError, match="HTML error page"):
+        aria2_download_file("https://example.com/html.tar", tmp_path / "html.tar", min_bytes=64)
 
 
