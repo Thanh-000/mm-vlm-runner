@@ -26,10 +26,12 @@ class PALRLSClassifier:
         lam: float = 1.0,
         expand_dim: int | None = None,
         seed: int = 11,
+        auto_lam: bool = False,
     ) -> None:
         self.embed_dim = int(embed_dim)
         self.num_classes = int(num_classes)
         self.lam = float(lam)
+        self.auto_lam = bool(auto_lam)
         self.expand_dim = int(expand_dim) if expand_dim is not None else min(max(4 * self.embed_dim, 64), 2048)
         gen = torch.Generator().manual_seed(int(seed))
         self.w_up = torch.randn(2 * self.embed_dim, self.expand_dim, dtype=torch.float64, generator=gen) / math.sqrt(float(2 * self.embed_dim))
@@ -37,6 +39,8 @@ class PALRLSClassifier:
         self.rhs = torch.zeros((self.expand_dim, num_classes), dtype=torch.float64)
         self.mod_sum = {"text": torch.zeros(self.embed_dim, dtype=torch.float64), "image": torch.zeros(self.embed_dim, dtype=torch.float64)}
         self.mod_count = {"text": 0, "image": 0}
+        self.y_fro2 = 0.0
+        self.n_samples = 0
         self.weights: torch.Tensor | None = None
         self._dirty = False
 
@@ -72,12 +76,29 @@ class PALRLSClassifier:
         y_oh = F.one_hot(labels.detach().cpu().long(), num_classes=self.num_classes).to(torch.float64)
         self.gram += h.T @ h
         self.rhs += h.T @ y_oh
+        self.y_fro2 += float((y_oh * y_oh).sum().item())
+        self.n_samples += int(h.shape[0])
         self._dirty = True
 
     def _ensure_solved(self) -> None:
         if self._dirty:
-            eye = torch.eye(self.expand_dim, dtype=torch.float64)
-            self.weights = torch.linalg.solve(self.gram + self.lam * eye, self.rhs).float()
+            if self.auto_lam and self.n_samples >= 4:
+                eigvals, eigvecs = torch.linalg.eigh(self.gram)
+                eigvals = eigvals.clamp_min(0.0)
+                proj = eigvecs.T @ self.rhs
+                b2 = (proj * proj).sum(dim=-1)
+                best_lam, best_gcv = self.lam, float("inf")
+                for lv in (0.05, 0.2, 1.0, 5.0, 20.0, 100.0):
+                    rss = max(0.0, self.y_fro2 - float((b2 * (eigvals + 2.0 * lv) / (eigvals + lv).square().clamp_min(1e-24)).sum().item()))
+                    df = float((eigvals / (eigvals + lv).clamp_min(1e-24)).sum().item())
+                    gcv = rss / (max(1.0 - df / float(max(self.n_samples, 1)), 1e-3) ** 2)
+                    if gcv < best_gcv:
+                        best_gcv, best_lam = gcv, lv
+                self.lam = float(best_lam)
+                self.weights = (eigvecs @ (proj / (eigvals + best_lam).unsqueeze(-1))).float()
+            else:
+                eye = torch.eye(self.expand_dim, dtype=torch.float64)
+                self.weights = torch.linalg.solve(self.gram + self.lam * eye, self.rhs).float()
             self._dirty = False
 
     def predict_batch(self, u_t: torch.Tensor | None, u_i: torch.Tensor | None, mask: tuple[str, ...], seen_classes: list[int]) -> torch.Tensor:
@@ -155,9 +176,9 @@ def train_mg_clip_stage(
     stage_idx: int, epochs: int, effective_batch_size: int, micro_batch_size: int, lr: float, weight_decay: float,
     seed: int, use_amp: bool, tensor_store: PreprocessedTensorStore,
     gap_alpha: float = 0.10, mgc_epochs: int = 3, mgc_lr: float = 5e-4, mgc_bs: int = 64,
-    eval_batch_size: int | None = None,
+    eval_batch_size: int | None = None, orig_prompts: list[str] | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, IntraModalCosineClassifier]]:
-    """Train MG-CLIP (linlany/MindtheGap@21fb1da0): epoch-level MGP early-stop + MGC cosine heads."""
+    """Train MG-CLIP (linlany/MindtheGap): dynamic prompt LoRA co-adaptation + MGC cosine heads."""
     vlm.restore_base_weights()
     if stage_idx == 1 or prev_state is None:
         vlm.reset_lora()
@@ -172,6 +193,7 @@ def train_mg_clip_stage(
     cls_ord = old_ord + new_ord
     cls_map = {c: i for i, c in enumerate(cls_ord)}
     p_ord = l2_normalize(protos_full[cls_ord].float())
+    tok_p_dev = {k: v.to(vlm.device) for k, v in vlm.tokenize_texts([orig_prompts[c] for c in cls_ord]).items()} if orig_prompts is not None else None
     eff_bs = max(1, int(effective_batch_size))
     micro_bs = min(eff_bs, max(1, int(micro_batch_size)))
     accum_steps = max(1, eff_bs // micro_bs)
@@ -191,10 +213,7 @@ def train_mg_clip_stage(
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, int(epochs)), eta_min=float(lr) * 0.01)
     rng = random.Random(int(seed) + stage_idx * 23)
     train_specs = list(specs)
-    last_valid = copy.deepcopy(saved_state)
-    stopped_ep = max(1, int(epochs))
-    rel_drift = 0.0
-    for ep in range(int(epochs)):
+    for _ in range(int(epochs)):
         vlm.clip.train()
         rng.shuffle(train_specs)
         for gs in range(0, len(train_specs), accum_steps):
@@ -206,31 +225,22 @@ def train_mg_clip_stage(
                 dev_inp = {k: v.to(vlm.device, non_blocking=True) for k, v in batch.items() if k not in ("label", "sample_id")}
                 y_loc = torch.tensor([cls_map[int(v)] for v in batch["label"].tolist()], dtype=torch.long, device=vlm.device)
                 with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_on):
+                    p_cur = l2_normalize(vlm.encode_text(tok_p_dev)) if tok_p_dev is not None else p_ord
                     feats = {m: (vlm.encode_text(dev_inp) if m == "text" else vlm.encode_image(dev_inp)) for m in views}
-                    z = _mean_proto_logits(feats, p_ord, vlm.logit_scale)
+                    z = _mean_proto_logits(feats, p_cur, vlm.logit_scale)
                     loss_c = F.cross_entropy(z, y_loc) if (stage_idx == 1 or not old_ord) else _intra_cls_loss(z, y_loc, len(old_ord))
                     loss = loss_c / denom
                 scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
         sched.step()
-        neg_ep = _measure_mean_neg_by_mask(vlm, eval_specs, tensor_store, p_ord, cls_map, len(cls_ord), amp_dtype, amp_on)
-        rel_drift = max((abs(neg_ep[vw] - neg0[vw]) / max(abs(neg0[vw]), 1e-6) for vw in neg_ep), default=0.0)
-        if ep == 0:
-            last_valid = vlm.lora_state()
-            if rel_drift > float(gap_alpha):
-                stopped_ep = ep + 1
-                break
-        elif rel_drift > float(gap_alpha):
-            vlm.load_lora_state(last_valid)
-            stopped_ep = ep + 1
-            break
-        else:
-            last_valid = vlm.lora_state()
+    p_fin = l2_normalize(vlm.encode_prompts_current([orig_prompts[c] for c in cls_ord])) if orig_prompts is not None else p_ord
+    neg_ep = _measure_mean_neg_by_mask(vlm, eval_specs, tensor_store, p_fin, cls_map, len(cls_ord), amp_dtype, amp_on)
+    rel_drift = max((abs(neg_ep[vw] - neg0[vw]) / max(abs(neg0[vw]), 1e-6) for vw in neg_ep), default=0.0)
     mg_heads["text"].mgp_trace[int(stage_idx)] = {
         "neg0": {"+".join(vw): round(val, 4) for vw, val in neg0.items()},
         "rel_drift": round(float(rel_drift), 5),
-        "stopped_epoch": int(stopped_ep),
+        "stopped_epoch": int(epochs),
     }
 
     vlm.clip.eval()
@@ -300,14 +310,14 @@ def mg_clip_eval_logits(
     out: dict[str, torch.Tensor] = {}
     for vw in ("text", "image"):
         if vw in cross_scores and vw in active_intra and cross_scores[vw].shape[0] == active_intra[vw].shape[0]:
-            p_c = F.softmax(cross_scores[vw].float(), dim=-1)
+            p_c = F.softmax(F.softmax(cross_scores[vw].float(), dim=-1), dim=-1)
             p_i = F.softmax(active_intra[vw].float(), dim=-1)
             out[vw] = torch.log(((float(a_weight) * p_c + float(b_weight) * p_i) / denom).clamp_min(1e-12))
-    if (
-        "paired" in cross_scores and "text" in active_intra and "image" in active_intra
-        and active_intra["text"].shape[0] == active_intra["image"].shape[0] == cross_scores["paired"].shape[0]
-    ):
-        p_cp = F.softmax(cross_scores["paired"].float(), dim=-1)
-        p_ip = 0.5 * (F.softmax(active_intra["text"].float(), dim=-1) + F.softmax(active_intra["image"].float(), dim=-1))
-        out["paired"] = torch.log(((float(a_weight) * p_cp + float(b_weight) * p_ip) / denom).clamp_min(1e-12))
+    if "paired" in cross_scores:
+        n_p = int(cross_scores["paired"].shape[0])
+        intra_p = [F.softmax(active_intra[tw].float(), dim=-1) for tw in ("text", "image") if tw in active_intra and int(active_intra[tw].shape[0]) == n_p]
+        if intra_p:
+            p_cp = F.softmax(F.softmax(cross_scores["paired"].float(), dim=-1), dim=-1)
+            p_ip = torch.stack(intra_p, dim=0).mean(dim=0)
+            out["paired"] = torch.log(((float(a_weight) * p_cp + float(b_weight) * p_ip) / denom).clamp_min(1e-12))
     return out

@@ -259,7 +259,7 @@ def test_lora_nullspace_zero_leakage_and_verbatim_author_parity() -> None:
     assert float((out_gr["text"] - 10.0 * (l2_normalize(dt_c) @ q_ref.T)).abs().max().item()) < 1e-5
     assert float((out_gr["paired"] - 10.0 * (l2_normalize(0.5 * dt_c + 0.5 * di_c) @ q_ref.T)).abs().max().item()) < 1e-5
 
-    # 4. Verbatim MG-CLIP inference formula: (1 * softmax(cross) + 4 * softmax(unscaled_intra)) / 5
+    # 4. Verbatim MG-CLIP inference formula: (1 * softmax(softmax(cross)) + 4 * softmax(unscaled_intra)) / 5
     class _CosHead(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -272,7 +272,7 @@ def test_lora_nullspace_zero_leakage_and_verbatim_author_parity() -> None:
     ut, ui = torch.randn(4, 8), torch.randn(4, 8)
     cross = {"text": torch.randn(4, 4), "image": torch.randn(4, 4), "paired": torch.randn(4, 4)}
     mg_out = mg_clip_eval_logits(ut, ui, cross, heads, seen, logit_scale=50.0)
-    expected_txt = torch.log((torch.softmax(cross["text"], -1) + 4.0 * torch.softmax(heads["text"](ut, seen), -1)) / 5.0)
+    expected_txt = torch.log((torch.softmax(torch.softmax(cross["text"], -1), -1) + 4.0 * torch.softmax(heads["text"](ut, seen), -1)) / 5.0)
     assert float((mg_out["text"] - expected_txt).abs().max().item()) < 1e-5
 
     # 5. Verbatim PAL-RLS ReLU expansion + closed-form ridge parity

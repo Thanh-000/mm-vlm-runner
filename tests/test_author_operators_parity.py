@@ -178,7 +178,14 @@ def test_run_iccv_same_bank_end_to_end_mock(tmp_path: Path, monkeypatch: pytest.
             v = torch.zeros(16); v[c % 8] = 1.0; v[8 + (c % 8)] = 0.5; return v / v.norm()
 
         def tokenize_texts(self, texts: list[str], **_kw: object) -> dict[str, torch.Tensor]:
-            return {"input_ids": torch.stack([self._vec(int(t.split("_", 1)[1].split(" ", 1)[0])) for t in texts])}
+            from mnarm.data.crisismmd import ORIGINAL_PROMPTS
+
+            def _cid(t: str) -> int:
+                if t.startswith("cls_"):
+                    return int(t.split("_", 1)[1].split(" ", 1)[0])
+                return ORIGINAL_PROMPTS.index(t) if t in ORIGINAL_PROMPTS else (sum(ord(c) for c in t) % 8)
+
+            return {"input_ids": torch.stack([self._vec(_cid(t)) for t in texts])}
 
         def processor(self, images: list[Image.Image], return_tensors: str = "pt") -> dict[str, torch.Tensor]:
             del return_tensors
@@ -258,9 +265,9 @@ def test_run_iccv_same_bank_end_to_end_mock(tmp_path: Path, monkeypatch: pytest.
     assert set(res["protocols"].keys()) == {"P4", "P3"}
     for p in ("P4", "P3"):
         p_res = json.loads((out_dir / f"clip_b16_{p.lower()}" / "ICCV_PROTOCOL_RESULTS.json").read_text(encoding="utf8"))
-        assert len(p_res["arms"]) == len(ALL_MERGE_METHODS) + 6
-        for arm in list(ALL_MERGE_METHODS) + ["seq_ft", "seq_lmnar", "seq_replay256", "mg_clip", "joint_oracle"]:
-            assert set(p_res["arms"][arm]["regimes"].keys()) == {"raw", "gr_clip", "unlab_center", "zero_mnar", "cal_bias"}
+        assert len(p_res["arms"]) == len(ALL_MERGE_METHODS) + 7
+        for arm in list(ALL_MERGE_METHODS) + ["seq_ft", "seq_magmax", "seq_lmnar", "seq_replay256", "mg_clip", "joint_oracle"]:
+            assert set(p_res["arms"][arm]["regimes"].keys()) == {"raw", "gr_clip", "unlab_center", "ncm", "oas_lda", "zero_mnar", "cal_bias"}
             assert "i2t_r1" in p_res["arms"][arm]["encoder_preservation"]["retrieval"]
             assert "i2t_r1" in p_res["arms"][arm]["encoder_preservation"]["retrieval_reanchored"]
         assert "raw" in p_res["arms"]["pal_rls"]["regimes"]
@@ -299,3 +306,75 @@ def test_run_iccv_same_bank_end_to_end_mock(tmp_path: Path, monkeypatch: pytest.
     m_md = write_ecosystem_master_summary(out_dir.parent)
     assert m_md.is_file() and "$" not in m_md.read_text(encoding="utf8")
     assert (out_dir.parent / "ICCV_ECOSYSTEM_MASTER_TABLE.tex").is_file()
+
+
+def test_dc_lora_small_n_knots_global_opcm_tower_and_mg_clip_p4_cal() -> None:
+    from mnarm.methods import PALRLSClassifier, mg_clip_eval_logits
+    from mnarm.methods.merging import _ties_merge_flat
+    from mnarm.methods.subspace_merging import _knots_merge
+
+    torch.manual_seed(29)
+    # 1. DC-LoRA with N=3, r=8 keeps >= 8 active components and preserves avg_norm
+    d3 = [(torch.randn(64, 8) @ torch.randn(8, 64)) * 0.05 for _ in range(3)]
+    out_dc = merge_task_deltas([{"vision_model.l0": m} for m in d3], "dc_lora", rank_per_task=8)["vision_model.l0"]
+    s_dc = torch.linalg.svdvals(out_dc)
+    assert int((s_dc > 1e-4).sum().item()) >= 8
+    avg_n = sum(float(m.norm().item()) for m in d3) / 3.0
+    assert abs(float(out_dc.norm().item()) - avg_n) < 1e-4
+
+    # 2. KnOTS global cross-layer TIES pruning per active tower
+    kd = [
+        {"vision_model.l0": (torch.randn(32, 4) @ torch.randn(4, 32)) * 0.04, "vision_model.l1": (torch.randn(32, 4) @ torch.randn(4, 32)) * 0.04}
+        for _ in range(3)
+    ]
+    k_merged = _knots_merge(kd, ["vision_model.l0", "vision_model.l1"], _ties_merge_flat)
+    u_ref, sv_parts, items_ref = {}, [[] for _ in range(3)], []
+    for key in ("vision_model.l0", "vision_model.l1"):
+        u64, s64, vh64 = torch.linalg.svd(torch.cat([d[key].double() for d in kd], dim=1), full_matrices=False)
+        kp = s64 > 1e-5
+        rk = int(kp.sum().item())
+        u_ref[key] = (u64[:, kp].float(), rk)
+        items_ref.append((key, rk * 32))
+        s_k, vh_k = s64[kp].float(), vh64[kp, :].float()
+        for j in range(3):
+            sv_parts[j].append((s_k.unsqueeze(1) * vh_k[:, j * 32 : (j + 1) * 32]).reshape(-1))
+    g_ties = _ties_merge_flat(torch.stack([torch.cat(p) for p in sv_parts], dim=0), 0.20)
+    for (key, sz), chunk in zip(items_ref, g_ties.split([x[1] for x in items_ref])):
+        u_k, rk = u_ref[key]
+        assert float((k_merged[key] - 0.6 * (u_k @ chunk.reshape(rk, 32))).abs().max().item()) < 1e-5
+
+    # 3. OPCM & TIES-20 tower independence under P3/P4 MNAR zero-delta text stages
+    deltas_mnar = [
+        {"text_model.q": torch.zeros(24, 24), "vision_model.q": (torch.randn(24, 4) @ torch.randn(4, 24)) * 0.05},
+        {"text_model.q": torch.zeros(24, 24), "vision_model.q": (torch.randn(24, 4) @ torch.randn(4, 24)) * 0.05},
+        {"text_model.q": (torch.randn(24, 4) @ torch.randn(4, 24)) * 0.05, "vision_model.q": (torch.randn(24, 4) @ torch.randn(4, 24)) * 0.05},
+        {"text_model.q": (torch.randn(24, 4) @ torch.randn(4, 24)) * 0.05, "vision_model.q": (torch.randn(24, 4) @ torch.randn(4, 24)) * 0.05},
+    ]
+    vis_only = [{"vision_model.q": d["vision_model.q"]} for d in deltas_mnar]
+    for m_name in ("opcm", "ties20"):
+        m_both = merge_task_deltas(deltas_mnar, m_name)["vision_model.q"]
+        m_alone = merge_task_deltas(vis_only, m_name)["vision_model.q"]
+        assert float((m_both - m_alone).abs().max().item()) < 1e-6
+
+    # 4. MG-CLIP partial-modality paired log-probs on P3/P4 calibration chunks
+    class _Head(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(4, 8))
+            self.initialized = torch.tensor([True, True, True, True])
+        def forward(self, u: torch.Tensor, classes: list[int]) -> torch.Tensor:
+            return torch.nn.functional.linear(torch.nn.functional.normalize(u.float(), dim=-1), torch.nn.functional.normalize(self.weight[classes], dim=-1))
+
+    mg_p = mg_clip_eval_logits(None, torch.randn(5, 8), {"image": torch.randn(5, 4), "paired": torch.randn(5, 4)}, {"text": _Head(), "image": _Head()}, [0, 1, 2, 3], 10.0)
+    assert mg_p["paired"].shape == (5, 4) and float(mg_p["paired"].min().item()) >= -30.0 and float(mg_p["paired"].max().item()) <= 0.0
+
+    # 5. PAL-RLS GCV automatic lambda matches closed-form ridge solution
+    pal = PALRLSClassifier(embed_dim=8, num_classes=4, lam=1.0, expand_dim=32, seed=29, auto_lam=True)
+    xt, xi, y = torch.randn(24, 8), torch.randn(24, 8), torch.arange(4).repeat(6)
+    pal.update(xt, xi, y, ("text", "image"))
+    xq = torch.randn(6, 8)
+    pred = pal.predict_batch(xq, xq, ("text", "image"), [0, 1, 2, 3])
+    eye = torch.eye(32, dtype=torch.float64)
+    w_ref = torch.linalg.solve(pal.gram + pal.lam * eye, pal.rhs).float()
+    h_q = torch.relu(pal._fill_pair(xq, xq, ("text", "image")) @ pal.w_up).float()
+    assert float((pred - h_q @ w_ref).abs().max().item()) < 1e-5

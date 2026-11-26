@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 
 from mnarm.methods import ALL_MERGE_METHODS
 
-SEQ_ARMS = ("seq_ft", "seq_lmnar", "mg_clip", "pal_rls", "seq_replay256", "joint_oracle")
+SEQ_ARMS = ("seq_ft", "seq_magmax", "seq_lmnar", "mg_clip", "pal_rls", "seq_replay256", "joint_oracle")
 
 
 def _configure_style() -> None:
@@ -54,6 +54,7 @@ def _plot_regimes(backbone: str, per_proto: dict[str, dict[str, Any]], fig_dir: 
     styles = [
         ("raw", "Raw (Weight-Only / SOTA)", "o", "#555555", 52),
         ("gr_clip", "+GR-CLIP (NeurIPS'25, 0-label)", "s", "#E69F00", 52),
+        ("ncm", "+NCM (Fair Centroid, 0 D_cal)", "P", "#009E73", 56),
         ("cal_bias", "+cal_bias (100% D_cal)", "D", "#56B4E9", 54),
         ("zero_mnar", "+CSS-CT (Ours, 0 D_cal)", "^", "#0072B2", 78),
     ]

@@ -65,8 +65,15 @@ def _wudi_matrix(mats: list[torch.Tensor], iter_num: int = 300, lr: float = 1e-5
     return _wudi_merge([{"k": m} for m in mats], ["k"], iter_num=iter_num, lr=lr)["k"]
 
 
-def _opcm_merge(deltas: list[dict[str, torch.Tensor]], keys: list[str], alpha: float = 0.5) -> dict[str, torch.Tensor]:
-    """Verbatim OPCM (arXiv:2501.09522) continual SVD projection across stage task deltas."""
+def _tower_of(key: str) -> str:
+    if key == "t" or key.startswith(("text_model.", "t.")):
+        return "text"
+    if key == "v" or key.startswith(("vision_model.", "v.")):
+        return "vision"
+    return "shared"
+
+
+def _opcm_merge_tower(deltas: list[dict[str, torch.Tensor]], keys: list[str], alpha: float) -> dict[str, torch.Tensor]:
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     merged = {k: deltas[0][k].float().to(dev).clone() for k in keys}
     norm0 = float(torch.cat([merged[k].reshape(-1) for k in keys]).norm().item())
@@ -101,6 +108,25 @@ def _opcm_merge(deltas: list[dict[str, torch.Tensor]], keys: list[str], alpha: f
             else:
                 prev_lambda = 1.0
     return {k: merged[k].detach().cpu() for k in keys}
+
+
+def _opcm_merge(deltas: list[dict[str, torch.Tensor]], keys: list[str], alpha: float = 0.5) -> dict[str, torch.Tensor]:
+    """Verbatim OPCM (arXiv:2501.09522) continual SVD projection independently per active tower."""
+    out: dict[str, torch.Tensor] = {}
+    by_tw: dict[str, list[str]] = {}
+    for k in keys:
+        by_tw.setdefault(_tower_of(k), []).append(k)
+    for tw_keys in by_tw.values():
+        act = [d for d in deltas if sum(float(d[k].float().norm().item()) for k in tw_keys) > 1e-12]
+        if not act:
+            for k in tw_keys:
+                out[k] = torch.zeros_like(deltas[0][k].float().cpu())
+        elif len(act) == 1:
+            for k in tw_keys:
+                out[k] = act[0][k].float().cpu().clone()
+        else:
+            out.update(_opcm_merge_tower(act, tw_keys, alpha))
+    return out
 
 
 def _dop_factor_truncated(mat: torch.Tensor, svd_eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

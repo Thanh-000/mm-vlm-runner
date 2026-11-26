@@ -10,7 +10,9 @@ from mnarm.methods.subspace_merging import (
     _iso_c_matrix,
     _iso_cts_matrix,
     _knots_matrix,
+    _knots_merge,
     _opcm_merge,
+    _tower_group,
     _tsvm_merge_matrix,
     _wudi_merge,
 )
@@ -85,12 +87,27 @@ def merge_task_deltas(
             out[k] = scale * best
         return out
     if method == "ties20":
-        flat = torch.stack([torch.cat([d[k].float().cpu().reshape(-1) for k in keys]) for d in deltas])
-        merged_flat = _ties_merge_flat(flat, keep_frac=0.2)
-        sizes = [deltas[0][k].numel() for k in keys]
-        return {k: chunk.reshape_as(deltas[0][k]).float().cpu() for k, chunk in zip(keys, merged_flat.split(sizes))}
+        out = {}
+        by_tw: dict[str, list[str]] = {}
+        for k in keys:
+            by_tw.setdefault(_tower_group(k), []).append(k)
+        for tw_keys in by_tw.values():
+            act = [d for d in deltas if sum(float(d[k].float().norm().item()) for k in tw_keys) > 1e-12]
+            if not act:
+                for k in tw_keys:
+                    out[k] = torch.zeros_like(deltas[0][k].float().cpu())
+            elif len(act) == 1:
+                for k in tw_keys:
+                    out[k] = act[0][k].float().cpu().clone()
+            else:
+                flat = torch.stack([torch.cat([d[k].float().cpu().reshape(-1) for k in tw_keys]) for d in act])
+                merged_flat = 0.55 * _ties_merge_flat(flat, keep_frac=0.2)
+                sizes = [act[0][k].numel() for k in tw_keys]
+                for k, chunk in zip(tw_keys, merged_flat.split(sizes)):
+                    out[k] = chunk.reshape_as(act[0][k]).float().cpu()
+        return out
     if method == "knots":
-        return {k: _knots_matrix([d[k] for d in deltas], _ties_merge_flat) for k in keys}
+        return _knots_merge(deltas, keys, _ties_merge_flat)
     if method == "tsvm":
         return {k: _tsvm_merge_matrix([d[k] for d in deltas], rank_per_task=rank_per_task) for k in keys}
     if method == "iso_c":

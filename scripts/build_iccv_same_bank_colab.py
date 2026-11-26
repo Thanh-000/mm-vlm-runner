@@ -63,11 +63,11 @@ def build() -> None:
     cells = [
         _cell(
             """
-            # ICCV Same-Bank Benchmark — `Canonical CSS-CT` v2 across Multi-Altitude Disaster Benchmarks (dev-Only)
+            # ICCV Same-Bank Full-Suite Benchmark — `CSS-CT v2.2-fair` across 4 Multi-Altitude Benchmarks (`dev` + Confirmatory `test`)
 
-            Runs all **14 verbatim author merging operators** alongside **6 continual/VLM-CL/oracle tracks** on the **EXACT SAME source expert bank** across **5 information regimes** (`raw`, `gr_clip`, `unlab_center`, `zero_mnar` [`CSS-CT` Ours: 0 D_cal labels, 0 exemplars], `cal_bias` [100% D_cal]) with **Blackwell / A100 High-VRAM Turbo Mode** (`TF32` + contiguous VRAM tensor bank + `6–8` parallel workers).
+            Runs **all 4 full datasets** (`CrisisMMD` 18,082 rows, `DMD` UCI #456, `IncidentsVQA` incidents1m, `DisasterM3` NeurIPS'25) x **2 backbones** (`CLIP-B/16`, `SigLIP-B/16`) x **4 protocols** (`P1–P4`) on the **EXACT SAME source expert bank**: **14 verbatim author merging operators** alongside **7 continual/VLM-CL/oracle tracks** (`seq_magmax`, `mg_clip`, `pal_rls`, `joint_oracle`, etc.) across **7 regimes** (`raw`, `gr_clip`, `unlab_center`, `ncm`, `oas_lda`, `zero_mnar` [`CSS-CT` Ours: 0 D_cal labels, 0 exemplars], `cal_bias` [100% D_cal]).
 
-            - **Zero Base64 / GitHub-Backed Notebook:** Cell 2 clones the repository directly from GitHub (`~1s`), Cell 3 downloads the 4 pre-staged Google Drive archives via **16-connection `aria2c -x16 -s16`** into `/dev/shm`. Toggle `RUN_CRISISMMD = True` if you also want to re-run CrisisMMD.
+            - **Full-Dataset & Zero-Subsampling Execution:** Pre-warms HuggingFace models in parallel with **16-connection `aria2c -x16 -s16`** Drive/HF downloads into `/dev/shm`, verifies full split sizes (`0%` overlap) upfront, runs VRAM-safe parallel scheduling across Blackwell / A100 / L4, and saves an incremental checkpoint archive after every dataset.
             """,
             kind="markdown",
             cid="iccv-cell-0",
@@ -189,6 +189,7 @@ def build() -> None:
                 extract_contracts_from_a2z_zip,
                 hf_lfs_batch_download,
                 is_valid_binary_archive,
+                load_benchmark_contracts,
                 prepare_disaster_m3,
                 prepare_dmd,
                 prepare_incidents_vqa,
@@ -205,6 +206,20 @@ def build() -> None:
                     hf_tok = ""
             if not hf_tok:
                 os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+
+            def _prewarm_hf_models() -> None:
+                try:
+                    from huggingface_hub import snapshot_download
+                    hf_skip = ["*.msgpack", "*.h5", "*.ot", "tf_model*"]
+                    if RUN_CLIP:
+                        snapshot_download("openai/clip-vit-base-patch16", revision="57c216476eefef5ab752ec549e440a49ae4ae5f3", ignore_patterns=hf_skip)
+                    if RUN_SIGLIP:
+                        snapshot_download("google/siglip-base-patch16-224", revision="7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed", ignore_patterns=hf_skip)
+                except Exception as exc_hf:
+                    print(f"[WARN] HF snapshot pre-warm skipped: {{exc_hf}}", flush=True)
+
+            hf_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            hf_fut = hf_pool.submit(_prewarm_hf_models)
 
             def _extract_drive_id(url_in: str) -> str:
                 m = re.search(r"/file/d/([A-Za-z0-9_-]+)", url_in)
@@ -384,6 +399,14 @@ def build() -> None:
                 m3_dir = _prepare_from_link("disaster_m3", str(DISASTER_M3_ARCHIVE_URL), prepare_disaster_m3, lambda d: any(d.rglob("benchmark_release.json")) and any(d.rglob("*.png")))
                 DATASET_PATHS["disaster_m3"] = (m3_dir, m3_dir)
                 print("[READY] disaster_m3:", m3_dir, flush=True)
+
+            hf_fut.result()
+            hf_pool.shutdown(wait=True)
+            for ds_name, (seq_p, img_p) in DATASET_PATHS.items():
+                chk = load_benchmark_contracts(ds_name, seq_p, img_p, "P4", allow_test=bool(CONFIRM_FREEZE_TEST), seed=11)
+                n_tr = sum(len(s["fit"]) for s in chk["stages"]) + len(chk["stages"][-1]["calibration_latest_views"])
+                n_dv, n_ts = len(chk["dev"]), (len(chk["test"]) if chk.get("test") else 0)
+                print(f"[FULL-DATASET VERIFIED] {{ds_name}}: train+cal={{n_tr}} dev={{n_dv}} test={{n_ts}} lookup_total={{len(chk['lookup'])}}", flush=True)
             """,
             cid="iccv-cell-3",
         ),
@@ -409,25 +432,19 @@ def build() -> None:
                 "OMP_NUM_THREADS": "2",
                 "MKL_NUM_THREADS": "2",
                 "MNARM_TURBO_KERNELS": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
                 "HF_HUB_DISABLE_IMPLICIT_TOKEN": os.environ.get("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1" if not os.environ.get("HF_TOKEN") else "0"),
                 "PYTHONPATH": str(CODE_DIR / "src") + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else ""),
             }
-            try:
-                from huggingface_hub import snapshot_download
-                hf_skip = ["*.msgpack", "*.h5", "*.ot", "tf_model*"]
-                if RUN_CLIP:
-                    snapshot_download("openai/clip-vit-base-patch16", revision="57c216476eefef5ab752ec549e440a49ae4ae5f3", ignore_patterns=hf_skip)
-                if RUN_SIGLIP:
-                    snapshot_download("google/siglip-base-patch16-224", revision="7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed", ignore_patterns=hf_skip)
-            except Exception as exc_hf:
-                print(f"[WARN] HF snapshot pre-warm skipped: {exc_hf}", flush=True)
 
             print_lock = threading.Lock()
             sel_protos = [p for flag, p in ((RUN_P4, "P4"), (RUN_P3, "P3"), (RUN_P2, "P2"), (RUN_P1, "P1")) if flag]
             if not sel_protos or not DATASET_PATHS:
                 raise RuntimeError("Enable at least one dataset and one protocol.")
 
-            def _run_job(tag, cfg_rel, seq_p, img_p, out_sub, bb_name, protos_list=None, skip_suite=False):
+            from mnarm.runners.iccv_report import write_ecosystem_master_summary
+
+            def _run_job(tag, cfg_rel, seq_p, img_p, out_sub, bb_name, protos_list=None, skip_suite=False, force_resume=False):
                 out_path = OUT_DIR / out_sub
                 out_path.mkdir(parents=True, exist_ok=True)
                 p_args = list(protos_list or sel_protos)
@@ -441,7 +458,7 @@ def build() -> None:
                 ]
                 if CONFIRM_FREEZE_TEST:
                     cmd.append("--confirm-freeze")
-                if RESUME_COMPLETED or not skip_suite:
+                if RESUME_COMPLETED or force_resume:
                     cmd.append("--resume")
                 if skip_suite:
                     cmd.append("--skip-suite-summary")
@@ -458,9 +475,18 @@ def build() -> None:
                     raise RuntimeError(f"{tag} failed (exit={rc}). Last 40 lines:\\n" + "\\n".join(tail))
                 return out_sub, bb_name
 
-            vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-            sys_ram_gb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9) if hasattr(os, "sysconf") else 32.0
+            def _pack_results_zip(target_zip: Path) -> None:
+                tmp_z = target_zip.with_suffix(".tmp.zip")
+                with zipfile.ZipFile(tmp_z, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+                    for fp in sorted(OUT_DIR.rglob("*")):
+                        if fp.is_file():
+                            zout.write(fp, fp.relative_to(OUT_DIR).as_posix())
+                tmp_z.replace(target_zip)
+
+            vram_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            sys_ram_gib = ((os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024 ** 3)) if hasattr(os, "sysconf") else 32.0
             gpu_name = torch.cuda.get_device_name(0)
+            CKPT_ZIP = Path("/content/ICCV_CHECKPOINT_LATEST.zip")
             ran_jobs = []
             for ds_name, (seq_p, img_p) in DATASET_PATHS.items():
                 ds_jobs = []
@@ -472,28 +498,28 @@ def build() -> None:
                     ds_jobs.append((f"{ds_name.upper()}:SIGLIP", f"configs/iccv_{ds_name}_siglip.yaml", seq_p, img_p, sub, "siglip_b16"))
                 max_w = 1
                 if PARALLEL_BACKBONES:
-                    if vram_gb >= 85.0 and sys_ram_gb >= 64.0:
+                    if vram_gib >= 88.0 and sys_ram_gib >= 60.0:
                         max_w = 6 if ds_name == "crisismmd" else 8
-                    elif vram_gb >= 65.0 and sys_ram_gb >= 48.0:
-                        max_w = 6
-                    elif vram_gb >= 38.0 and sys_ram_gb >= 32.0:
-                        max_w = 4
-                    elif vram_gb >= 22.0 and sys_ram_gb >= 24.0:
-                        max_w = 2
+                    elif vram_gib >= 70.0 and sys_ram_gib >= 44.0:
+                        max_w = 4 if ds_name == "crisismmd" else 6
+                    elif vram_gib >= 36.0 and sys_ram_gib >= 28.0:
+                        max_w = 2 if ds_name == "crisismmd" else 4
+                    elif vram_gib >= 20.0 and sys_ram_gib >= 20.0:
+                        max_w = 1 if ds_name == "crisismmd" else 2
                 if max_w >= 4 and len(sel_protos) > 1:
                     proto_tasks = [
-                        (f"{tag}:{pr}", cfg_rel, seq_p2, img_p2, sub, bb, [pr], True)
+                        (f"{tag}:{pr}", cfg_rel, seq_p2, img_p2, sub, bb, [pr], True, False)
                         for tag, cfg_rel, seq_p2, img_p2, sub, bb in ds_jobs
                         for pr in sel_protos
                     ]
-                    print(f"[TURBO-PARALLEL:{ds_name}] Launching {len(proto_tasks)} tasks (max_workers={max_w}) on {gpu_name} ({vram_gb:.1f} GB VRAM)", flush=True)
+                    print(f"[TURBO-PARALLEL:{ds_name}] Launching {len(proto_tasks)} tasks (max_workers={max_w}) on {gpu_name} ({vram_gib:.1f} GiB VRAM)", flush=True)
                     with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as pool:
                         for fut in [pool.submit(_run_job, *t) for t in proto_tasks]:
                             fut.result()
                     for tag, cfg_rel, seq_p2, img_p2, sub, bb in ds_jobs:
-                        _run_job(f"{tag}:SUMMARY", cfg_rel, seq_p2, img_p2, sub, bb, sel_protos, False)
+                        _run_job(f"{tag}:SUMMARY", cfg_rel, seq_p2, img_p2, sub, bb, sel_protos, False, True)
                 elif max_w > 1 and len(ds_jobs) > 1:
-                    print(f"[PARALLEL:{ds_name}] Running CLIP + SigLIP ({','.join(sel_protos)}) on {gpu_name} ({vram_gb:.1f} GB VRAM)", flush=True)
+                    print(f"[PARALLEL:{ds_name}] Running CLIP + SigLIP ({','.join(sel_protos)}) on {gpu_name} ({vram_gib:.1f} GiB VRAM)", flush=True)
                     with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_w, len(ds_jobs))) as pool:
                         for fut in [pool.submit(_run_job, *j) for j in ds_jobs]:
                             fut.result()
@@ -501,8 +527,10 @@ def build() -> None:
                     for j in ds_jobs:
                         _run_job(*j)
                 ran_jobs.extend(ds_jobs)
+                write_ecosystem_master_summary(OUT_DIR)
+                _pack_results_zip(CKPT_ZIP)
+                print(f"[CHECKPOINT SAVED] {ds_name} -> {CKPT_ZIP} ({CKPT_ZIP.stat().st_size} bytes)", flush=True)
 
-            from mnarm.runners.iccv_report import write_ecosystem_master_summary
             master_md = write_ecosystem_master_summary(OUT_DIR)
             display(Markdown(master_md.read_text(encoding="utf8")))
             for _, _, _, _, out_sub, bb_name in ran_jobs:
@@ -515,10 +543,7 @@ def build() -> None:
                     display(IPyImage(filename=str(fig_png)))
 
             RES_ZIP = Path("/content/ICCV_FINAL_DEV_AND_TEST_RESULTS.zip" if CONFIRM_FREEZE_TEST else "/content/ICCV_SAME_BANK_DEV_RESULTS.zip")
-            with zipfile.ZipFile(RES_ZIP, "w", compression=zipfile.ZIP_DEFLATED) as zout:
-                for fp in sorted(OUT_DIR.rglob("*")):
-                    if fp.is_file():
-                        zout.write(fp, fp.relative_to(OUT_DIR).as_posix())
+            _pack_results_zip(RES_ZIP)
             print("[PACKAGED]", RES_ZIP, RES_ZIP.stat().st_size, "bytes")
             if AUTO_DOWNLOAD and colab_files is not None:
                 colab_files.download(str(RES_ZIP))

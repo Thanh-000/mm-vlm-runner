@@ -72,22 +72,21 @@ def run_single_protocol_same_bank(
     eff_eval_bs = max(int(config["eval_batch_size"]), 512) if (vlm.device == "cuda" and torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory >= 36 * (1024 ** 3)) else int(config["eval_batch_size"])
     b0_cache = base0_cache if base0_cache is not None else {"text": {}, "image": {}}
     ds = load_benchmark_contracts(str(config.get("dataset", "crisismmd")), seq_inputs, images_dir, config["protocol"], allow_test=allow_test, seed=seed)
-    lock_cfg = {**config, "allow_test": allow_test, **({"method_freeze": "CSS-CT-v2.1"} if allow_test else {})}
+    lock_cfg = {**config, "allow_test": allow_test, **({"method_freeze": "CSS-CT-v2.2-fair"} if allow_test else {})}
     out_dir.mkdir(parents=True, exist_ok=True)
     write_json_atomic(out_dir / "RUN_LOCK.json", build_run_lock(lock_cfg, repo_root=Path(__file__).resolve().parents[3], dataset_hashes=ds["hashes"]))
 
     st4 = ds["stages"][-1]
     seen = st4["seen_classes"]
     dev_rows = [r for r in ds["dev"] if int(r["label"]) in set(seen)]
-    extract_paired_features_cached_prewarm = True
-    del extract_paired_features_cached_prewarm
 
     exp_deltas: list[dict[str, torch.Tensor]] = []
-    bank, seq_bank, seq_lmnar_bank, seq_rep_bank, mg_bank = (
-        StreamingClassBank(), StreamingClassBank(), StreamingClassBank(), StreamingClassBank(), StreamingClassBank(),
+    seq_mm_deltas: list[dict[str, torch.Tensor]] = []
+    bank, seq_bank, seq_mm_bank, seq_lmnar_bank, seq_rep_bank, mg_bank, joint_bank = (
+        StreamingClassBank(), StreamingClassBank(), StreamingClassBank(), StreamingClassBank(), StreamingClassBank(), StreamingClassBank(), StreamingClassBank(),
     )
-    pal = PALRLSClassifier(vlm.embed_dim, len(ds["orig_prompts"]), lam=1.0, seed=seed)
-    seq_ft_state = seq_lmnar_state = seq_rep_state = mg_state = None
+    pal = PALRLSClassifier(vlm.embed_dim, len(ds["orig_prompts"]), lam=1.0, seed=seed, auto_lam=True)
+    seq_ft_state = seq_mm_state = seq_lmnar_state = seq_rep_state = mg_state = None
     mg_heads: dict[str, Any] = {}
     seen_so_far: list[int] = []
     t0 = time.perf_counter()
@@ -120,6 +119,16 @@ def run_single_protocol_same_bank(
         tf_sq = collect_train_features_by_modality(vlm=vlm, kind="lora", payload=seq_ft_state, records=st["fit"], tensor_store=store, batch_size=eff_eval_bs, use_amp=use_amp)
         seq_bank.update_stage(u_expert_t=tf_sq["text_x"], u_base_t=tf_b0["text_x"], y_t=tf_sq["text_y"], u_expert_i=tf_sq["image_x"], u_base_i=tf_b0["image_x"], y_i=tf_sq["image_y"], paired_base_t=tf_b0["paired_t"], paired_base_i=tf_b0["paired_i"])
 
+        seq_mm_state, _ = train_lora_stage(
+            vlm=vlm, init_lora=seq_mm_state, records=st["fit"], protos_full=protos_full, seen_classes=new_c,
+            objective="std_ce", stage_idx=t, epochs=int(config["epochs"]),
+            effective_batch_size=int(config["effective_batch_size"]), micro_batch_size=int(config["micro_batch_size"]),
+            lr=float(config["lr"]), weight_decay=float(config["weight_decay"]), seed=seed + 1250, use_amp=use_amp, tensor_store=store,
+        )
+        seq_mm_deltas.append(vlm.extract_lora_delta(seq_mm_state))
+        tf_smm = collect_train_features_by_modality(vlm=vlm, kind="lora", payload=seq_mm_state, records=st["fit"], tensor_store=store, batch_size=eff_eval_bs, use_amp=use_amp)
+        seq_mm_bank.update_stage(u_expert_t=tf_smm["text_x"], u_base_t=tf_b0["text_x"], y_t=tf_smm["text_y"], u_expert_i=tf_smm["image_x"], u_base_i=tf_b0["image_x"], y_i=tf_smm["image_y"], paired_base_t=tf_b0["paired_t"], paired_base_i=tf_b0["paired_i"])
+
         seq_lmnar_state, _ = train_lora_stage(
             vlm=vlm, init_lora=seq_lmnar_state, records=st["fit"], protos_full=protos_full, seen_classes=seen_so_far,
             objective="l_mnar", stage_idx=t, epochs=int(config["epochs"]),
@@ -141,12 +150,13 @@ def run_single_protocol_same_bank(
         seq_rep_bank.update_stage(u_expert_t=tf_sr["text_x"], u_base_t=tf_b0_rep["text_x"], y_t=tf_sr["text_y"], u_expert_i=tf_sr["image_x"], u_base_i=tf_b0_rep["image_x"], y_i=tf_sr["image_y"], paired_base_t=tf_b0_rep["paired_t"], paired_base_i=tf_b0_rep["paired_i"])
 
         if bool(config.get("include_mg_clip", True)):
+            mg_lr = float(config.get("mg_clip_lr", max(float(config["lr"]), 5e-4)))
             mg_state, mg_heads = train_mg_clip_stage(
                 vlm=vlm, prev_state=mg_state, mg_heads=mg_heads, records=st["fit"], protos_full=protos_full,
                 old_classes=old_c, new_classes=new_c, stage_idx=t, epochs=int(config["epochs"]),
                 effective_batch_size=int(config["effective_batch_size"]), micro_batch_size=int(config["micro_batch_size"]),
-                lr=float(config["lr"]), weight_decay=float(config["weight_decay"]), seed=seed + 3000, use_amp=use_amp, tensor_store=store,
-                eval_batch_size=eff_eval_bs,
+                lr=mg_lr, weight_decay=float(config["weight_decay"]), seed=seed + 3000, use_amp=use_amp, tensor_store=store,
+                eval_batch_size=eff_eval_bs, orig_prompts=ds["orig_prompts"],
             )
             tf_mg = collect_train_features_by_modality(vlm=vlm, kind="lora", payload=mg_state, records=st["fit"], tensor_store=store, batch_size=eff_eval_bs, use_amp=use_amp)
             mg_bank.update_stage(u_expert_t=tf_mg["text_x"], u_base_t=tf_b0["text_x"], y_t=tf_mg["text_y"], u_expert_i=tf_mg["image_x"], u_base_i=tf_b0["image_x"], y_i=tf_mg["image_y"], paired_base_t=tf_b0["paired_t"], paired_base_i=tf_b0["paired_i"])
@@ -159,6 +169,9 @@ def run_single_protocol_same_bank(
         effective_batch_size=int(config["effective_batch_size"]), micro_batch_size=int(config["micro_batch_size"]),
         lr=float(config["lr"]), weight_decay=float(config["weight_decay"]), seed=seed + 4000, use_amp=use_amp, tensor_store=store,
     )
+    tf_jn = collect_train_features_by_modality(vlm=vlm, kind="lora", payload=joint_state, records=joint_recs, tensor_store=store, batch_size=eff_eval_bs, use_amp=use_amp)
+    tf_b0_jn = _cached_base0_features(vlm, joint_recs, store, eff_eval_bs, use_amp, b0_cache)
+    joint_bank.update_stage(u_expert_t=tf_jn["text_x"], u_base_t=tf_b0_jn["text_x"], y_t=tf_jn["text_y"], u_expert_i=tf_jn["image_x"], u_base_i=tf_b0_jn["image_x"], y_i=tf_jn["image_y"], paired_base_t=tf_b0_jn["paired_t"], paired_base_i=tf_b0_jn["paired_i"])
 
     _, _, cal0_fx = collect_masked_cal_bundle(
         vlm=vlm, kind="lora", payload={}, cal_recs=st4["calibration_latest_views"], store=store,
@@ -167,10 +180,10 @@ def run_single_protocol_same_bank(
 
     common_eval = dict(
         ds=ds, seen=seen, exp_deltas=exp_deltas, bank=bank, seq_ft_state=seq_ft_state, seq_bank=seq_bank,
-        seq_lmnar_state=seq_lmnar_state, seq_lmnar_bank=seq_lmnar_bank, seq_rep_state=seq_rep_state, seq_rep_bank=seq_rep_bank,
-        mg_state=mg_state, mg_bank=mg_bank, mg_heads=mg_heads, joint_state=joint_state, joint_recs=joint_recs, pal=pal,
-        cal0_fx=cal0_fx, vlm=vlm, protos_full=protos_full, unseen_protos_full=unseen_protos_full, store=store,
-        eff_eval_bs=eff_eval_bs, use_amp=use_amp,
+        seq_mm_deltas=seq_mm_deltas, seq_mm_bank=seq_mm_bank, seq_lmnar_state=seq_lmnar_state, seq_lmnar_bank=seq_lmnar_bank,
+        seq_rep_state=seq_rep_state, seq_rep_bank=seq_rep_bank, mg_state=mg_state, mg_bank=mg_bank, mg_heads=mg_heads,
+        joint_state=joint_state, joint_recs=joint_recs, joint_bank=joint_bank, pal=pal, cal0_fx=cal0_fx,
+        vlm=vlm, protos_full=protos_full, unseen_protos_full=unseen_protos_full, store=store, eff_eval_bs=eff_eval_bs, use_amp=use_amp,
     )
     payload_out = evaluate_protocol_split(config={**config, "allow_test": False}, eval_rows=dev_rows, split_name="dev", feat_cache=dev_cache, **common_eval)
     write_json_atomic(out_dir / "ICCV_PROTOCOL_RESULTS.json", payload_out)
@@ -189,9 +202,13 @@ def _is_v21_valid(p_json: Path) -> dict[str, Any] | None:
     if not p_json.is_file():
         return None
     cached_p = json.loads(p_json.read_text(encoding="utf8"))
-    tsvm_rg = cached_p.get("arms", {}).get("tsvm", {}).get("regimes", {})
+    arms = cached_p.get("arms", {})
+    tsvm_rg = arms.get("tsvm", {}).get("regimes", {})
     ok = (
         cached_p.get("schema") == "mnarm-iccv-protocol-v2"
+        and "seq_magmax" in arms
+        and "ncm" in tsvm_rg
+        and "oas_lda" in tsvm_rg
         and "balanced_ece" in tsvm_rg.get("raw", {}).get("paired", {})
         and "cone_scale_p" in tsvm_rg.get("zero_mnar", {}).get("diagnostics", {}).get("towers", {}).get("text", {})
     )

@@ -17,7 +17,8 @@ epochs: 5
 effective_batch_size: 64
 micro_batch_size: 64
 eval_batch_size: 256
-lr: 3.0e-5
+lr: 3.0e-4
+mg_clip_lr: 5.0e-4
 weight_decay: 1.0e-4
 max_cached_images: 25000
 workers: 0

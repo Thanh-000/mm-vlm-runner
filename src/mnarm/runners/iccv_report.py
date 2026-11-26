@@ -9,10 +9,12 @@ from mnarm.core import write_json_atomic
 from mnarm.eval import generate_iccv_suite_figures
 from mnarm.methods import ALL_MERGE_METHODS
 
-SEQ_ORACLE_ARMS = ("seq_ft", "seq_lmnar", "seq_replay256", "mg_clip", "pal_rls", "joint_oracle")
+SEQ_ORACLE_ARMS = ("seq_ft", "seq_magmax", "seq_lmnar", "seq_replay256", "mg_clip", "pal_rls", "joint_oracle")
 ARM_REGIME_TAG = {
     **{m: "Weight-Only -> Merge" for m in ALL_MERGE_METHODS},
+    "magmax": "MaxAbs-Ind (s=0.5) -> Merge",
     "seq_ft": "Sequential (0 Replay)",
+    "seq_magmax": "Continual Merging SOTA (ECCV'24)",
     "seq_lmnar": "Sequential L_MNAR (0 Replay)",
     "seq_replay256": "Sequential (Buffer<=256)",
     "mg_clip": "VLM-CL SOTA (ICCV'25)",
@@ -31,12 +33,12 @@ def render_protocol_report(results: dict[str, Any], out_path: Path) -> None:
     cfg = results["config"]
     ds_name = str(cfg.get("dataset", "crisismmd"))
     split_name = str(results.get("split", "dev"))
-    split_tag = "Confirmatory Test, Frozen CSS-CT v2.1" if split_name == "test" else "dev-Only, Strict Layer Isolation"
+    split_tag = "Confirmatory Test, Frozen CSS-CT v2.2-fair" if split_name == "test" else "dev-Only, Strict Layer Isolation"
     lines = [
         f"# ICCV Same-Bank Report — {ds_name} {cfg['backbone']} {cfg['protocol']} ({split_tag})\n",
-        "- **Regimes:** `raw` · `gr_clip` (NeurIPS'25, 0-label) · `unlab_center` (0-label) · `zero_mnar` (**CSS-CT Ours: 0 D_cal labels, 0 exemplars**) · `cal_bias` (100% D_cal labels)\n",
-        "| Arm | Track / Privilege | Raw (P) | +GR-CLIP (P) | +unlab (P) | +cal (P) | **+CSS-CT (P)** | +CSS-CT 3-View | Early Rec (Raw->CSS) | ECE (CSS) | Unseen OOD (Raw->Re) | I->T R@1 (Raw->Re) | thT/thI |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---|---:|---|---|---:|",
+        "- **Regimes:** `raw` · `gr_clip` (NeurIPS'25, 0-label) · `unlab_center` (0-label) · `ncm` / `oas_lda` (0 D_cal fair head) · `zero_mnar` (**CSS-CT Ours: 0 D_cal labels, 0 exemplars**) · `cal_bias` (100% D_cal labels)\n",
+        "| Arm | Track / Privilege | Raw (P) | +GR-CLIP (P) | +unlab (P) | +NCM (P) | +OAS-LDA (P) | +cal (P) | **+CSS-CT (P)** | +CSS-CT 3-View | Early Rec (Raw->CSS) | ECE (CSS) | Unseen OOD (Raw->Re) | I->T R@1 (Raw->Re) | thT/thI |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---|---|---:|",
     ]
     for arm in list(ALL_MERGE_METHODS) + list(SEQ_ORACLE_ARMS):
         arec = results["arms"].get(arm)
@@ -53,8 +55,8 @@ def render_protocol_report(results: dict[str, Any], out_path: Path) -> None:
         r1_re = enc.get("retrieval_reanchored", enc["retrieval"])["i2t_r1"] * 100.0
         lines.append(
             f"| `{arm}` | {ARM_REGIME_TAG[arm]} | {_pf1(arec, 'raw')} | {_pf1(arec, 'gr_clip')} | {_pf1(arec, 'unlab_center')} | "
-            f"{_pf1(arec, 'cal_bias')} | **{_pf1(arec, 'zero_mnar')}** | {zn_r['summary']['view3_mean_f1']*100:.2f} | "
-            f"{er_str} | {zn_r['paired']['ece']:.3f} | {enc['unseen_prompt_paired_f1']*100:.2f}->{ood_re*100:.2f} | "
+            f"{_pf1(arec, 'ncm')} | {_pf1(arec, 'oas_lda')} | {_pf1(arec, 'cal_bias')} | **{_pf1(arec, 'zero_mnar')}** | "
+            f"{zn_r['summary']['view3_mean_f1']*100:.2f} | {er_str} | {zn_r['paired']['ece']:.3f} | {enc['unseen_prompt_paired_f1']*100:.2f}->{ood_re*100:.2f} | "
             f"{r1_raw:.2f}->{r1_re:.2f} | {th_t:.1f}/{th_i:.1f} |"
         )
 
@@ -88,12 +90,12 @@ def write_same_bank_suite_outputs(
     is_test = str(split_name) == "test"
     split_hdr = "`test` Confirmatory, Same Source Bank" if is_test else "`dev`, Same Source Bank"
     protos = [p for p in ("P1", "P2", "P3", "P4") if p in per_proto] + [p for p in per_proto if p not in ("P1", "P2", "P3", "P4")]
-    hdr_cols = " | ".join(f"{p} (Raw / +GR / +cal / **CSS-CT**)" for p in protos)
+    hdr_cols = " | ".join(f"{p} (Raw / +NCM / +cal / **CSS-CT**)" for p in protos)
     sep_cols = " | ".join("---:" for _ in protos)
     lines = [
         f"# ICCV Same-Bank Summary — {ds_name} {backbone} ({split_hdr})\n",
         f"- **Protocols:** `{', '.join(protos)}` | **Zero `D_cal` labels & O(|Y|d + d^2) moments** in `CSS-CT` (`zero_mnar`)\n",
-        f"| Arm | {hdr_cols} | Mean (Raw / +GR / +cal / **CSS-CT**) |",
+        f"| Arm | {hdr_cols} | Mean (Raw / +NCM / +cal / **CSS-CT**) |",
         f"|---|{sep_cols}|---:|",
     ]
     tex_rows: list[str] = []
@@ -103,33 +105,33 @@ def write_same_bank_suite_outputs(
     }
 
     for arm in list(ALL_MERGE_METHODS) + list(SEQ_ORACLE_ARMS):
-        cells, raw_vals, gr_vals, cal_vals, our_vals, tex_cells = [], [], [], [], [], []
+        cells, raw_vals, ncm_vals, cal_vals, our_vals, tex_cells = [], [], [], [], [], []
         for p in protos:
             arec = per_proto[p]["arms"].get(arm)
             if not arec:
-                cells.append("--"); tex_cells.extend(["--", "--", "--"]); continue
+                cells.append("--"); tex_cells.extend(["--", "--", "--", "--"]); continue
             r0 = arec["regimes"]["raw"]["paired"]["macro_f1"] * 100.0
-            rg = arec["regimes"]["gr_clip"]["paired"]["macro_f1"] * 100.0 if "gr_clip" in arec["regimes"] else float("nan")
+            rn = arec["regimes"]["ncm"]["paired"]["macro_f1"] * 100.0 if "ncm" in arec["regimes"] else float("nan")
             r2 = arec["regimes"]["cal_bias"]["paired"]["macro_f1"] * 100.0 if "cal_bias" in arec["regimes"] else float("nan")
             r1 = arec["regimes"]["zero_mnar"]["paired"]["macro_f1"] * 100.0 if "zero_mnar" in arec["regimes"] else float("nan")
             raw_vals.append(r0)
-            if rg == rg:
-                gr_vals.append(rg)
+            if rn == rn:
+                ncm_vals.append(rn)
             if r2 == r2:
                 cal_vals.append(r2)
             if r1 == r1:
                 our_vals.append(r1)
-            rg_s, r2_s, r1_s = (f"{rg:.2f}" if rg == rg else "--"), (f"{r2:.2f}" if r2 == r2 else "--"), (f"**{r1:.2f}**" if r1 == r1 else "--")
-            cells.append(f"{r0:.2f} / {rg_s} / {r2_s} / {r1_s}")
-            tex_cells.extend([f"{r0:.2f}", r2_s, f"\\textbf{{{r1:.2f}}}" if r1 == r1 else "--"])
+            rn_s, r2_s, r1_s = (f"{rn:.2f}" if rn == rn else "--"), (f"{r2:.2f}" if r2 == r2 else "--"), (f"**{r1:.2f}**" if r1 == r1 else "--")
+            cells.append(f"{r0:.2f} / {rn_s} / {r2_s} / {r1_s}")
+            tex_cells.extend([f"{r0:.2f}", rn_s, r2_s, f"\\textbf{{{r1:.2f}}}" if r1 == r1 else "--"])
         m_raw = f"{sum(raw_vals)/len(raw_vals):.2f}" if raw_vals else "--"
-        m_gr = f"{sum(gr_vals)/len(gr_vals):.2f}" if gr_vals else "--"
+        m_ncm = f"{sum(ncm_vals)/len(ncm_vals):.2f}" if ncm_vals else "--"
         m_cal = f"{sum(cal_vals)/len(cal_vals):.2f}" if cal_vals else "--"
         m_our = f"**{sum(our_vals)/len(our_vals):.2f}**" if our_vals else "--"
-        lines.append(f"| `{arm}` | {' | '.join(cells)} | {m_raw} / {m_gr} / {m_cal} / {m_our} |")
+        lines.append(f"| `{arm}` | {' | '.join(cells)} | {m_raw} / {m_ncm} / {m_cal} / {m_our} |")
         tex_label = arm.replace("_", "\\_")
         m_our_tex = f"\\textbf{{{sum(our_vals)/len(our_vals):.2f}}}" if our_vals else "--"
-        tex_rows.append(f"\\texttt{{{tex_label}}} & {' & '.join(tex_cells)} & {m_raw} & {m_cal} & {m_our_tex} \\\\")
+        tex_rows.append(f"\\texttt{{{tex_label}}} & {' & '.join(tex_cells)} & {m_raw} & {m_ncm} & {m_cal} & {m_our_tex} \\\\")
         if arm == ALL_MERGE_METHODS[-1]:
             tex_rows.append("\\midrule")
 
@@ -139,9 +141,9 @@ def write_same_bank_suite_outputs(
     suf = "_TEST" if is_test else ""
     (out_dir / f"ICCV_SAME_BANK_{backbone}{suf}_SUMMARY.md").write_text(md_text, encoding="utf8")
 
-    tex_cols = "l" + "rrr" * len(protos) + "rrr"
-    p_hdr = " & ".join(f"\\multicolumn{{3}}{{c}}{{{p}}}" for p in protos) + " & \\multicolumn{3}{c}{Mean}"
-    sub_hdr = " & ".join("Raw & +cal & CSS-CT" for _ in range(len(protos) + 1))
+    tex_cols = "l" + "rrrr" * len(protos) + "rrrr"
+    p_hdr = " & ".join(f"\\multicolumn{{4}}{{c}}{{{p}}}" for p in protos) + " & \\multicolumn{4}{c}{Mean}"
+    sub_hdr = " & ".join("Raw & +NCM & +cal & CSS-CT" for _ in range(len(protos) + 1))
     tex_body = "\n".join([
         f"% Auto-generated booktabs table ({split_name} Paired Macro-F1 % across identical expert bank)",
         f"\\begin{{tabular}}{{{tex_cols}}}",
@@ -180,10 +182,10 @@ def write_ecosystem_master_summary(out_root: Path) -> Path:
                 p_jsons = [(p, sdir / f"{bb}_{p.lower()}" / fname) for p in ("P1", "P2", "P3", "P4") if (sdir / f"{bb}_{p.lower()}" / fname).is_file()]
                 if not p_jsons:
                     continue
-                vals = {k: [] for k in ("raw", "gr_clip", "unlab_center", "cal_bias", "zero_mnar")}
-                v3 = {k: [] for k in ("cal_bias", "zero_mnar")}
-                wins = {"raw": 0, "gr_clip": 0, "cal_bias": 0, "tot": 0}
-                refs = {k: [] for k in ("tsvm_css", "lmnar_css", "mg_clip", "pal_rls", "joint_raw")}
+                vals = {k: [] for k in ("raw", "gr_clip", "unlab_center", "ncm", "oas_lda", "cal_bias", "zero_mnar")}
+                v3 = {k: [] for k in ("ncm", "cal_bias", "zero_mnar")}
+                wins = {"raw": 0, "gr_clip": 0, "ncm": 0, "cal_bias": 0, "tot": 0}
+                refs = {k: [] for k in ("tsvm_css", "seq_mm_ncm", "lmnar_css", "mg_clip", "pal_rls", "joint_ncm")}
                 for _, jp in p_jsons:
                     res = json.loads(jp.read_text(encoding="utf8"))
                     arms = res.get("arms", {})
@@ -191,48 +193,55 @@ def write_ecosystem_master_summary(out_root: Path) -> Path:
                         rg = arms[m]["regimes"]
                         zp = rg["zero_mnar"]["paired"]["macro_f1"]
                         wins["tot"] += 1
-                        for wk in ("raw", "gr_clip", "cal_bias"):
-                            if zp > rg[wk]["paired"]["macro_f1"]:
+                        for wk in ("raw", "gr_clip", "ncm", "cal_bias"):
+                            if wk in rg and zp > rg[wk]["paired"]["macro_f1"]:
                                 wins[wk] += 1
                         for k in vals:
-                            vals[k].append(rg[k]["paired"]["macro_f1"] * 100.0)
+                            if k in rg:
+                                vals[k].append(rg[k]["paired"]["macro_f1"] * 100.0)
                         for k in v3:
-                            v3[k].append(rg[k]["summary"]["view3_mean_f1"] * 100.0)
+                            if k in rg:
+                                v3[k].append(rg[k]["summary"]["view3_mean_f1"] * 100.0)
                     refs["tsvm_css"].append(arms["tsvm"]["regimes"]["zero_mnar"]["paired"]["macro_f1"] * 100.0)
+                    if "seq_magmax" in arms:
+                        mm_rg = arms["seq_magmax"]["regimes"]
+                        refs["seq_mm_ncm"].append((mm_rg.get("ncm") or mm_rg["raw"])["paired"]["macro_f1"] * 100.0)
                     refs["lmnar_css"].append(arms["seq_lmnar"]["regimes"]["zero_mnar"]["paired"]["macro_f1"] * 100.0)
                     if "mg_clip" in arms:
                         refs["mg_clip"].append(arms["mg_clip"]["regimes"]["raw"]["paired"]["macro_f1"] * 100.0)
                     if "pal_rls" in arms:
                         refs["pal_rls"].append(arms["pal_rls"]["regimes"]["raw"]["paired"]["macro_f1"] * 100.0)
-                    refs["joint_raw"].append(arms["joint_oracle"]["regimes"]["raw"]["paired"]["macro_f1"] * 100.0)
+                    jn_rg = arms["joint_oracle"]["regimes"]
+                    refs["joint_ncm"].append((jn_rg.get("ncm") or jn_rg["raw"])["paired"]["macro_f1"] * 100.0)
                 avg = lambda xs: (sum(xs) / len(xs)) if xs else 0.0
                 master_data[sp].append({
                     "dataset": ds, "backbone": bb, "n_protocols": len(p_jsons),
                     "raw": avg(vals["raw"]), "gr_clip": avg(vals["gr_clip"]), "unlab_center": avg(vals["unlab_center"]),
+                    "ncm": avg(vals["ncm"]), "oas_lda": avg(vals["oas_lda"]),
                     "cal_bias": avg(vals["cal_bias"]), "css_ct": avg(vals["zero_mnar"]),
                     "v3_cal": avg(v3["cal_bias"]), "v3_css": avg(v3["zero_mnar"]),
                     "wins": wins, **{k: avg(v) for k, v in refs.items()},
                 })
 
-    md_lines = ["# ICCV 4-Benchmark Multi-Altitude Ecosystem Master Summary (`CSS-CT` v2.1)\n"]
-    tex_lines = ["% Auto-generated 4-benchmark ICCV Master Booktabs Table", "\\begin{tabular}{llrrrrrrrrrr}", "\\toprule", "Split / Dataset & Backbone & Raw & +GR & +cal & **CSS-CT** & 3V-cal & 3V-CSS & TSV+CSS & MG-CLIP & PAL-RLS & Joint \\\\", "\\midrule"]
+    md_lines = ["# ICCV 4-Benchmark Multi-Altitude Ecosystem Master Summary (`CSS-CT` v2.2-fair)\n"]
+    tex_lines = ["% Auto-generated 4-benchmark ICCV Master Booktabs Table", "\\begin{tabular}{llrrrrrrrrrrrr}", "\\toprule", "Split / Dataset & Backbone & Raw & +GR & +NCM & +OAS & +cal & **CSS-CT** & TSV+CSS & SeqMM+NCM & MG-CLIP & PAL-RLS & Joint+NCM \\\\", "\\midrule"]
     for sp in ("test", "dev"):
         rows = master_data[sp]
         if not rows:
             continue
         md_lines.append(f"## Split: `{sp}` ({'Confirmatory Frozen Test' if sp == 'test' else 'Validation Dev'})\n")
-        md_lines.append("| Dataset | Backbone | Raw | +GR-CLIP | +unlab | +cal (100% D_cal) | **CSS-CT (0 D_cal)** | 3-View (+cal -> CSS) | Wins (vs Raw / GR / cal) | TSV+CSS | LMNAR+CSS | MG-CLIP | PAL-RLS | Joint |")
-        md_lines.append("|---|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|")
+        md_lines.append("| Dataset | Backbone | Raw | +GR-CLIP | +NCM (0 D_cal) | +OAS-LDA (0 D_cal) | +cal (100% D_cal) | **CSS-CT (0 D_cal)** | 3-View (+cal -> CSS) | Wins (vs Raw / NCM / cal) | TSV+CSS | SeqMM+NCM | LMNAR+CSS | MG-CLIP | PAL-RLS | Joint+NCM |")
+        md_lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|")
         for r in rows:
             w = r["wins"]
             md_lines.append(
-                f"| `{r['dataset']}` | `{r['backbone']}` | {r['raw']:.2f} | {r['gr_clip']:.2f} | {r['unlab_center']:.2f} | {r['cal_bias']:.2f} | **{r['css_ct']:.2f}** | "
-                f"{r['v3_cal']:.2f} -> **{r['v3_css']:.2f}** | {w['raw']}/{w['tot']} · {w['gr_clip']}/{w['tot']} · {w['cal_bias']}/{w['tot']} | "
-                f"{r['tsvm_css']:.2f} | {r['lmnar_css']:.2f} | {r['mg_clip']:.2f} | {r['pal_rls']:.2f} | {r['joint_raw']:.2f} |"
+                f"| `{r['dataset']}` | `{r['backbone']}` | {r['raw']:.2f} | {r['gr_clip']:.2f} | {r['ncm']:.2f} | {r['oas_lda']:.2f} | {r['cal_bias']:.2f} | **{r['css_ct']:.2f}** | "
+                f"{r['v3_cal']:.2f} -> **{r['v3_css']:.2f}** | {w['raw']}/{w['tot']} · {w['ncm']}/{w['tot']} · {w['cal_bias']}/{w['tot']} | "
+                f"{r['tsvm_css']:.2f} | {r['seq_mm_ncm']:.2f} | {r['lmnar_css']:.2f} | {r['mg_clip']:.2f} | {r['pal_rls']:.2f} | {r['joint_ncm']:.2f} |"
             )
             ds_tex, bb_tex = r["dataset"].replace("_", "\\_"), r["backbone"].replace("_", "\\_")
             tex_lines.append(
-                f"{sp}:\\texttt{{{ds_tex}}} & \\texttt{{{bb_tex}}} & {r['raw']:.2f} & {r['gr_clip']:.2f} & {r['cal_bias']:.2f} & \\textbf{{{r['css_ct']:.2f}}} & {r['v3_cal']:.2f} & \\textbf{{{r['v3_css']:.2f}}} & {r['tsvm_css']:.2f} & {r['mg_clip']:.2f} & {r['pal_rls']:.2f} & {r['joint_raw']:.2f} \\\\"
+                f"{sp}:\\texttt{{{ds_tex}}} & \\texttt{{{bb_tex}}} & {r['raw']:.2f} & {r['gr_clip']:.2f} & {r['ncm']:.2f} & {r['oas_lda']:.2f} & {r['cal_bias']:.2f} & \\textbf{{{r['css_ct']:.2f}}} & {r['tsvm_css']:.2f} & {r['seq_mm_ncm']:.2f} & {r['mg_clip']:.2f} & {r['pal_rls']:.2f} & {r['joint_ncm']:.2f} \\\\"
             )
         md_lines.append("")
     tex_lines.extend(["\\bottomrule", "\\end{tabular}", ""])
