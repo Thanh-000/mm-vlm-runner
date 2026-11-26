@@ -16,6 +16,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 OUT_NB = ROOT / "colab" / "ICCV_SameBank_ZeroMNAR_ColabWeb.ipynb"
 OUT_ZIP = ROOT / "colab" / "mnarm_iccv_same_bank_code.zip"
+ASSETS_XZ = ROOT / "assets" / "crisismmd_contracts_json.tar.xz"
+DEFAULT_GIT_URL = "https://github.com/Thanh-000/mm-vlm-runner.git"
 
 CRISISMMA_HF_REV = "10a5626ba112ab9c50369c473a2062bcf205d708"
 
@@ -42,63 +44,63 @@ def _pack_repo_zip(zip_path: Path) -> tuple[str, str]:
     return hashlib.sha256(raw).hexdigest(), base64.b64encode(raw).decode("ascii")
 
 
-def _pack_contracts_xz() -> tuple[str, str]:
+def _ensure_contracts_xz() -> Path:
     zp = ROOT / "colab" / "crisismmd_p1_p4_contracts.zip"
-    if not zp.is_file():
-        return "", ""
-    buf = io.BytesIO()
-    with zipfile.ZipFile(zp) as zf, tarfile.open(fileobj=buf, mode="w:xz", preset=9) as tf:
-        for nm in ("CONTRACT_SHA256.json", "manifest.json", "PLANS.json", "partition_contract.json"):
-            raw = zf.read(nm)
-            ti = tarfile.TarInfo(nm)
-            ti.size = len(raw)
-            tf.addfile(ti, io.BytesIO(raw))
-    raw_xz = buf.getvalue()
-    return hashlib.sha256(raw_xz).hexdigest(), base64.b64encode(raw_xz).decode("ascii")
+    if zp.is_file() and not ASSETS_XZ.is_file():
+        ASSETS_XZ.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zp) as zf, tarfile.open(ASSETS_XZ, mode="w:xz", preset=9) as tf:
+            for nm in ("CONTRACT_SHA256.json", "manifest.json", "PLANS.json", "partition_contract.json"):
+                raw = zf.read(nm)
+                ti = tarfile.TarInfo(nm)
+                ti.size = len(raw)
+                tf.addfile(ti, io.BytesIO(raw))
+    return ASSETS_XZ
 
 
 def build() -> None:
     code_sha, code_b64 = _pack_repo_zip(OUT_ZIP)
-    cxz_sha, cxz_b64 = _pack_contracts_xz()
+    _ensure_contracts_xz()
     cells = [
         _cell(
             """
             # ICCV Same-Bank Benchmark — `Canonical CSS-CT` v2 across Multi-Altitude Disaster Benchmarks (dev-Only)
 
-            Runs all **14 verbatim author merging operators** alongside **6 continual/VLM-CL/oracle tracks** on the **EXACT SAME source expert bank** across **5 information regimes** (`raw`, `gr_clip`, `unlab_center`, `zero_mnar` [`CSS-CT` Ours: 0 D_cal labels, 0 exemplars], `cal_bias` [100% D_cal]) with **Blackwell / A100 High-VRAM Turbo Mode** (`VRAM >= 36 GB` GPU tensor pre-staging + batched GPU DOP + `use_fast=True`).
+            Runs all **14 verbatim author merging operators** alongside **6 continual/VLM-CL/oracle tracks** on the **EXACT SAME source expert bank** across **5 information regimes** (`raw`, `gr_clip`, `unlab_center`, `zero_mnar` [`CSS-CT` Ours: 0 D_cal labels, 0 exemplars], `cal_bias` [100% D_cal]) with **Blackwell / A100 High-VRAM Turbo Mode** (`TF32` + contiguous VRAM tensor bank + `6–8` parallel workers).
 
-            - **100% Unattended 4-Dataset Execution (Zero Upload / Zero Drive Mount):** All **4 verified Google Drive archives** (`CrisisMMD` + `DMD` + `DisasterVQA-Incidents` + `DisasterM3`) and SHA-256 `CrisisMMD` P1–P4 contracts are pre-integrated. Just click **Runtime -> Run all**; Cell 3 pulls all 4 benchmarks into `/dev/shm` via **16-connection `aria2c -x16 -s16`**.
+            - **Zero Base64 / GitHub-Backed Notebook:** Cell 2 clones the repository directly from GitHub (`~1s`), Cell 3 downloads the 4 pre-staged Google Drive archives via **16-connection `aria2c -x16 -s16`** into `/dev/shm`. Toggle `RUN_CRISISMMD = True` if you also want to re-run CrisisMMD.
             """,
             kind="markdown",
             cid="iccv-cell-0",
         ),
         _cell(
-            """
-            #@title Configuration { display-mode: "form" }
-            RUN_CRISISMMD = True  # @param {type:"boolean"}
-            RUN_DMD = True  # @param {type:"boolean"}
-            RUN_INCIDENTS_VQA = True  # @param {type:"boolean"}
-            RUN_DISASTER_M3 = True  # @param {type:"boolean"}
-            RUN_CLIP = True  # @param {type:"boolean"}
-            RUN_SIGLIP = True  # @param {type:"boolean"}
-            PARALLEL_BACKBONES = True  # @param {type:"boolean"}
-            RUN_P4 = True  # @param {type:"boolean"}
-            RUN_P3 = True  # @param {type:"boolean"}
-            RUN_P2 = True  # @param {type:"boolean"}
-            RUN_P1 = True  # @param {type:"boolean"}
-            RESUME_COMPLETED = True  # @param {type:"boolean"}
-            A2Z_INPUTS_URL = ""  # @param {type:"string"}
-            CRISISMMA_TAR_URL = "https://drive.google.com/uc?id=1wOJzIezlrH-o2LmWHtcxv8KdAKL6a7K6&export=download"  # @param {type:"string"}
-            DMD_ARCHIVE_URL = "https://drive.google.com/uc?id=1_1Bn0dHKqZ7sk4r2mVcShoQlvgZXcPL0&export=download"  # @param {type:"string"}
-            INCIDENTS_VQA_ARCHIVE_URL = "https://drive.google.com/uc?id=1WUMyBQ68cMkhW3ONCzvPl2W1KpV1QPO5&export=download"  # @param {type:"string"}
-            DISASTER_M3_ARCHIVE_URL = "https://drive.google.com/uc?id=1oknnyMNKCXXK3tTrVVD4M7XAx3VzLmiO&export=download"  # @param {type:"string"}
-            AUTO_DOWNLOAD = True  # @param {type:"boolean"}
+            f"""
+            #@title Configuration {{ display-mode: "form" }}
+            REPO_GIT_URL = {DEFAULT_GIT_URL!r}  # @param {{type:"string"}}
+            REPO_BRANCH = "main"  # @param {{type:"string"}}
+            RUN_CRISISMMD = False  # @param {{type:"boolean"}}
+            RUN_DMD = True  # @param {{type:"boolean"}}
+            RUN_INCIDENTS_VQA = True  # @param {{type:"boolean"}}
+            RUN_DISASTER_M3 = True  # @param {{type:"boolean"}}
+            RUN_CLIP = True  # @param {{type:"boolean"}}
+            RUN_SIGLIP = True  # @param {{type:"boolean"}}
+            PARALLEL_BACKBONES = True  # @param {{type:"boolean"}}
+            RUN_P4 = True  # @param {{type:"boolean"}}
+            RUN_P3 = True  # @param {{type:"boolean"}}
+            RUN_P2 = True  # @param {{type:"boolean"}}
+            RUN_P1 = True  # @param {{type:"boolean"}}
+            RESUME_COMPLETED = True  # @param {{type:"boolean"}}
+            A2Z_INPUTS_URL = ""  # @param {{type:"string"}}
+            CRISISMMA_TAR_URL = "https://drive.google.com/uc?id=1wOJzIezlrH-o2LmWHtcxv8KdAKL6a7K6&export=download"  # @param {{type:"string"}}
+            DMD_ARCHIVE_URL = "https://drive.google.com/uc?id=1_1Bn0dHKqZ7sk4r2mVcShoQlvgZXcPL0&export=download"  # @param {{type:"string"}}
+            INCIDENTS_VQA_ARCHIVE_URL = "https://drive.google.com/uc?id=1WUMyBQ68cMkhW3ONCzvPl2W1KpV1QPO5&export=download"  # @param {{type:"string"}}
+            DISASTER_M3_ARCHIVE_URL = "https://drive.google.com/uc?id=1oknnyMNKCXXK3tTrVVD4M7XAx3VzLmiO&export=download"  # @param {{type:"string"}}
+            AUTO_DOWNLOAD = True  # @param {{type:"boolean"}}
             """,
             cid="iccv-cell-1",
         ),
         _cell(
-            f"""
-            import base64, concurrent.futures, hashlib, importlib, io, os, shutil, site, subprocess, sys, zipfile
+            """
+            import concurrent.futures, importlib, os, shutil, site, subprocess, sys
             from pathlib import Path
             import torch
 
@@ -112,20 +114,28 @@ def build() -> None:
             vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
             DATA_ROOT = Path("/dev/shm/mnarm_data") if shm_free_gb >= 12.0 else (WS / "data")
             IMG_DIR = Path("/dev/shm/crisismmd_v2") if (Path("/dev/shm/crisismmd_v2").is_dir() and any(Path("/dev/shm/crisismmd_v2").rglob("*.jpg"))) else (DATA_ROOT / "crisismmd_v2")
-            print(f"[ENV] GPU={{torch.cuda.get_device_name(0)}} VRAM={{vram_gb:.1f}}GB RAM={{sys_ram_gb:.1f}}GB SHM_FREE={{shm_free_gb:.1f}}GB DATA_ROOT={{DATA_ROOT}} TURBO_GPU_CACHE={{vram_gb >= 36.0}}", flush=True)
-            for d in (WS, CODE_DIR, DATA_ROOT, IMG_DIR):
+            print(f"[ENV] GPU={torch.cuda.get_device_name(0)} VRAM={vram_gb:.1f}GB RAM={sys_ram_gb:.1f}GB SHM_FREE={shm_free_gb:.1f}GB DATA_ROOT={DATA_ROOT}", flush=True)
+            for d in (WS, DATA_ROOT, IMG_DIR):
                 d.mkdir(parents=True, exist_ok=True)
 
-            CODE_SHA = {code_sha!r}
-            CODE_B64 = {code_b64!r}
-            raw_zip = base64.b64decode(CODE_B64)
-            if hashlib.sha256(raw_zip).hexdigest() != CODE_SHA:
-                raise ValueError("Embedded mnarm repo SHA mismatch!")
-            if CODE_DIR.exists():
-                shutil.rmtree(CODE_DIR)
-            CODE_DIR.mkdir(parents=True, exist_ok=True)
-            with zipfile.ZipFile(io.BytesIO(raw_zip)) as zf:
-                zf.extractall(CODE_DIR)
+            git_url = str(REPO_GIT_URL).strip()
+            git_branch = str(REPO_BRANCH).strip() or "main"
+            gh_tok = os.environ.get("GH_TOKEN", "").strip()
+            if not gh_tok:
+                try:
+                    from google.colab import userdata as colab_userdata
+                    gh_tok = (colab_userdata.get("GH_TOKEN") or "").strip()
+                except Exception:
+                    gh_tok = ""
+            clone_url = git_url.replace("https://", f"https://{gh_tok}@", 1) if (gh_tok and git_url.startswith("https://")) else git_url
+
+            if (CODE_DIR / ".git").is_dir():
+                subprocess.run(["git", "-C", str(CODE_DIR), "fetch", "--depth", "1", "origin", git_branch], check=True)
+                subprocess.run(["git", "-C", str(CODE_DIR), "reset", "--hard", f"origin/{git_branch}"], check=True)
+            else:
+                if CODE_DIR.exists():
+                    shutil.rmtree(CODE_DIR)
+                subprocess.run(["git", "clone", "--depth", "1", "--branch", git_branch, clone_url, str(CODE_DIR)], check=True)
 
             def _pip_deps():
                 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "transformers==4.57.6", "datasets==3.2.0", "PyYAML", "scipy", "pillow", "matplotlib>=3.8.0", "huggingface_hub", "pytest", "wheel", "gdown"], check=True)
@@ -150,7 +160,7 @@ def build() -> None:
             if pt_res.returncode != 0:
                 if pt_res.stderr:
                     print(pt_res.stderr, flush=True)
-                raise RuntimeError(f"pytest failed (exit={{pt_res.returncode}})")
+                raise RuntimeError(f"pytest failed (exit={pt_res.returncode})")
             """,
             cid="iccv-cell-2",
         ),
@@ -270,14 +280,10 @@ def build() -> None:
             if RUN_CRISISMMD:
                 SEQ_DIR = WS / "crisismmd_seq_inputs"
                 SEQ_DIR.mkdir(parents=True, exist_ok=True)
-                CONTRACTS_XZ_SHA = {cxz_sha!r}
-                CONTRACTS_XZ_B64 = {cxz_b64!r}
                 req_json = ("CONTRACT_SHA256.json", "manifest.json", "PLANS.json", "partition_contract.json")
-                if CONTRACTS_XZ_B64 and any(not (SEQ_DIR / fn).is_file() for fn in req_json):
-                    raw_cxz = base64.b64decode(CONTRACTS_XZ_B64)
-                    if hashlib.sha256(raw_cxz).hexdigest() != CONTRACTS_XZ_SHA:
-                        raise ValueError("Embedded CrisisMMD contracts SHA mismatch!")
-                    with tarfile.open(fileobj=io.BytesIO(raw_cxz), mode="r:xz") as tf:
+                xz_asset = CODE_DIR / "assets" / "crisismmd_contracts_json.tar.xz"
+                if xz_asset.is_file() and any(not (SEQ_DIR / fn).is_file() for fn in req_json):
+                    with tarfile.open(xz_asset, mode="r:xz") as tf:
                         tf.extractall(SEQ_DIR)
 
                 if not (SEQ_DIR / "manifest.json").is_file():
