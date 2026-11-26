@@ -145,7 +145,12 @@ def build() -> None:
             importlib.invalidate_caches()
             import mnarm
             print("[IMPORT OK]", mnarm.__file__, flush=True)
-            subprocess.run([sys.executable, "-m", "pytest", "-v"], cwd=str(CODE_DIR), check=True)
+            pt_res = subprocess.run([sys.executable, "-m", "pytest", "-q"], cwd=str(CODE_DIR), text=True, capture_output=True)
+            print(pt_res.stdout, end="", flush=True)
+            if pt_res.returncode != 0:
+                if pt_res.stderr:
+                    print(pt_res.stderr, flush=True)
+                raise RuntimeError(f"pytest failed (exit={{pt_res.returncode}})")
             """,
             cid="iccv-cell-2",
         ),

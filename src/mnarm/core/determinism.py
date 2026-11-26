@@ -20,13 +20,24 @@ def seed_everything(seed: int, deterministic: bool = True) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed_i)
     random.seed(seed_i)
     torch.manual_seed(seed_i)
+    turbo = os.environ.get("MNARM_TURBO_KERNELS", "0") == "1"
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed_i)
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
+        prec = "tf32" if turbo else "ieee"
+        try:
+            if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
+                torch.backends.cuda.matmul.fp32_precision = prec
+                torch.backends.cudnn.conv.fp32_precision = prec
+            else:
+                torch.backends.cuda.matmul.allow_tf32 = bool(turbo)
+                torch.backends.cudnn.allow_tf32 = bool(turbo)
+        except (RuntimeError, AttributeError, TypeError):
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = bool(turbo)
+                torch.backends.cudnn.allow_tf32 = bool(turbo)
+            except (RuntimeError, AttributeError, TypeError):
+                pass
 
-    turbo = os.environ.get("MNARM_TURBO_KERNELS", "0") == "1"
     if deterministic and not turbo:
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.backends.cudnn.deterministic = True
