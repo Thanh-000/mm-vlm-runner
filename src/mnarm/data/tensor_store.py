@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from PIL import Image
+from PIL import Image, ImageFile
 from torch.utils.data import Dataset
 
 from mnarm.core.determinism import make_generator
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 class MaskedRowsDataset(Dataset):

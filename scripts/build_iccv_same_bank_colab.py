@@ -193,6 +193,8 @@ def build() -> None:
                         os.environ["HF_TOKEN"] = hf_tok
                 except Exception:
                     hf_tok = ""
+            if not hf_tok:
+                os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
 
             def _extract_drive_id(url_in: str) -> str:
                 m = re.search(r"/file/d/([A-Za-z0-9_-]+)", url_in)
@@ -426,14 +428,16 @@ def build() -> None:
                 "OMP_NUM_THREADS": "2",
                 "MKL_NUM_THREADS": "2",
                 "MNARM_TURBO_KERNELS": "1",
+                "HF_HUB_DISABLE_IMPLICIT_TOKEN": os.environ.get("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1" if not os.environ.get("HF_TOKEN") else "0"),
                 "PYTHONPATH": str(CODE_DIR / "src") + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else ""),
             }
             try:
                 from huggingface_hub import snapshot_download
+                hf_skip = ["*.msgpack", "*.h5", "*.ot", "tf_model*"]
                 if RUN_CLIP:
-                    snapshot_download("openai/clip-vit-base-patch16", revision="57c216476eefef5ab752ec549e440a49ae4ae5f3")
+                    snapshot_download("openai/clip-vit-base-patch16", revision="57c216476eefef5ab752ec549e440a49ae4ae5f3", ignore_patterns=hf_skip)
                 if RUN_SIGLIP:
-                    snapshot_download("google/siglip-base-patch16-224", revision="7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed")
+                    snapshot_download("google/siglip-base-patch16-224", revision="7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed", ignore_patterns=hf_skip)
             except Exception as exc_hf:
                 print(f"[WARN] HF snapshot pre-warm skipped: {exc_hf}", flush=True)
 

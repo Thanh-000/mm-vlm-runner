@@ -179,10 +179,22 @@ def prepare_disaster_m3(dest_dir: Path, archive_path: Path | None = None) -> Pat
     return dest_dir
 
 
+def _is_valid_image(p: Path) -> bool:
+    if not p.is_file() or p.stat().st_size < 64:
+        return False
+    try:
+        from PIL import Image, ImageFile
+        ImageFile.LOAD_TRUNCATED_IMAGES = True
+        with Image.open(p) as im:
+            return im.width > 0 and im.height > 0
+    except Exception:
+        return False
+
+
 def _scan_dmd_records(root: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for img_p in sorted(root.rglob("*")):
-        if not img_p.is_file() or img_p.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp"):
+        if img_p.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp") or not _is_valid_image(img_p):
             continue
         cls_idx = next((_DMD_DIR_MAP[p.lower()] for p in reversed(img_p.parts[:-1]) if p.lower() in _DMD_DIR_MAP), None)
         if cls_idx is None:
@@ -221,7 +233,7 @@ def _scan_incidents_vqa_records(root: Path) -> list[dict[str, Any]]:
         if dtype not in _INC_MAP:
             continue
         img_p = base_dir / str(rows[0]["image_path"]).replace("\\", "/").lstrip("/")
-        if not img_p.is_file():
+        if not _is_valid_image(img_p):
             continue
         qa_parts = []
         for r in rows:
@@ -267,7 +279,7 @@ def _scan_disaster_m3_records(root: Path) -> list[dict[str, Any]]:
             continue
         rel = str(r.get("post_image_path", "")).replace("\\", "/").lstrip("/")
         img_p = img_base / rel
-        if not img_p.is_file():
+        if not _is_valid_image(img_p):
             continue
         rep_body = re.sub(r"^DISASTER:[^\n\r]*[\n\r]*", "", raw_rep, flags=re.IGNORECASE)
         adv_body = advice_by_img.get(str(r.get("post_image_path", "")).replace("\\", "/"), "")

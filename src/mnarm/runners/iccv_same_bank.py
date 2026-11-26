@@ -40,31 +40,36 @@ ABLATION_SPECS = (
 def _cached_base0_features(
     vlm: MultimodalVLM, records: list[dict[str, Any]], store: PreprocessedTensorStore, eval_bs: int, use_amp: bool,
     cache: dict[str, dict[str, torch.Tensor]],
-) -> dict[str, torch.Tensor | None]:
-    """Encode frozen theta_0 features per uid once across protocols for StreamingClassBank."""
+) -> dict[str, Any]:
+    """Encode frozen theta_0 features per uid aligned with make_batch_specs mask groups."""
     uncached = [r for r in records if ("text" in r["mask"] and r["uid"] not in cache["text"]) or ("image" in r["mask"] and r["uid"] not in cache["image"])]
     if uncached:
+        ord_un = [r for _, grp in store.make_batch_specs(uncached, batch_size=max(1, len(uncached)), shuffle=False) for r in grp]
         tf_new = collect_train_features_by_modality(vlm=vlm, kind="lora", payload={}, records=uncached, tensor_store=store, batch_size=eval_bs, use_amp=use_amp)
         t_pos = i_pos = 0
-        for r in uncached:
+        for r in ord_un:
             if "text" in r["mask"] and tf_new["text_x"] is not None:
                 cache["text"].setdefault(r["uid"], tf_new["text_x"][t_pos]); t_pos += 1
             if "image" in r["mask"] and tf_new["image_x"] is not None:
                 cache["image"].setdefault(r["uid"], tf_new["image_x"][i_pos]); i_pos += 1
     tx, ty, ix, iy, pt, pi = [], [], [], [], [], []
-    for r in records:
-        uid, lbl = r["uid"], int(r["label"])
-        has_t, has_i = ("text" in r["mask"] and uid in cache["text"]), ("image" in r["mask"] and uid in cache["image"])
-        if has_t:
-            tx.append(cache["text"][uid]); ty.append(lbl)
-        if has_i:
-            ix.append(cache["image"][uid]); iy.append(lbl)
-        if has_t and has_i:
-            pt.append(cache["text"][uid]); pi.append(cache["image"][uid])
+    by_mask: dict[tuple[str, ...], tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]] = {}
+    for views, grp in store.make_batch_specs(records, batch_size=max(1, len(records)), shuffle=False):
+        gt = torch.stack([cache["text"][r["uid"]] for r in grp], 0) if "text" in views else None
+        gi = torch.stack([cache["image"][r["uid"]] for r in grp], 0) if "image" in views else None
+        gy = torch.tensor([int(r["label"]) for r in grp], dtype=torch.long)
+        by_mask[views] = (gt, gi, gy)
+        if gt is not None:
+            tx.append(gt); ty.append(gy)
+        if gi is not None:
+            ix.append(gi); iy.append(gy)
+        if gt is not None and gi is not None:
+            pt.append(gt); pi.append(gi)
     return {
-        "text_x": torch.stack(tx, 0) if tx else None, "text_y": torch.tensor(ty, dtype=torch.long) if ty else None,
-        "image_x": torch.stack(ix, 0) if ix else None, "image_y": torch.tensor(iy, dtype=torch.long) if iy else None,
-        "paired_t": torch.stack(pt, 0) if pt else None, "paired_i": torch.stack(pi, 0) if pi else None,
+        "text_x": torch.cat(tx, 0) if tx else None, "text_y": torch.cat(ty, 0) if ty else None,
+        "image_x": torch.cat(ix, 0) if ix else None, "image_y": torch.cat(iy, 0) if iy else None,
+        "paired_t": torch.cat(pt, 0) if pt else None, "paired_i": torch.cat(pi, 0) if pi else None,
+        "by_mask": by_mask,
     }
 
 
@@ -121,13 +126,8 @@ def run_single_protocol_same_bank(
         tf_b0 = _cached_base0_features(vlm, st["fit"], store, eff_eval_bs, use_amp, b0_cache)
         bank.update_stage(u_expert_t=tf_st["text_x"], u_base_t=tf_b0["text_x"], y_t=tf_st["text_y"], u_expert_i=tf_st["image_x"], u_base_i=tf_b0["image_x"], y_i=tf_st["image_y"], paired_base_t=tf_b0["paired_t"], paired_base_i=tf_b0["paired_i"])
 
-        if tf_b0["paired_t"] is not None and tf_b0["paired_i"] is not None:
-            pal.update(tf_b0["paired_t"], tf_b0["paired_i"], tf_b0["text_y"], ("text", "image"))
-        else:
-            if tf_b0["text_x"] is not None:
-                pal.update(tf_b0["text_x"], None, tf_b0["text_y"], ("text",))
-            if tf_b0["image_x"] is not None:
-                pal.update(None, tf_b0["image_x"], tf_b0["image_y"], ("image",))
+        for m_views, (m_t, m_i, m_y) in tf_b0["by_mask"].items():
+            pal.update(m_t, m_i, m_y, m_views)
 
         seq_ft_state, _ = train_lora_stage(
             vlm=vlm, init_lora=seq_ft_state, records=st["fit"], protos_full=protos_full, seen_classes=seen_so_far,

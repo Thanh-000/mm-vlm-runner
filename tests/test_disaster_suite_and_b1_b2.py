@@ -316,3 +316,72 @@ def test_contiguous_tensor_bank_palette_and_mgclip_batch_invariance(tmp_path: Pa
     n_small = _measure_mean_neg_by_mask(vlm, specs_s, store, p_ord, {0: 0, 1: 1}, 2, torch.float32, False)
     n_large = _measure_mean_neg_by_mask(vlm, specs_l, store, p_ord, {0: 0, 1: 1}, 2, torch.float32, False)
     assert abs(n_small[("image", "text")] - n_large[("image", "text")]) < 1e-5
+
+
+def test_truncated_jpeg_and_mixed_mask_base0_pal_alignment(tmp_path: Path) -> None:
+    import io
+    from mnarm.methods import PALRLSClassifier
+    from mnarm.runners.iccv_same_bank import _cached_base0_features
+    from mnarm.runners.stage_ops import collect_train_features_by_modality
+
+    dmd_root = tmp_path / "dmd_trunc"
+    for cls_dir in ("fires", "flood", "damaged_nature", "damaged_infrastructure", "human_damage", "non_damage"):
+        for i in range(6):
+            img_p = dmd_root / "multimodal" / cls_dir / "images" / f"{cls_dir}_{i}.jpg"
+            txt_p = dmd_root / "multimodal" / cls_dir / "text" / f"{cls_dir}_{i}.txt"
+            img_p.parent.mkdir(parents=True, exist_ok=True)
+            txt_p.parent.mkdir(parents=True, exist_ok=True)
+            buf = io.BytesIO()
+            Image.new("RGB", (24, 24), color=(15 * i + 20, 60, 100)).save(buf, format="JPEG")
+            raw_jpg = buf.getvalue()
+            img_p.write_bytes(raw_jpg[:-16] if (cls_dir == "fires" and i == 0) else raw_jpg)
+            txt_p.write_text(f"Trunc test {cls_dir} item {i}", encoding="utf8")
+
+    # 0-byte stub must be skipped cleanly without failing split
+    bad_p = dmd_root / "multimodal" / "fires" / "images" / "corrupt_stub.jpg"
+    bad_p.write_bytes(b"")
+    (dmd_root / "multimodal" / "fires" / "text" / "corrupt_stub.txt").write_text("bad stub", encoding="utf8")
+
+    ds_p1 = load_benchmark_contracts("dmd", dmd_root, dmd_root, "P1", allow_test=False, seed=11)
+    assert all("corrupt_stub" not in uid for uid in ds_p1["lookup"])
+    st1_fit = ds_p1["stages"][0]["fit"]
+    assert {tuple(sorted(r["mask"])) for r in st1_fit} == {("text",), ("image", "text")}
+
+    class _MixVLM:
+        device = "cpu"
+        embed_dim = 8
+        logit_scale = 10.0
+
+        def tokenize_texts(self, texts):
+            ids = torch.tensor([[len(t), len(t) % 5 + 1] for t in texts], dtype=torch.long)
+            return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+
+        def processor(self, images, return_tensors="pt", **_kw):
+            del return_tensors
+            arrs = [torch.full((3, 24, 24), float(im.getpixel((0, 0))[0]) / 255.0) for im in images]
+            return {"pixel_values": torch.stack(arrs, dim=0)}
+
+        def restore_base_weights(self): return None
+        def load_lora_state(self, _p): return None
+        clip = type("_C", (), {"eval": lambda self: None})()
+
+        def encode_text(self, inp):
+            x = inp["input_ids"].float()
+            return F.normalize(torch.cat([x, x + 1.0, x + 2.0, x + 3.0], dim=-1), dim=-1)
+
+        def encode_image(self, inp):
+            m = inp["pixel_values"].float().mean(dim=(2, 3))
+            return F.normalize(torch.cat([m, m * 2.0, torch.ones(m.shape[0], 2)], dim=-1), dim=-1)
+
+    vlm = _MixVLM()
+    store = PreprocessedTensorStore(ds_p1["lookup"], vlm, max_cached_images=100, workers=1, gpu_cache=False)
+    cache: dict[str, dict[str, torch.Tensor]] = {"text": {}, "image": {}}
+    tf_direct = collect_train_features_by_modality(vlm=vlm, kind="lora", payload={}, records=st1_fit, tensor_store=store, batch_size=64, use_amp=False)
+    tf_b0 = _cached_base0_features(vlm, st1_fit, store, eval_bs=64, use_amp=False, cache=cache)
+    assert float((tf_b0["text_x"] - tf_direct["text_x"]).abs().max().item()) < 1e-6
+    assert float((tf_b0["paired_t"] - tf_direct["paired_t"]).abs().max().item()) < 1e-6
+
+    pal = PALRLSClassifier(embed_dim=8, num_classes=6, lam=1.0, seed=11)
+    for m_views, (m_t, m_i, m_y) in tf_b0["by_mask"].items():
+        pal.update(m_t, m_i, m_y, m_views)
+    assert pal._dirty and pal.mod_count["text"] == len(st1_fit)
