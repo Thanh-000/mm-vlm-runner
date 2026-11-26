@@ -104,7 +104,7 @@ def build() -> None:
             M3_REV = "1da6da73fad6bd100454c099edd0cee972823810"
             CRISIS_REV = "10a5626ba112ab9c50369c473a2062bcf205d708"
             DMD_UCI_URL = "https://archive.ics.uci.edu/static/public/456/multimodal+damage+identification+for+humanitarian+computing.zip"
-            CIFAR100_URL = "https://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz"
+            CIFAR100_URL = "https://storage.googleapis.com/tensorflow/tf-keras-datasets/cifar-100-python.tar.gz"
             CIFAR100_MD5 = "md5=eb9058c3a382ffc7106e4002c42a8d85"
 
             def _digest_file(path: Path, alg: str = "sha256") -> str:

@@ -165,16 +165,26 @@ def build() -> None:
                     extract_archive_safe(dl_p, data_dir)
                     dl_p.unlink(missing_ok=True)
                 else:
-                    tgz_url = "https://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz"
+                    tgz_mirrors = (
+                        "https://storage.googleapis.com/tensorflow/tf-keras-datasets/cifar-100-python.tar.gz",
+                        "https://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz",
+                    )
                     tgz_p = data_dir / "cifar-100-python.tar.gz"
-                    try:
-                        aria2_download_file(
-                            tgz_url, tgz_p, checksum="md5=eb9058c3a382ffc7106e4002c42a8d85",
-                            min_bytes=160_000_000, max_conn=16,
-                        )
-                        extract_archive_safe(tgz_p, data_dir)
-                        tgz_p.unlink(missing_ok=True)
-                    except Exception as exc_web:
+                    fetched_ok, exc_web = False, None
+                    for tgz_url in tgz_mirrors:
+                        try:
+                            aria2_download_file(
+                                tgz_url, tgz_p, checksum="md5=eb9058c3a382ffc7106e4002c42a8d85",
+                                min_bytes=160_000_000, max_conn=16,
+                            )
+                            extract_archive_safe(tgz_p, data_dir)
+                            tgz_p.unlink(missing_ok=True)
+                            fetched_ok = True
+                            break
+                        except Exception as exc_try:
+                            exc_web = exc_try
+                            tgz_p.unlink(missing_ok=True)
+                    if not fetched_ok:
                         print(f"[WARN] Direct aria2c web pull throttled/failed ({{exc_web}})", flush=True)
                         fb_url = input("Web source overloaded; paste Google Drive CIFAR100_ARCHIVE_URL from Stage_Disaster_Datasets_To_Drive.ipynb (or Enter to retry torchvision): ").strip()
                         if fb_url:
@@ -193,6 +203,11 @@ def build() -> None:
                 checksum="sha-256=5806e77cd80f8b59890b7e101eabd078d9fb84e6937f9e85e4ecb61988df416f",
                 min_bytes=340_000_000, max_conn=16,
             )
+            try:
+                from huggingface_hub import snapshot_download
+                snapshot_download("openai/clip-vit-base-patch16", revision="57c216476eefef5ab752ec549e440a49ae4ae5f3", ignore_patterns=["*.msgpack", "*.h5", "*.ot", "tf_model*"])
+            except Exception as exc_hf:
+                print(f"[WARN] HF CLIP snapshot pre-warm skipped ({{exc_hf}})", flush=True)
             print("[READY] CIFAR-100 & CLIP ViT-B-16.pt cached via aria2c at", DATA_DIR, flush=True)
 
             AUDIT_RESULTS = {{}}
@@ -592,7 +607,7 @@ def build() -> None:
                 splits = [sorted(class_order[i * 10 : (i + 1) * 10]) for i in range(10)]
                 templates = list(mm_tmpl.cifar100_template)
 
-                base_m, tr_tf, val_tf = open_clip.create_model_and_transforms("ViT-B-16", pretrained="openai", device=device)
+                base_m, tr_tf, val_tf = open_clip.create_model_and_transforms("ViT-B-16", pretrained="openai", device=device, cache_dir=str(Path.home() / ".cache" / "clip"))
                 base_m = base_m.float().eval()
                 with torch.no_grad():
                     zs_w = []
