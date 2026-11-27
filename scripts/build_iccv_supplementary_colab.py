@@ -9,7 +9,9 @@ import warnings
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT_NB = ROOT / "colab" / "ICCV_Supplementary_3Piece_ColabWeb.ipynb"
+OUT_NB_ALL = ROOT / "colab" / "ICCV_Supplementary_3Piece_ColabWeb.ipynb"
+OUT_NB_PART_A = ROOT / "colab" / "ICCV_FullMatrix_PartA_ColabWeb.ipynb"
+OUT_NB_PART_B = ROOT / "colab" / "ICCV_FullMatrix_PartB_ColabWeb.ipynb"
 DEFAULT_GIT_URL = "https://github.com/Thanh-000/mm-vlm-runner.git"
 
 
@@ -20,28 +22,28 @@ def _cell(src: str, kind: str = "code", cid: str = "") -> dict:
     return {"id": cid, "cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": clean.splitlines(keepends=True)}
 
 
-def build() -> None:
+def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_sweep: bool, subtitle: str) -> None:
     cells = [
         _cell(
-            """
-            # ICCV Level-3 Full-Matrix Verification Suite (`5 Datasets × 4 Backbones × 4 Protocols × 5 Seeds` + `MNAR Sweep`)
+            f"""
+            # ICCV Level-3 Full-Matrix Suite — `{part_tag}` ({subtitle})
 
-            Runs the complete cross-architecture, multi-seed, out-of-domain, and missingness-severity benchmark suite cleanly in **Seed-Major Order (`Seed 11 -> 22 -> 33 -> 44 -> 55`)** inside `[VRAM-QUEUE]`:
+            Runs a clean, collision-free shard of the complete **`5 Datasets × 4 Backbones × 4 Protocols × 5 Seeds` + `MNAR Sweep`** matrix inside `[VRAM-QUEUE]`:
             - **5 Datasets:** `CrisisMMD` (18k), `DMD` (5.8k), `DisasterM3` (2.3k), `IncidentsVQA` (368), and out-of-domain **`ScienceQA-MM8`** (~10.3k, auto-fetched via `aria2c`).
             - **4 Backbones in Parallel:** `CLIP ViT-B/32`, `CLIP ViT-B/16`, `CLIP ViT-L/14` (428M), `SigLIP ViT-B/16`.
-            - **5 Seeds (`11, 22, 33, 44, 55`):** Fixed `dev`/`test` splits with permuted continual class order (`Mean ± Std`), plus `DMD` MNAR severity sweep (`0%, 25%, 50%, 75%, 90%, 100%`).
-            - **Zero-Loss Resume & Seed-11 Import:** Auto-imports `/content/ICCV_SUPP_CHECKPOINT_LATEST.zip`, optional Google Drive checkpoint (`SAVE_CHECKPOINT_TO_GDRIVE`), or uploaded `/content/ICCV_FINAL_DEV_AND_TEST_RESULTS*.zip` for instant `seed=11` `B/16+SigLIP` reuse!
+            - **Shard Configuration:** `PART_TAG = {part_tag!r}` | `SEEDS = {default_seeds!r}` | `RUN_MNAR_SWEEP = {default_sweep!r}` (isolated Drive & local checkpoint names so Part A and Part B run simultaneously on 2 Colab tabs with zero conflicts).
             """,
             kind="markdown",
             cid="supp-cell-0",
         ),
         _cell(
             f"""
-            #@title Level-3 Full-Matrix Configuration {{ display-mode: "form" }}
+            #@title Level-3 Full-Matrix Configuration ({part_tag}) {{ display-mode: "form" }}
             REPO_GIT_URL = {DEFAULT_GIT_URL!r}  # @param {{type:"string"}}
             REPO_BRANCH = "main"  # @param {{type:"string"}}
+            PART_TAG = {part_tag!r}  # @param {{type:"string"}}
             CONFIRM_FREEZE_TEST = True  # @param {{type:"boolean"}}
-            SEEDS = "11,22,33,44,55"  # @param {{type:"string"}}
+            SEEDS = {default_seeds!r}  # @param {{type:"string"}}
             RUN_CRISISMMD = True  # @param {{type:"boolean"}}
             RUN_DMD = True  # @param {{type:"boolean"}}
             RUN_DISASTER_M3 = True  # @param {{type:"boolean"}}
@@ -51,7 +53,7 @@ def build() -> None:
             RUN_CLIP_B16 = True  # @param {{type:"boolean"}}
             RUN_CLIP_L14 = True  # @param {{type:"boolean"}}
             RUN_SIGLIP_B16 = True  # @param {{type:"boolean"}}
-            RUN_MNAR_SWEEP = True  # @param {{type:"boolean"}}
+            RUN_MNAR_SWEEP = {default_sweep!r}  # @param {{type:"boolean"}}
             SWEEP_RATES = "0.0,0.25,0.50,0.75,0.90,1.0"  # @param {{type:"string"}}
             PARALLEL_WORKERS = True  # @param {{type:"boolean"}}
             RESUME_COMPLETED = True  # @param {{type:"boolean"}}
@@ -306,7 +308,8 @@ def build() -> None:
             except ImportError:
                 colab_drive, colab_files = None, None
 
-            SUPP_OUT = WS / "outputs_iccv_supplementary"
+            part_tag_norm = (str(PART_TAG).strip().upper() or "ALL").replace(" ", "_")
+            SUPP_OUT = WS / f"outputs_iccv_{part_tag_norm.lower()}"
             SUPP_OUT.mkdir(parents=True, exist_ok=True)
             run_env = {
                 **os.environ, "USE_TF": "0", "USE_JAX": "0", "TF_CPP_MIN_LOG_LEVEL": "3",
@@ -319,11 +322,12 @@ def build() -> None:
             from mnarm.runners.iccv_same_bank import _is_v21_valid
             from mnarm.runners.iccv_supplementary import write_supplementary_suite
 
-            CKPT_ZIP = Path("/content/ICCV_SUPP_CHECKPOINT_LATEST.zip")
+            seeds = [int(x.strip()) for x in str(SEEDS).split(",") if x.strip()]
+            CKPT_ZIP = Path(f"/content/ICCV_SUPP_{part_tag_norm}_CHECKPOINT.zip")
             DRIVE_CKPT = None
             if SAVE_CHECKPOINT_TO_GDRIVE and colab_drive is not None:
                 colab_drive.mount("/content/drive", force_remount=False)
-                DRIVE_CKPT = Path("/content/drive/MyDrive/ICCV_FULL_MATRIX_CHECKPOINT.zip")
+                DRIVE_CKPT = Path(f"/content/drive/MyDrive/ICCV_FULL_MATRIX_{part_tag_norm}_CHECKPOINT.zip")
 
             def _restore_zip_into(zp: Path, dst_root: Path, tag_label: str) -> None:
                 if zp.is_file() and zipfile.is_zipfile(zp):
@@ -334,27 +338,28 @@ def build() -> None:
             if RESUME_COMPLETED:
                 for z_cand in (DRIVE_CKPT, CKPT_ZIP):
                     if z_cand is not None:
-                        _restore_zip_into(z_cand, SUPP_OUT, "FULL-MATRIX")
-                for main_z in (Path("/content/ICCV_FINAL_DEV_AND_TEST_RESULTS.zip"), Path("/content/ICCV_FINAL_DEV_AND_TEST_RESULTS (1).zip")):
-                    if main_z.is_file() and zipfile.is_zipfile(main_z):
-                        imported = 0
-                        with zipfile.ZipFile(main_z, "r") as zin:
-                            for nm in zin.namelist():
-                                if nm.endswith(".json") and ("_same_bank/" in nm):
-                                    parts = nm.split("/")
-                                    if parts[0] in ("clip_same_bank", "siglip_same_bank"):
-                                        ds_m, bb_f, rest_p = "crisismmd", ("clip_b16_same_bank" if parts[0] == "clip_same_bank" else "siglip_b16_same_bank"), "/".join(parts[1:])
-                                    elif len(parts) >= 3 and parts[1] in ("clip_same_bank", "siglip_same_bank"):
-                                        ds_m, bb_f, rest_p = parts[0], ("clip_b16_same_bank" if parts[1] == "clip_same_bank" else "siglip_b16_same_bank"), "/".join(parts[2:])
-                                    else:
-                                        continue
-                                    out_f = SUPP_OUT / "multiseed" / ds_m / "seed_11" / bb_f / rest_p
-                                    if not out_f.is_file():
-                                        out_f.parent.mkdir(parents=True, exist_ok=True)
-                                        out_f.write_bytes(zin.read(nm))
-                                        imported += 1
-                        if imported:
-                            print(f"[IMPORTED SEED-11] Reused {imported} JSONs from {main_z.name}", flush=True)
+                        _restore_zip_into(z_cand, SUPP_OUT, part_tag_norm)
+                if 11 in seeds:
+                    for main_z in (Path("/content/ICCV_FINAL_DEV_AND_TEST_RESULTS.zip"), Path("/content/ICCV_FINAL_DEV_AND_TEST_RESULTS (1).zip")):
+                        if main_z.is_file() and zipfile.is_zipfile(main_z):
+                            imported = 0
+                            with zipfile.ZipFile(main_z, "r") as zin:
+                                for nm in zin.namelist():
+                                    if nm.endswith(".json") and ("_same_bank/" in nm):
+                                        parts = nm.split("/")
+                                        if parts[0] in ("clip_same_bank", "siglip_same_bank"):
+                                            ds_m, bb_f, rest_p = "crisismmd", ("clip_b16_same_bank" if parts[0] == "clip_same_bank" else "siglip_b16_same_bank"), "/".join(parts[1:])
+                                        elif len(parts) >= 3 and parts[1] in ("clip_same_bank", "siglip_same_bank"):
+                                            ds_m, bb_f, rest_p = parts[0], ("clip_b16_same_bank" if parts[1] == "clip_same_bank" else "siglip_b16_same_bank"), "/".join(parts[2:])
+                                        else:
+                                            continue
+                                        out_f = SUPP_OUT / "multiseed" / ds_m / "seed_11" / bb_f / rest_p
+                                        if not out_f.is_file():
+                                            out_f.parent.mkdir(parents=True, exist_ok=True)
+                                            out_f.write_bytes(zin.read(nm))
+                                            imported += 1
+                            if imported:
+                                print(f"[IMPORTED SEED-11] Reused {imported} JSONs from {main_z.name}", flush=True)
 
             def _pack_zip(target: Path) -> None:
                 tmp = target.with_suffix(".tmp.zip")
@@ -419,7 +424,6 @@ def build() -> None:
                 if flag
             ]
             ds_order = [d for d in ("crisismmd", "dmd", "scienceqa_mm8", "disaster_m3", "incidents_vqa") if d in DATASET_PATHS]
-            seeds = [int(x.strip()) for x in str(SEEDS).split(",") if x.strip()]
             rates = [float(x.strip()) for x in str(SWEEP_RATES).split(",") if x.strip()]
             tasks, grp_rem, grp_info, skipped_n = [], {}, {}, 0
 
@@ -506,7 +510,7 @@ def build() -> None:
             if fig_png.is_file():
                 display(IPyImage(filename=str(fig_png)))
 
-            RES_ZIP = Path("/content/ICCV_FULL_MATRIX_DEV_AND_TEST_RESULTS.zip")
+            RES_ZIP = Path(f"/content/ICCV_FULL_MATRIX_{part_tag_norm}_RESULTS.zip")
             _pack_zip(RES_ZIP)
             print("[PACKAGED]", RES_ZIP, RES_ZIP.stat().st_size, "bytes", flush=True)
             if AUTO_DOWNLOAD and colab_files is not None:
@@ -522,16 +526,22 @@ def build() -> None:
     }
     nb_json = json.dumps(nb, indent=2, ensure_ascii=False)
     if "$" in nb_json:
-        raise AssertionError("Forbidden dollar character in ICCV Level-3 notebook")
+        raise AssertionError(f"Forbidden dollar character in {out_nb.name}")
     for idx, c in enumerate(cells):
         if c["cell_type"] == "code":
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always", SyntaxWarning)
                 ast.parse("".join(c["source"]))
                 if w:
-                    raise SyntaxError(f"SyntaxWarning in cell {idx}: {w[0].message}")
-    OUT_NB.write_text(nb_json, encoding="utf8")
-    print(f"Built {OUT_NB} ({len(nb_json)} B)")
+                    raise SyntaxError(f"SyntaxWarning in {out_nb.name} cell {idx}: {w[0].message}")
+    out_nb.write_text(nb_json, encoding="utf8")
+    print(f"Built {out_nb} ({len(nb_json)} B)")
+
+
+def build() -> None:
+    _build_notebook(OUT_NB_PART_A, part_tag="PART_A", default_seeds="11,22", default_sweep=True, subtitle="Seeds 11, 22 + MNAR Sweep")
+    _build_notebook(OUT_NB_PART_B, part_tag="PART_B", default_seeds="33,44,55", default_sweep=False, subtitle="Seeds 33, 44, 55")
+    _build_notebook(OUT_NB_ALL, part_tag="ALL", default_seeds="11,22,33,44,55", default_sweep=True, subtitle="Full 5-Seed Single Session")
 
 
 if __name__ == "__main__":

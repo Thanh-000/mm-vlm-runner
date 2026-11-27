@@ -16,6 +16,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from mnarm.core import write_json_atomic
+from mnarm.data.archive_ops import extract_archive_safe
 from mnarm.eval.iccv_figures import _configure_style, _save_pair
 
 SUPP_ARMS = ("opcm", "knots", "tsvm", "dc_lora", "iso_c", "magmax", "seq_ft", "seq_magmax", "seq_lmnar", "seq_replay256", "mg_clip", "pal_rls", "joint_oracle")
@@ -310,11 +311,22 @@ def write_supplementary_suite(supp_root: Path) -> Path:
     return out_md
 
 
+def merge_supplementary_zips(zip_paths: list[Path], out_dir: Path) -> Path:
+    """Unpack multiple disjoint shard zips (e.g. Part A + Part B) and build unified 5-seed reports."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for zp in zip_paths:
+        extract_archive_safe(zp, out_dir)
+    for stale in ("ICCV_SUPP_PIECE1_MULTISEED.md", "ICCV_SUPP_PIECE2_SCALING_OOD.md", "ICCV_SUPP_PIECE3_MNAR_SWEEP.md"):
+        (out_dir / stale).unlink(missing_ok=True)
+    return write_supplementary_suite(out_dir)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", type=Path, required=True)
+    ap.add_argument("--merge-zips", type=Path, nargs="*", default=None)
     args = ap.parse_args()
-    out_md = write_supplementary_suite(args.root)
+    out_md = merge_supplementary_zips(list(args.merge_zips), args.root) if args.merge_zips else write_supplementary_suite(args.root)
     print(f"[SUPPLEMENTARY SUMMARY WRITTEN] {out_md}", flush=True)
 
 

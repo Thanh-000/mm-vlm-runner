@@ -8,7 +8,7 @@ from pathlib import Path
 from PIL import Image
 
 from mnarm.data import build_p1_p4_contracts, load_benchmark_contracts
-from mnarm.runners.iccv_supplementary import write_supplementary_suite
+from mnarm.runners.iccv_supplementary import merge_supplementary_zips, write_supplementary_suite
 
 
 def _make_dummy_records(root: Path, n_classes: int = 8, per_cls: int = 8) -> list[dict]:
@@ -156,3 +156,49 @@ def test_crisismmd_multiseed_class_order_keeps_splits_fixed(tmp_path: Path) -> N
     assert [r["uid"] for r in c22["test"]] == [r["uid"] for r in c11["test"]]
     assert set(c22["early_classes"]) != set(c11["early_classes"])
     assert len(c22["stages"]) == 4
+
+
+def test_merge_supplementary_zips_combines_part_a_and_part_b(tmp_path: Path) -> None:
+    import zipfile
+
+    def _mk_json(root: Path, rel: str, ds: str, bb: str, pr: str, val: float) -> None:
+        fp = root / rel
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        arms = {
+            arm: {
+                "regimes": {
+                    "raw": {"paired": {"macro_f1": val, "early_recall": 0.3}, "summary": {"view3_mean_f1": val}},
+                    **({} if arm == "pal_rls" else {
+                        "ncm": {"paired": {"macro_f1": val - 0.05, "early_recall": 0.2}, "summary": {"view3_mean_f1": val - 0.05}},
+                        "cal_bias": {"paired": {"macro_f1": val + 0.02, "early_recall": 0.35}, "summary": {"view3_mean_f1": val}},
+                        "zero_mnar": {"paired": {"macro_f1": val + 0.25, "early_recall": 0.7}, "summary": {"view3_mean_f1": val + 0.2}},
+                    }),
+                }
+            }
+            for arm in ("opcm", "knots", "tsvm", "dc_lora", "iso_c", "magmax", "seq_ft", "seq_magmax", "seq_lmnar", "seq_replay256", "mg_clip", "pal_rls", "joint_oracle")
+        }
+        fp.write_text(json.dumps({"config": {"dataset": ds, "backbone": bb, "protocol": pr}, "arms": arms}), encoding="utf8")
+
+    part_a_dir, part_b_dir = tmp_path / "pa_raw", tmp_path / "pb_raw"
+    for s in (11, 22):
+        for pr in ("P1", "P3", "P4"):
+            _mk_json(part_a_dir, f"multiseed/dmd/seed_{s}/clip_b16_same_bank/clip_b16_{pr.lower()}/ICCV_PROTOCOL_TEST_RESULTS.json", "dmd", "clip_b16", pr, 0.50)
+    for rt, v in (("rho_000", 0.65), ("rho_100", 0.50)):
+        _mk_json(part_a_dir, f"mnar_sweep/dmd/{rt}/clip_b16_same_bank/clip_b16_p4/ICCV_PROTOCOL_TEST_RESULTS.json", "dmd", "clip_b16", "P4", v)
+    for s in (33, 44, 55):
+        for pr in ("P1", "P3", "P4"):
+            _mk_json(part_b_dir, f"multiseed/dmd/seed_{s}/clip_b16_same_bank/clip_b16_{pr.lower()}/ICCV_PROTOCOL_TEST_RESULTS.json", "dmd", "clip_b16", pr, 0.52)
+
+    pa_zip, pb_zip = tmp_path / "part_a.zip", tmp_path / "part_b.zip"
+    for d, zp in ((part_a_dir, pa_zip), (part_b_dir, pb_zip)):
+        with zipfile.ZipFile(zp, "w") as zf:
+            for fp in sorted(d.rglob("*")):
+                if fp.is_file():
+                    zf.write(fp, fp.relative_to(d).as_posix())
+
+    merged_dir = tmp_path / "merged_out"
+    master_md = merge_supplementary_zips([pa_zip, pb_zip], merged_dir)
+    res_json = json.loads((merged_dir / "ICCV_SUPPLEMENTARY_MASTER_RESULTS.json").read_text(encoding="utf8"))
+    assert res_json["piece1_multiseed"]["seeds"] == [11, 22, 33, 44, 55]
+    assert (merged_dir / "figures" / "fig_mnar_severity_sweep.pdf").is_file()
+    assert "$" not in master_md.read_text(encoding="utf8")
