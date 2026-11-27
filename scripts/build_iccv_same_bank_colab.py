@@ -444,6 +444,9 @@ def build() -> None:
 
             from mnarm.runners.iccv_report import write_ecosystem_master_summary
 
+            class _OOMRetryError(RuntimeError):
+                pass
+
             def _run_job(tag, cfg_rel, seq_p, img_p, out_sub, bb_name, protos_list=None, skip_suite=False, force_resume=False):
                 out_path = OUT_DIR / out_sub
                 out_path.mkdir(parents=True, exist_ok=True)
@@ -462,7 +465,7 @@ def build() -> None:
                     cmd.append("--resume")
                 if skip_suite:
                     cmd.append("--skip-suite-summary")
-                tail = deque(maxlen=40)
+                tail = deque(maxlen=80)
                 with log_path.open("w", encoding="utf8") as lf:
                     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=run_env)
                     assert proc.stdout is not None
@@ -472,7 +475,11 @@ def build() -> None:
                             print(f"[{tag}] {line}", end="", flush=True)
                     rc = proc.wait()
                 if rc != 0:
-                    raise RuntimeError(f"{tag} failed (exit={rc}). Last 40 lines:\\n" + "\\n".join(tail))
+                    tail_msg = "\\n".join(tail)
+                    is_oom = any(k in tail_msg for k in ("OutOfMemoryError", "CUDA out of memory", "CUBLAS_STATUS_ALLOC_FAILED", "memory mapping failed with OOM"))
+                    if is_oom:
+                        raise _OOMRetryError(f"{tag} OOM (exit={rc}):\\n{tail_msg}")
+                    raise RuntimeError(f"{tag} failed (exit={rc}). Last lines:\\n{tail_msg}")
                 return out_sub, bb_name
 
             def _pack_results_zip(target_zip: Path) -> None:
@@ -501,8 +508,8 @@ def build() -> None:
             cpu_threads = str(max(2, min(6, (os.cpu_count() or 8) // max(max_slots, 1))))
             run_env["OMP_NUM_THREADS"] = cpu_threads
             run_env["MKL_NUM_THREADS"] = cpu_threads
-            cost_map = {"crisismmd": 10.2, "dmd": 6.5, "disaster_m3": 4.5, "incidents_vqa": 2.5} if vram_gib >= 36.0 else {"crisismmd": 4.5, "dmd": 3.5, "disaster_m3": 3.0, "incidents_vqa": 2.2}
-            budget_gib = max(10.5, vram_gib * 0.88)
+            cost_map = {"crisismmd": 15.8, "dmd": 12.2, "disaster_m3": 10.0, "incidents_vqa": 7.0} if vram_gib >= 36.0 else {"crisismmd": 12.0, "dmd": 9.5, "disaster_m3": 7.5, "incidents_vqa": 5.5}
+            budget_gib = max(16.0, vram_gib * 0.82)
 
             CKPT_ZIP = Path("/content/ICCV_CHECKPOINT_LATEST.zip")
             ds_order = [d for d in ("crisismmd", "dmd", "disaster_m3", "incidents_vqa") if d in DATASET_PATHS] + [d for d in DATASET_PATHS if d not in ("crisismmd", "dmd", "disaster_m3", "incidents_vqa")]
@@ -522,48 +529,66 @@ def build() -> None:
                     group_meta[k_grp] = {"tag": tag, "cfg": cfg_rel, "seq": sp2, "img": ip2, "sub": sub, "bb": bb}
                     rem_cnt[k_grp] = len(sel_protos)
                     for pr in sel_protos:
-                        queue_tasks.append({"group": k_grp, "vram": cost_map.get(ds_name, 5.0), "args": (f"{tag}:{pr}", cfg_rel, sp2, ip2, sub, bb, [pr], len(sel_protos) > 1, False)})
+                        queue_tasks.append({"group": k_grp, "vram": cost_map.get(ds_name, 10.0), "retries": 0, "args": (f"{tag}:{pr}", cfg_rel, sp2, ip2, sub, bb, [pr], len(sel_protos) > 1, False)})
 
-            if max_slots >= 2 and len(queue_tasks) > 1:
-                print(f"[VRAM-QUEUE] {len(queue_tasks)} tasks across {len(ds_order)} datasets | slots={max_slots} budget={budget_gib:.1f}/{vram_gib:.1f} GiB CPU_threads={cpu_threads}/worker ({gpu_name})", flush=True)
-                pending, in_flight, used_vram = deque(queue_tasks), {}, 0.0
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_slots) as pool:
-                    while pending or in_flight:
-                        launched = False
-                        for idx in range(len(pending)):
-                            t_cand = pending[idx]
-                            c_gib = t_cand["vram"]
-                            if len(in_flight) < max_slots and (len(in_flight) == 0 or used_vram + c_gib <= budget_gib):
-                                del pending[idx]
-                                used_vram += c_gib
-                                fut = pool.submit(_run_job, *t_cand["args"])
-                                in_flight[fut] = t_cand
-                                launched = True
-                                break
-                        if launched:
-                            continue
-                        done_futs, _ = concurrent.futures.wait(in_flight.keys(), return_when=concurrent.futures.FIRST_COMPLETED)
-                        for df in done_futs:
-                            done_t = in_flight.pop(df)
-                            used_vram = max(0.0, used_vram - done_t["vram"])
-                            df.result()
-                            k_grp = done_t["group"]
-                            rem_cnt[k_grp] -= 1
-                            if rem_cnt[k_grp] == 0:
-                                g_meta = group_meta[k_grp]
-                                if len(sel_protos) > 1:
-                                    _run_job(f"{g_meta['tag']}:SUMMARY", g_meta["cfg"], g_meta["seq"], g_meta["img"], g_meta["sub"], g_meta["bb"], sel_protos, False, True)
-                                write_ecosystem_master_summary(OUT_DIR)
-                                _pack_results_zip(CKPT_ZIP)
-                                print(f"[CHECKPOINT SAVED] {k_grp[0]}:{g_meta['bb']} -> {CKPT_ZIP} ({CKPT_ZIP.stat().st_size} bytes)", flush=True)
-            else:
-                for ds_name in ds_order:
-                    for tag, cfg_rel, sp2, ip2, sub, bb in ran_jobs:
-                        if (sub == "clip_same_bank" or sub == "siglip_same_bank" if ds_name == "crisismmd" else sub.startswith(f"{ds_name}/")):
-                            _run_job(tag, cfg_rel, sp2, ip2, sub, bb, sel_protos, False, False)
-                    write_ecosystem_master_summary(OUT_DIR)
-                    _pack_results_zip(CKPT_ZIP)
-                    print(f"[CHECKPOINT SAVED] {ds_name} -> {CKPT_ZIP} ({CKPT_ZIP.stat().st_size} bytes)", flush=True)
+            try:
+                if max_slots >= 2 and len(queue_tasks) > 1:
+                    print(f"[VRAM-QUEUE] {len(queue_tasks)} tasks across {len(ds_order)} datasets | slots={max_slots} budget={budget_gib:.1f}/{vram_gib:.1f} GiB CPU_threads={cpu_threads}/worker ({gpu_name})", flush=True)
+                    pending, in_flight, used_vram = deque(queue_tasks), {}, 0.0
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_slots) as pool:
+                        while pending or in_flight:
+                            launched = False
+                            for idx in range(len(pending)):
+                                t_cand = pending[idx]
+                                c_gib = t_cand["vram"]
+                                if len(in_flight) < max_slots and (len(in_flight) == 0 or used_vram + c_gib <= budget_gib):
+                                    del pending[idx]
+                                    used_vram += c_gib
+                                    fut = pool.submit(_run_job, *t_cand["args"])
+                                    in_flight[fut] = t_cand
+                                    launched = True
+                                    break
+                            if launched:
+                                continue
+                            done_futs, _ = concurrent.futures.wait(in_flight.keys(), return_when=concurrent.futures.FIRST_COMPLETED)
+                            for df in done_futs:
+                                done_t = in_flight.pop(df)
+                                used_vram = max(0.0, used_vram - done_t["vram"])
+                                try:
+                                    df.result()
+                                except _OOMRetryError as exc_oom:
+                                    if done_t.get("retries", 0) < 2:
+                                        done_t["retries"] = done_t.get("retries", 0) + 1
+                                        done_t["vram"] = budget_gib if done_t["retries"] >= 2 else min(budget_gib, round(done_t["vram"] * 1.4, 2))
+                                        print(f"[OOM-RETRY] Re-queueing {done_t['args'][0]} with VRAM={done_t['vram']:.1f} GiB (attempt {done_t['retries']}/2)", flush=True)
+                                        pending.appendleft(done_t)
+                                        continue
+                                    raise exc_oom
+                                k_grp = done_t["group"]
+                                rem_cnt[k_grp] -= 1
+                                if rem_cnt[k_grp] == 0:
+                                    g_meta = group_meta[k_grp]
+                                    if len(sel_protos) > 1:
+                                        _run_job(f"{g_meta['tag']}:SUMMARY", g_meta["cfg"], g_meta["seq"], g_meta["img"], g_meta["sub"], g_meta["bb"], sel_protos, False, True)
+                                    write_ecosystem_master_summary(OUT_DIR)
+                                    _pack_results_zip(CKPT_ZIP)
+                                    print(f"[CHECKPOINT SAVED] {k_grp[0]}:{g_meta['bb']} -> {CKPT_ZIP} ({CKPT_ZIP.stat().st_size} bytes)", flush=True)
+                else:
+                    for ds_name in ds_order:
+                        for tag, cfg_rel, sp2, ip2, sub, bb in ran_jobs:
+                            if (sub == "clip_same_bank" or sub == "siglip_same_bank" if ds_name == "crisismmd" else sub.startswith(f"{ds_name}/")):
+                                _run_job(tag, cfg_rel, sp2, ip2, sub, bb, sel_protos, False, False)
+                        write_ecosystem_master_summary(OUT_DIR)
+                        _pack_results_zip(CKPT_ZIP)
+                        print(f"[CHECKPOINT SAVED] {ds_name} -> {CKPT_ZIP} ({CKPT_ZIP.stat().st_size} bytes)", flush=True)
+            finally:
+                if any(OUT_DIR.rglob("ICCV_PROTOCOL*RESULTS.json")):
+                    try:
+                        write_ecosystem_master_summary(OUT_DIR)
+                        _pack_results_zip(CKPT_ZIP)
+                        print(f"[FINALLY-CHECKPOINT] Preserved completed protocols -> {CKPT_ZIP} ({CKPT_ZIP.stat().st_size} bytes)", flush=True)
+                    except Exception:
+                        pass
 
             master_md = write_ecosystem_master_summary(OUT_DIR)
             display(Markdown(master_md.read_text(encoding="utf8")))
@@ -595,9 +620,11 @@ def build() -> None:
         raise AssertionError("Forbidden dollar character in ICCV Same-Bank notebook")
     for idx, c in enumerate(cells):
         if c["cell_type"] == "code":
+            src_str = "".join(c["source"])
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always", SyntaxWarning)
-                ast.parse("".join(c["source"]))
+                ast.parse(src_str)
+                compile(src_str, f"{OUT_NB.name}:cell_{idx}", "exec")
                 if w:
                     raise SyntaxError(f"SyntaxWarning in cell {idx}: {w[0].message}")
     OUT_NB.write_text(nb_json, encoding="utf8")

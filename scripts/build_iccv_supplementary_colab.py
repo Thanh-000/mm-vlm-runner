@@ -373,6 +373,9 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
                     shutil.copy2(target, dtmp)
                     dtmp.replace(DRIVE_CKPT)
 
+            class _OOMRetryError(RuntimeError):
+                pass
+
             def _run_job(tag, cfg_rel, seq_p, img_p, out_dir_sub, protos, extra_flags, skip_suite=False):
                 out_p = SUPP_OUT / out_dir_sub
                 out_p.mkdir(parents=True, exist_ok=True)
@@ -388,7 +391,7 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
                     cmd.append("--resume")
                 if skip_suite:
                     cmd.append("--skip-suite-summary")
-                tail = deque(maxlen=35)
+                tail = deque(maxlen=80)
                 with log_p.open("w", encoding="utf8") as lf:
                     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=run_env)
                     assert proc.stdout is not None
@@ -398,20 +401,24 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
                             print(f"[{tag}] {ln}", end="", flush=True)
                     rc = proc.wait()
                 if rc != 0:
-                    raise RuntimeError(f"{tag} failed (exit={rc}):\\n" + "\\n".join(tail))
+                    tail_msg = "\\n".join(tail)
+                    is_oom = any(k in tail_msg for k in ("OutOfMemoryError", "CUDA out of memory", "CUBLAS_STATUS_ALLOC_FAILED", "memory mapping failed with OOM"))
+                    if is_oom:
+                        raise _OOMRetryError(f"{tag} OOM (exit={rc}):\\n{tail_msg}")
+                    raise RuntimeError(f"{tag} failed (exit={rc}):\\n{tail_msg}")
 
             vram_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
             sys_ram_gib = ((os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024 ** 3)) if hasattr(os, "sysconf") else 32.0
             max_slots = 1 if not PARALLEL_WORKERS else (8 if (vram_gib >= 88 and sys_ram_gib >= 60) else (6 if (vram_gib >= 68 and sys_ram_gib >= 44) else (4 if (vram_gib >= 36 and sys_ram_gib >= 28) else (2 if vram_gib >= 20 else 1))))
             cpu_th = str(max(2, min(6, (os.cpu_count() or 8) // max(max_slots, 1))))
             run_env["OMP_NUM_THREADS"] = cpu_th; run_env["MKL_NUM_THREADS"] = cpu_th
-            budget_gib = max(12.5, vram_gib * 0.88)
+            budget_gib = max(16.0, vram_gib * 0.82)
 
             vram_tbl = {
-                "clip_b32": {"crisismmd": 6.5, "scienceqa_mm8": 5.5, "dmd": 4.5, "disaster_m3": 3.5, "incidents_vqa": 2.2},
-                "clip_b16": {"crisismmd": 10.2, "scienceqa_mm8": 8.2, "dmd": 6.5, "disaster_m3": 4.5, "incidents_vqa": 2.5},
-                "siglip_b16": {"crisismmd": 10.2, "scienceqa_mm8": 8.2, "dmd": 6.5, "disaster_m3": 4.5, "incidents_vqa": 2.5},
-                "clip_l14": {"crisismmd": 12.8, "scienceqa_mm8": 11.2, "dmd": 9.2, "disaster_m3": 7.5, "incidents_vqa": 5.5},
+                "clip_b32": {"crisismmd": 10.5, "scienceqa_mm8": 9.0, "dmd": 7.5, "disaster_m3": 6.0, "incidents_vqa": 4.5},
+                "clip_b16": {"crisismmd": 15.0, "scienceqa_mm8": 13.5, "dmd": 11.5, "disaster_m3": 9.5, "incidents_vqa": 6.5},
+                "siglip_b16": {"crisismmd": 15.8, "scienceqa_mm8": 14.2, "dmd": 12.2, "disaster_m3": 10.0, "incidents_vqa": 7.0},
+                "clip_l14": {"crisismmd": 20.5, "scienceqa_mm8": 18.5, "dmd": 16.5, "disaster_m3": 13.5, "incidents_vqa": 10.0},
             }
             bb_specs = [
                 (bb_id, cfg_suf)
@@ -443,7 +450,7 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
                 grp_info[grp_key] = (cfg_rel, sp, ip, out_sub, protos, flags)
                 grp_rem[grp_key] = len(rem)
                 for pr in rem:
-                    tasks.append({"group": grp_key, "vram": vram_cost, "args": (f"{grp_key}:{pr}", cfg_rel, sp, ip, out_sub, [pr], flags, len(protos) > 1)})
+                    tasks.append({"group": grp_key, "vram": vram_cost, "retries": 0, "args": (f"{grp_key}:{pr}", cfg_rel, sp, ip, out_sub, [pr], flags, len(protos) > 1)})
 
             for idx_s, s in enumerate(seeds):
                 for ds in ds_order:
@@ -459,40 +466,59 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
                         r_tag = f"rho_{int(round(r * 100)):03d}"
                         for sw_bb, sw_suf in (("clip_b16", "clip"), ("siglip_b16", "siglip")):
                             fl = ["--seed", "11", "--split-seed", "11", "--mnar-missing-rate", f"{r:.4f}"]
-                            _add_group(f"sweep_dmd_{r_tag}_{sw_bb}", f"configs/iccv_dmd_{sw_suf}.yaml", sp_d, ip_d, f"mnar_sweep/dmd/{r_tag}/{sw_bb}_same_bank", sw_bb, ["P4", "P3"], fl, 6.5)
+                            _add_group(f"sweep_dmd_{r_tag}_{sw_bb}", f"configs/iccv_dmd_{sw_suf}.yaml", sp_d, ip_d, f"mnar_sweep/dmd/{r_tag}/{sw_bb}_same_bank", sw_bb, ["P4", "P3"], fl, vram_tbl[sw_bb]["dmd"])
 
             if skipped_cnt[0]:
                 print(f"[RESUME] Skipped {skipped_cnt[0]} already-verified protocol jobs.", flush=True)
-            if max_slots >= 2 and len(tasks) > 1:
-                print(f"[VRAM-QUEUE] {len(tasks)} pending tasks | slots={max_slots} budget={budget_gib:.1f}/{vram_gib:.1f} GiB CPU_threads={cpu_th}", flush=True)
-                pending, in_flight, used = deque(tasks), {}, 0.0
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_slots) as pool:
-                    while pending or in_flight:
-                        launched = False
-                        for i in range(len(pending)):
-                            cand = pending[i]
-                            if len(in_flight) < max_slots and (len(in_flight) == 0 or used + cand["vram"] <= budget_gib):
-                                del pending[i]; used += cand["vram"]
-                                in_flight[pool.submit(_run_job, *cand["args"])] = cand
-                                launched = True; break
-                        if launched:
-                            continue
-                        done, _ = concurrent.futures.wait(in_flight.keys(), return_when=concurrent.futures.FIRST_COMPLETED)
-                        for df in done:
-                            dt = in_flight.pop(df); used = max(0.0, used - dt["vram"]); df.result()
-                            gk = dt["group"]; grp_rem[gk] -= 1
-                            if grp_rem[gk] == 0:
-                                cfg_rel, sp, ip, out_sub, protos, flags = grp_info[gk]
-                                if len(protos) > 1:
-                                    _run_job(f"{gk}:SUMMARY", cfg_rel, sp, ip, out_sub, protos, flags, False)
-                                write_supplementary_suite(SUPP_OUT)
-                                _pack_zip(CKPT_ZIP)
-                                print(f"[CHECKPOINT SAVED] {gk} -> {CKPT_ZIP} ({CKPT_ZIP.stat().st_size} B)", flush=True)
-            else:
-                for gk, (cfg_rel, sp, ip, out_sub, protos, flags) in grp_info.items():
-                    _run_job(gk, cfg_rel, sp, ip, out_sub, protos, flags, False)
-                    write_supplementary_suite(SUPP_OUT)
-                    _pack_zip(CKPT_ZIP)
+            try:
+                if max_slots >= 2 and len(tasks) > 1:
+                    print(f"[VRAM-QUEUE] {len(tasks)} pending tasks | slots={max_slots} budget={budget_gib:.1f}/{vram_gib:.1f} GiB CPU_threads={cpu_th}", flush=True)
+                    pending, in_flight, used = deque(tasks), {}, 0.0
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_slots) as pool:
+                        while pending or in_flight:
+                            launched = False
+                            for i in range(len(pending)):
+                                cand = pending[i]
+                                if len(in_flight) < max_slots and (len(in_flight) == 0 or used + cand["vram"] <= budget_gib):
+                                    del pending[i]; used += cand["vram"]
+                                    in_flight[pool.submit(_run_job, *cand["args"])] = cand
+                                    launched = True; break
+                            if launched:
+                                continue
+                            done, _ = concurrent.futures.wait(in_flight.keys(), return_when=concurrent.futures.FIRST_COMPLETED)
+                            for df in done:
+                                dt = in_flight.pop(df); used = max(0.0, used - dt["vram"])
+                                try:
+                                    df.result()
+                                except _OOMRetryError as exc_oom:
+                                    if dt.get("retries", 0) < 2:
+                                        dt["retries"] = dt.get("retries", 0) + 1
+                                        dt["vram"] = budget_gib if dt["retries"] >= 2 else min(budget_gib, round(dt["vram"] * 1.4, 2))
+                                        print(f"[OOM-RETRY] Re-queueing {dt['args'][0]} with VRAM={dt['vram']:.1f} GiB (attempt {dt['retries']}/2)", flush=True)
+                                        pending.appendleft(dt)
+                                        continue
+                                    raise exc_oom
+                                gk = dt["group"]; grp_rem[gk] -= 1
+                                if grp_rem[gk] == 0:
+                                    cfg_rel, sp, ip, out_sub, protos, flags = grp_info[gk]
+                                    if len(protos) > 1:
+                                        _run_job(f"{gk}:SUMMARY", cfg_rel, sp, ip, out_sub, protos, flags, False)
+                                    write_supplementary_suite(SUPP_OUT)
+                                    _pack_zip(CKPT_ZIP)
+                                    print(f"[CHECKPOINT SAVED] {gk} -> {CKPT_ZIP} ({CKPT_ZIP.stat().st_size} B)", flush=True)
+                else:
+                    for gk, (cfg_rel, sp, ip, out_sub, protos, flags) in grp_info.items():
+                        _run_job(gk, cfg_rel, sp, ip, out_sub, protos, flags, False)
+                        write_supplementary_suite(SUPP_OUT)
+                        _pack_zip(CKPT_ZIP)
+            finally:
+                if any(SUPP_OUT.rglob("ICCV_PROTOCOL*RESULTS.json")):
+                    try:
+                        write_supplementary_suite(SUPP_OUT)
+                        _pack_zip(CKPT_ZIP)
+                        print(f"[FINALLY-CHECKPOINT] Preserved completed protocols -> {CKPT_ZIP} ({CKPT_ZIP.stat().st_size} B)", flush=True)
+                    except Exception:
+                        pass
 
             if RUN_MNAR_SWEEP and any(abs(r - 1.0) < 1e-6 for r in rates) and (11 in seeds):
                 for bs in ("clip_b16", "siglip_b16"):

@@ -245,3 +245,59 @@ def test_part_a_and_part_b_cell4_dry_run_executes_cleanly(tmp_path: Path) -> Non
             exec(compile(c4_safe, f"{nb_name}:cell_4", "exec"), ns)
         expected_tasks = 20 * 4 + (20 if exp_sweep else 0)
         assert len(ns["tasks"]) == expected_tasks
+        assert ns["vram_tbl"]["clip_l14"]["crisismmd"] >= 20.0
+        assert ns["vram_tbl"]["clip_b16"]["crisismmd"] >= 15.0
+        assert ns["budget_gib"] <= 80.0 * 0.82 + 0.1
+
+
+def test_vram_queue_oom_auto_retry_and_calibrated_vram(tmp_path: Path) -> None:
+    import threading
+    from unittest.mock import MagicMock, patch
+
+    repo_root = Path(__file__).resolve().parents[1]
+    nb = json.loads((repo_root / "colab" / "ICCV_FullMatrix_PartB_ColabWeb.ipynb").read_text(encoding="utf8"))
+    c1, c4 = "".join(nb["cells"][1]["source"]), "".join(nb["cells"][4]["source"])
+    fake_prop = MagicMock()
+    fake_prop.total_memory = 95 * (1024 ** 3)
+    attempts: dict[tuple[str, str], int] = {}
+    lock = threading.Lock()
+
+    class _FakeOOMOnceProc:
+        def __init__(self, cmd: list[str], **kw: object) -> None:
+            del kw
+            cfg_name = Path(cmd[cmd.index("--config") + 1]).name
+            p_idx = cmd.index("--protocols") + 1
+            proto = cmd[p_idx]
+            key = (cfg_name, proto)
+            with lock:
+                attempts[key] = attempts.get(key, 0) + 1
+                cnt = attempts[key]
+            is_target = (cfg_name == "iccv_crisismmd_clip_l14.yaml") and (proto == "P4") and ("--skip-suite-summary" in cmd)
+            if is_target and cnt == 1:
+                self._rc = 1
+                self.stdout = iter(["torch.OutOfMemoryError: CUDA out of memory.\n"])
+            else:
+                self._rc = 0
+                self.stdout = iter([])
+
+        def wait(self) -> int:
+            return self._rc
+
+    td_sub = tmp_path / "oom_retry"
+    ns = {
+        "WS": td_sub / "ws",
+        "CODE_DIR": repo_root,
+        "DATASET_PATHS": {
+            ds: (td_sub / ds, td_sub / ds)
+            for ds in ("crisismmd", "dmd", "scienceqa_mm8", "disaster_m3", "incidents_vqa")
+        },
+    }
+    exec(compile(c1, "part_b:cell_1", "exec"), ns)
+    ns["SEEDS"] = "33"
+    ns["SAVE_CHECKPOINT_TO_GDRIVE"] = False
+    ns["AUTO_DOWNLOAD"] = False
+    c4_safe = c4.replace('Path("/content/', f'Path(r"{td_sub.as_posix()}/').replace('Path(f"/content/', f'Path(f"{td_sub.as_posix()}/')
+    with patch("torch.cuda.get_device_properties", return_value=fake_prop), patch("torch.cuda.get_device_name", return_value="Mock G4"), patch("subprocess.Popen", side_effect=_FakeOOMOnceProc), patch("IPython.display.display"):
+        exec(compile(c4_safe, "part_b:cell_4", "exec"), ns)
+    assert attempts[("iccv_crisismmd_clip_l14.yaml", "P4")] >= 2
+    assert len(ns["tasks"]) == 80
