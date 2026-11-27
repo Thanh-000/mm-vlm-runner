@@ -202,3 +202,46 @@ def test_merge_supplementary_zips_combines_part_a_and_part_b(tmp_path: Path) -> 
     assert res_json["piece1_multiseed"]["seeds"] == [11, 22, 33, 44, 55]
     assert (merged_dir / "figures" / "fig_mnar_severity_sweep.pdf").is_file()
     assert "$" not in master_md.read_text(encoding="utf8")
+
+
+def test_part_a_and_part_b_cell4_dry_run_executes_cleanly(tmp_path: Path) -> None:
+    from unittest.mock import MagicMock, patch
+
+    repo_root = Path(__file__).resolve().parents[1]
+    fake_prop = MagicMock()
+    fake_prop.total_memory = 80 * (1024 ** 3)
+
+    class _FakeProc:
+        def __init__(self, cmd: list[str], **kw: object) -> None:
+            del kw
+            cfg_p = Path(cmd[cmd.index("--config") + 1])
+            assert cfg_p.is_file(), f"Missing YAML config: {cfg_p}"
+            self.stdout = iter([])
+
+        def wait(self) -> int:
+            return 0
+
+    for nb_name, seed_over, exp_sweep in (
+        ("ICCV_FullMatrix_PartA_ColabWeb.ipynb", "11", True),
+        ("ICCV_FullMatrix_PartB_ColabWeb.ipynb", "33", False),
+    ):
+        nb = json.loads((repo_root / "colab" / nb_name).read_text(encoding="utf8"))
+        c1, c4 = "".join(nb["cells"][1]["source"]), "".join(nb["cells"][4]["source"])
+        td_sub = tmp_path / nb_name.split(".")[0]
+        ns = {
+            "WS": td_sub / "ws",
+            "CODE_DIR": repo_root,
+            "DATASET_PATHS": {
+                ds: (td_sub / ds, td_sub / ds)
+                for ds in ("crisismmd", "dmd", "scienceqa_mm8", "disaster_m3", "incidents_vqa")
+            },
+        }
+        exec(compile(c1, f"{nb_name}:cell_1", "exec"), ns)
+        ns["SEEDS"] = seed_over
+        ns["SAVE_CHECKPOINT_TO_GDRIVE"] = False
+        ns["AUTO_DOWNLOAD"] = False
+        c4_safe = c4.replace('Path("/content/', f'Path(r"{td_sub.as_posix()}/').replace('Path(f"/content/', f'Path(f"{td_sub.as_posix()}/')
+        with patch("torch.cuda.get_device_properties", return_value=fake_prop), patch("torch.cuda.get_device_name", return_value="Mock A100"), patch("subprocess.Popen", side_effect=_FakeProc), patch("IPython.display.display"):
+            exec(compile(c4_safe, f"{nb_name}:cell_4", "exec"), ns)
+        expected_tasks = 20 * 4 + (20 if exp_sweep else 0)
+        assert len(ns["tasks"]) == expected_tasks

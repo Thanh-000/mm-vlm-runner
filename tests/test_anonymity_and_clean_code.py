@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import zipfile
 from pathlib import Path
 
@@ -54,6 +55,11 @@ def test_anonymity_and_clean_code_gates() -> None:
                 assert tok not in text, f"Forbidden Drive token {tok!r} in core file {rel_p}"
         if fp.suffix in (".md", ".yaml", ".yml", ".ipynb"):
             assert "$" not in text, f"Forbidden '$' character found in {rel_p}"
+        if fp.suffix == ".ipynb":
+            nb_obj = json.loads(text)
+            for c_idx, cell in enumerate(nb_obj.get("cells", [])):
+                if cell.get("cell_type") == "code":
+                    compile("".join(cell.get("source", [])), f"{rel_p}:cell_{c_idx}", "exec")
 
     for src_py in sorted((repo_root / "src" / "mnarm").rglob("*.py")):
         lines = src_py.read_text(encoding="utf8").splitlines()

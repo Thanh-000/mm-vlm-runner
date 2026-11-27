@@ -414,7 +414,7 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
                 "clip_l14": {"crisismmd": 12.8, "scienceqa_mm8": 11.2, "dmd": 9.2, "disaster_m3": 7.5, "incidents_vqa": 5.5},
             }
             bb_specs = [
-                (flag, bb_id, cfg_suf)
+                (bb_id, cfg_suf)
                 for flag, bb_id, cfg_suf in (
                     (RUN_CLIP_B32, "clip_b32", "clip_b32"),
                     (RUN_CLIP_B16, "clip_b16", "clip"),
@@ -425,7 +425,7 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
             ]
             ds_order = [d for d in ("crisismmd", "dmd", "scienceqa_mm8", "disaster_m3", "incidents_vqa") if d in DATASET_PATHS]
             rates = [float(x.strip()) for x in str(SWEEP_RATES).split(",") if x.strip()]
-            tasks, grp_rem, grp_info, skipped_n = [], {}, {}, 0
+            tasks, grp_rem, grp_info, skipped_cnt = [], {}, {}, [0]
 
             def _proto_done(out_sub: str, bb_id: str, pr: str) -> bool:
                 if not RESUME_COMPLETED:
@@ -436,9 +436,8 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
                 return ok_d and ok_t
 
             def _add_group(grp_key, cfg_rel, sp, ip, out_sub, bb_id, protos, flags, vram_cost):
-                nonlocal skipped_n
                 rem = [pr for pr in protos if not _proto_done(out_sub, bb_id, pr)]
-                skipped_n += len(protos) - len(rem)
+                skipped_cnt[0] += len(protos) - len(rem)
                 if not rem:
                     return
                 grp_info[grp_key] = (cfg_rel, sp, ip, out_sub, protos, flags)
@@ -462,8 +461,8 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
                             fl = ["--seed", "11", "--split-seed", "11", "--mnar-missing-rate", f"{r:.4f}"]
                             _add_group(f"sweep_dmd_{r_tag}_{sw_bb}", f"configs/iccv_dmd_{sw_suf}.yaml", sp_d, ip_d, f"mnar_sweep/dmd/{r_tag}/{sw_bb}_same_bank", sw_bb, ["P4", "P3"], fl, 6.5)
 
-            if skipped_n:
-                print(f"[RESUME] Skipped {skipped_n} already-verified protocol jobs.", flush=True)
+            if skipped_cnt[0]:
+                print(f"[RESUME] Skipped {skipped_cnt[0]} already-verified protocol jobs.", flush=True)
             if max_slots >= 2 and len(tasks) > 1:
                 print(f"[VRAM-QUEUE] {len(tasks)} pending tasks | slots={max_slots} budget={budget_gib:.1f}/{vram_gib:.1f} GiB CPU_threads={cpu_th}", flush=True)
                 pending, in_flight, used = deque(tasks), {}, 0.0
@@ -529,9 +528,11 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
         raise AssertionError(f"Forbidden dollar character in {out_nb.name}")
     for idx, c in enumerate(cells):
         if c["cell_type"] == "code":
+            src_str = "".join(c["source"])
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always", SyntaxWarning)
-                ast.parse("".join(c["source"]))
+                ast.parse(src_str)
+                compile(src_str, f"{out_nb.name}:cell_{idx}", "exec")
                 if w:
                     raise SyntaxError(f"SyntaxWarning in {out_nb.name} cell {idx}: {w[0].message}")
     out_nb.write_text(nb_json, encoding="utf8")
