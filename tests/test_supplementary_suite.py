@@ -32,12 +32,11 @@ def test_class_order_permutation_keeps_identical_dev_test(tmp_path: Path) -> Non
     assert c11["early_classes"] == c11_def["early_classes"] == [0, 1, 2, 3]
     assert [r["uid"] for r in c11["test"]] == [r["uid"] for r in c11_def["test"]]
 
-    c22 = build_p1_p4_contracts(dataset_name="synthetic", raw_records=recs, class_names=names, orig_prompts=p0, unseen_prompts=pu, protocol="P4", allow_test=True, seed=22, split_seed=11, class_order_seed=22)
-    c33 = build_p1_p4_contracts(dataset_name="synthetic", raw_records=recs, class_names=names, orig_prompts=p0, unseen_prompts=pu, protocol="P4", allow_test=True, seed=33, split_seed=11, class_order_seed=33)
-    assert [r["uid"] for r in c22["dev"]] == [r["uid"] for r in c11["dev"]]
-    assert [r["uid"] for r in c22["test"]] == [r["uid"] for r in c11["test"]]
-    assert set(c22["early_classes"]) != set(c11["early_classes"])
-    assert set(c33["early_classes"]) != set(c11["early_classes"])
+    for extra_s in (22, 33, 44, 55):
+        c_s = build_p1_p4_contracts(dataset_name="synthetic", raw_records=recs, class_names=names, orig_prompts=p0, unseen_prompts=pu, protocol="P4", allow_test=True, seed=extra_s, split_seed=11, class_order_seed=extra_s)
+        assert [r["uid"] for r in c_s["dev"]] == [r["uid"] for r in c11["dev"]]
+        assert [r["uid"] for r in c_s["test"]] == [r["uid"] for r in c11["test"]]
+        assert set(c_s["early_classes"]) != set(c11["early_classes"])
 
 
 def test_mnar_missing_rate_sweep(tmp_path: Path) -> None:
@@ -92,10 +91,11 @@ def test_scienceqa_mm8_loader_and_supplementary_aggregator(tmp_path: Path) -> No
             arms[arm] = {"regimes": regs}
         path.write_text(json.dumps({"config": {"dataset": ds_name, "backbone": bb, "protocol": pr}, "arms": arms}), encoding="utf8")
 
-    for s, b in ((11, 0.0), (22, 0.01), (33, -0.01)):
+    for s, b in ((11, 0.0), (22, 0.01), (33, -0.01), (44, 0.005), (55, -0.005)):
         for pr in ("P1", "P2", "P3", "P4"):
             _mock_json(supp_root / "multiseed" / "dmd" / f"seed_{s}" / f"clip_b16_same_bank/clip_b16_{pr.lower()}/ICCV_PROTOCOL_TEST_RESULTS.json", "dmd", "clip_b16", pr, b)
     for pr in ("P1", "P2", "P3", "P4"):
+        _mock_json(supp_root / "scaling_b32" / "dmd" / f"clip_b32_same_bank/clip_b32_{pr.lower()}/ICCV_PROTOCOL_TEST_RESULTS.json", "dmd", "clip_b32", pr, -0.02)
         _mock_json(supp_root / "scaling_l14" / "dmd" / f"clip_l14_same_bank/clip_l14_{pr.lower()}/ICCV_PROTOCOL_TEST_RESULTS.json", "dmd", "clip_l14", pr, 0.04)
         _mock_json(supp_root / "ood_general" / "scienceqa_mm8" / f"clip_b16_same_bank/clip_b16_{pr.lower()}/ICCV_PROTOCOL_TEST_RESULTS.json", "scienceqa_mm8", "clip_b16", pr, 0.02)
     for r_tag, b in (("rho_000", 0.15), ("rho_050", 0.05), ("rho_100", 0.0)):
@@ -104,6 +104,8 @@ def test_scienceqa_mm8_loader_and_supplementary_aggregator(tmp_path: Path) -> No
 
     master_md = write_supplementary_suite(supp_root)
     assert master_md.is_file() and "$" not in master_md.read_text(encoding="utf8")
+    assert "B/32" in master_md.read_text(encoding="utf8")
+    assert "scaling_b32" in json.loads((supp_root / "ICCV_SUPPLEMENTARY_MASTER_RESULTS.json").read_text(encoding="utf8"))["piece2_scaling_ood"]
     assert (supp_root / "ICCV_SUPP_PIECE1_MULTISEED.tex").is_file()
     assert (supp_root / "ICCV_SUPP_PIECE2_SCALING_OOD.tex").is_file()
     assert (supp_root / "ICCV_SUPP_PIECE3_MNAR_SWEEP.tex").is_file()

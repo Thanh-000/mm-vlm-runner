@@ -26,9 +26,9 @@ def build() -> None:
             """
             # ICCV Supplementary 3-Piece Verification Suite (`CSS-CT v2.2-fair`)
 
-            Runs **3 targeted, reviewer-proofing experiments** (~55–65 min total on A100-80GB) cleanly separated from the frozen main-benchmark results:
-            1. **Piece 1 — Multi-Seed & Class-Order Permutation (`seeds = 11, 22, 33`):** Fixed `dev`/`test` splits with permuted continual class entry order -> `Mean ± Std` across 3 independent continual trajectories.
-            2. **Piece 2 — Backbone Scaling (`CLIP ViT-L/14`, 428M) & Out-of-Domain Generalization (`ScienceQA-MM8`, 8 academic topics):** Auto-fetched via `aria2c` from official HuggingFace Parquets.
+            Runs **3 targeted, reviewer-proofing experiments** (~75–85 min total on A100-80GB with 5 seeds + 3 ViT tiers) cleanly separated from the frozen main-benchmark results:
+            1. **Piece 1 — Multi-Seed & Class-Order Permutation (`seeds = 11, 22, 33, 44, 55`):** Fixed `dev`/`test` splits with 5 independent continual class-order permutations -> `Mean ± Std` (set `SEEDS = "11,22,33"` for ~55 min 3-seed mode).
+            2. **Piece 2 — Backbone Diversity & Scaling (`CLIP ViT-B/32`, `CLIP ViT-L/14` + `ScienceQA-MM8` Out-of-Domain):** Auto-fetched via `aria2c` / HF snapshots alongside `ViT-B/16` & `SigLIP-B/16`.
             3. **Piece 3 — Continuous MNAR Missingness Severity Sweep (`0%, 25%, 50%, 75%, 90%, 100%` on `DMD` `P3/P4`):** Quantifies phase-transition degradation and plots `fig_mnar_severity_sweep.pdf/.png`.
             """,
             kind="markdown",
@@ -41,8 +41,9 @@ def build() -> None:
             REPO_BRANCH = "main"  # @param {{type:"string"}}
             CONFIRM_FREEZE_TEST = True  # @param {{type:"boolean"}}
             RUN_PIECE1_MULTISEED = True  # @param {{type:"boolean"}}
-            SEEDS = "11,22,33"  # @param {{type:"string"}}
+            SEEDS = "11,22,33,44,55"  # @param {{type:"string"}}
             INCLUDE_CRISISMMD_MULTISEED = False  # @param {{type:"boolean"}}
+            RUN_PIECE2A_CLIP_B32 = True  # @param {{type:"boolean"}}
             RUN_PIECE2A_CLIP_L14 = True  # @param {{type:"boolean"}}
             RUN_PIECE2B_SCIENCEQA_OOD = True  # @param {{type:"boolean"}}
             RUN_PIECE3_MNAR_SWEEP = True  # @param {{type:"boolean"}}
@@ -162,6 +163,8 @@ def build() -> None:
                     sk = ["*.msgpack", "*.h5", "*.ot", "tf_model*"]
                     snapshot_download("openai/clip-vit-base-patch16", revision="57c216476eefef5ab752ec549e440a49ae4ae5f3", ignore_patterns=sk)
                     snapshot_download("google/siglip-base-patch16-224", revision="7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed", ignore_patterns=sk)
+                    if RUN_PIECE2A_CLIP_B32:
+                        snapshot_download("openai/clip-vit-base-patch32", revision="3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268", ignore_patterns=sk)
                     if RUN_PIECE2A_CLIP_L14:
                         snapshot_download("openai/clip-vit-large-patch14", revision="32bd64288804d66eefd0ccbe215aa642df71cc41", ignore_patterns=sk)
                 except Exception as exc_hf:
@@ -222,12 +225,12 @@ def build() -> None:
                 return out_d
 
             DATASET_PATHS = {}
-            need_dis = bool(RUN_PIECE1_MULTISEED or RUN_PIECE2A_CLIP_L14 or RUN_PIECE3_MNAR_SWEEP)
+            need_dis = bool(RUN_PIECE1_MULTISEED or RUN_PIECE2A_CLIP_B32 or RUN_PIECE2A_CLIP_L14 or RUN_PIECE3_MNAR_SWEEP)
             if need_dis:
                 dmd_d = _prep_ds("dmd", str(DMD_ARCHIVE_URL), prepare_dmd, lambda d: any(d.rglob("*.txt")) and any(d.rglob("*.jpg")))
                 DATASET_PATHS["dmd"] = (dmd_d, dmd_d)
                 print("[READY] dmd:", dmd_d, flush=True)
-            if RUN_PIECE1_MULTISEED or RUN_PIECE2A_CLIP_L14:
+            if RUN_PIECE1_MULTISEED or RUN_PIECE2A_CLIP_B32 or RUN_PIECE2A_CLIP_L14:
                 inc_d = _prep_ds("incidents_vqa", str(INCIDENTS_VQA_ARCHIVE_URL), prepare_incidents_vqa, lambda d: any(d.rglob("disastervqa_annotations.jsonl")) and any(d.rglob("*.jpg")))
                 m3_d = _prep_ds("disaster_m3", str(DISASTER_M3_ARCHIVE_URL), prepare_disaster_m3, lambda d: any(d.rglob("benchmark_release.json")) and any(d.rglob("*.png")))
                 DATASET_PATHS["incidents_vqa"] = (inc_d, inc_d)
@@ -350,6 +353,14 @@ def build() -> None:
                         for bb, bs in (("clip", "clip_b16"), ("siglip", "siglip_b16")):
                             fl = ["--seed", str(s), "--split-seed", "11", "--class-order-seed", str(s), "--mnar-missing-rate", "1.0"]
                             _add_group(f"p1_{ds}_s{s}_{bs}", f"configs/iccv_{ds}_{bb}.yaml", sp, ip, f"multiseed/{ds}/seed_{s}/{bs}_same_bank", ["P4", "P3", "P2", "P1"], fl, vc)
+
+            if RUN_PIECE2A_CLIP_B32:
+                for ds in ("dmd", "disaster_m3", "incidents_vqa"):
+                    if ds not in DATASET_PATHS:
+                        continue
+                    sp, ip = DATASET_PATHS[ds]
+                    vc = 4.5 if ds == "dmd" else (3.5 if ds == "disaster_m3" else 2.2)
+                    _add_group(f"p2a_{ds}_b32", f"configs/iccv_{ds}_clip_b32.yaml", sp, ip, f"scaling_b32/{ds}/clip_b32_same_bank", ["P4", "P3", "P2", "P1"], ["--seed", "11", "--split-seed", "11"], vc)
 
             if RUN_PIECE2A_CLIP_L14:
                 for ds in ("dmd", "disaster_m3", "incidents_vqa"):

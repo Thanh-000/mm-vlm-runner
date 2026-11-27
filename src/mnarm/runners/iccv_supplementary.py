@@ -129,6 +129,7 @@ def _summarize_piece1(ms_root: Path, out_dir: Path) -> dict[str, Any]:
 
 
 def _summarize_piece2(supp_root: Path, out_dir: Path) -> dict[str, Any]:
+    b32_map = _collect_proto_jsons(supp_root / "scaling_b32")
     l14_map = _collect_proto_jsons(supp_root / "scaling_l14")
     b16_map = {k: v for k, v in _collect_proto_jsons(supp_root / "multiseed").items() if k[1] == "clip_b16"}
     # Keep only seed_11 for B/16 scaling match when available
@@ -138,30 +139,37 @@ def _summarize_piece2(supp_root: Path, out_dir: Path) -> dict[str, Any]:
         for sp in s11_paths:
             b16_map.update({k: v for k, v in _collect_proto_jsons(sp).items() if k[1] == "clip_b16"})
     ood_map = _collect_proto_jsons(supp_root / "ood_general")
-    if not l14_map and not ood_map:
+    if not b32_map and not l14_map and not ood_map:
         return {}
 
-    lines = ["# Piece 2: Backbone Scaling (`CLIP ViT-L/14`) & Out-of-Domain (`ScienceQA-MM8`)\n"]
-    res_json: dict[str, Any] = {"scaling_l14": {}, "ood_scienceqa": {}}
-    if l14_map:
-        lines.append("## 2A. CLIP-B/16 vs CLIP-L/14 (Paired Macro-F1 % across matched datasets)\n")
-        lines.append("| Arm | B/16 Raw / +NCM / **CSS-CT** | L/14 Raw / +NCM / **CSS-CT** | L/14 P3/P4 (+NCM -> **CSS-CT**) |")
-        lines.append("|---|---|---|---|")
-        matched_ds = sorted({k[0] for k in l14_map})
+    lines = ["# Piece 2: Architecture Diversity (`CLIP ViT-B/32`, `ViT-B/16`, `ViT-L/14`) & Out-of-Domain (`ScienceQA-MM8`)\n"]
+    res_json: dict[str, Any] = {"scaling_b32": {}, "scaling_l14": {}, "ood_scienceqa": {}}
+    if b32_map or l14_map:
+        lines.append("## 2A. Architecture Diversity & Scaling: CLIP-B/32 vs. CLIP-B/16 vs. CLIP-L/14 (Paired Macro-F1 %)\n")
+        lines.append("| Arm | B/32 Raw / +NCM / **CSS-CT** | B/16 Raw / +NCM / **CSS-CT** | L/14 Raw / +NCM / **CSS-CT** | P3/P4 CSS-CT (B/32 / B/16 / L/14) |")
+        lines.append("|---|---|---|---|---|")
+        matched_ds = sorted({k[0] for k in l14_map} | {k[0] for k in b32_map})
         for arm in SUPP_ARMS:
             def _m(src: dict[tuple[str, str, str], dict[str, Any]], prs: tuple[str, ...], rg: str) -> float:
                 vs = [_cell_val(r, arm, rg) for (ds, _, pr), r in src.items() if ds in matched_ds and pr in prs]
                 vc = [v for v in vs if v is not None]
                 return sum(vc) / float(len(vc)) if vc else float("nan")
-            b_r, b_n, b_c = _m(b16_map, ("P1", "P2", "P3", "P4"), "raw"), _m(b16_map, ("P1", "P2", "P3", "P4"), "ncm"), _m(b16_map, ("P1", "P2", "P3", "P4"), "zero_mnar")
-            l_r, l_n, l_c = _m(l14_map, ("P1", "P2", "P3", "P4"), "raw"), _m(l14_map, ("P1", "P2", "P3", "P4"), "ncm"), _m(l14_map, ("P1", "P2", "P3", "P4"), "zero_mnar")
-            l_p34_n, l_p34_c = _m(l14_map, ("P3", "P4"), "ncm"), _m(l14_map, ("P3", "P4"), "zero_mnar")
+            a_r, a_n, a_c, a34 = _m(b32_map, ("P1", "P2", "P3", "P4"), "raw"), _m(b32_map, ("P1", "P2", "P3", "P4"), "ncm"), _m(b32_map, ("P1", "P2", "P3", "P4"), "zero_mnar"), _m(b32_map, ("P3", "P4"), "zero_mnar")
+            b_r, b_n, b_c, b34 = _m(b16_map, ("P1", "P2", "P3", "P4"), "raw"), _m(b16_map, ("P1", "P2", "P3", "P4"), "ncm"), _m(b16_map, ("P1", "P2", "P3", "P4"), "zero_mnar"), _m(b16_map, ("P3", "P4"), "zero_mnar")
+            l_r, l_n, l_c, l34 = _m(l14_map, ("P1", "P2", "P3", "P4"), "raw"), _m(l14_map, ("P1", "P2", "P3", "P4"), "ncm"), _m(l14_map, ("P1", "P2", "P3", "P4"), "zero_mnar"), _m(l14_map, ("P3", "P4"), "zero_mnar")
+            res_json["scaling_b32"][arm] = {
+                k: (round(v, 4) if v == v else None)
+                for k, v in (("b32_raw", a_r), ("b32_ncm", a_n), ("b32_css", a_c), ("b32_p34_css", a34))
+            }
             res_json["scaling_l14"][arm] = {
                 k: (round(v, 4) if v == v else None)
-                for k, v in (("l14_raw", l_r), ("l14_ncm", l_n), ("l14_css", l_c), ("l14_p34_css", l_p34_c))
+                for k, v in (("l14_raw", l_r), ("l14_ncm", l_n), ("l14_css", l_c), ("l14_p34_css", l34))
             }
             fmt = lambda x: f"{x:.2f}" if x == x else "--"
-            lines.append(f"| `{arm}` | {fmt(b_r)} / {fmt(b_n)} / **{fmt(b_c)}** | {fmt(l_r)} / {fmt(l_n)} / **{fmt(l_c)}** | {fmt(l_p34_n)} -> **{fmt(l_p34_c)}** |")
+            lines.append(
+                f"| `{arm}` | {fmt(a_r)} / {fmt(a_n)} / **{fmt(a_c)}** | {fmt(b_r)} / {fmt(b_n)} / **{fmt(b_c)}** | "
+                f"{fmt(l_r)} / {fmt(l_n)} / **{fmt(l_c)}** | **{fmt(a34)}** / **{fmt(b34)}** / **{fmt(l34)}** |"
+            )
     if ood_map:
         lines.append("\n## 2B. Out-of-Domain Generalization on ScienceQA-MM8 (CLIP-B/16 + SigLIP-B/16)\n")
         lines.append("| Arm | All P1-P4 Raw | +GR-CLIP | +NCM | +cal | **CSS-CT** | P3/P4 (+NCM -> **CSS-CT**) | 3-View CSS | P3/P4 ErRec (Raw -> CSS) |")
@@ -185,12 +193,14 @@ def _summarize_piece2(supp_root: Path, out_dir: Path) -> dict[str, Any]:
     assert "$" not in md
     (out_dir / "ICCV_SUPP_PIECE2_SCALING_OOD.md").write_text(md, encoding="utf8")
     tex_p2 = []
-    if res_json["scaling_l14"]:
-        tex_p2.extend(["% Piece 2A: CLIP ViT-L/14 Scaling", "\\begin{tabular}{lrrrr}", "\\toprule", "Method & L/14 Raw & L/14 +NCM & L/14 CSS-CT & L/14 P3/P4 CSS-CT \\\\", "\\midrule"])
-        for arm, rv in res_json["scaling_l14"].items():
+    if res_json["scaling_b32"] or res_json["scaling_l14"]:
+        tex_p2.extend(["% Piece 2A: CLIP ViT-B/32 & ViT-L/14 Architecture Diversity", "\\begin{tabular}{lrrrrr}", "\\toprule", "Method & B/32 CSS-CT & L/14 Raw & L/14 +NCM & L/14 CSS-CT & P3/P4 (B/32 / L/14) \\\\", "\\midrule"])
+        for arm in SUPP_ARMS:
+            rb = res_json["scaling_b32"].get(arm, {})
+            rl = res_json["scaling_l14"].get(arm, {})
             f = lambda x: f"{x:.2f}" if (x is not None and x == x) else "--"
             arm_tex = arm.replace("_", "\\_")
-            tex_p2.append(f"\\texttt{{{arm_tex}}} & {f(rv['l14_raw'])} & {f(rv['l14_ncm'])} & \\textbf{{{f(rv['l14_css'])}}} & \\textbf{{{f(rv['l14_p34_css'])}}} \\\\")
+            tex_p2.append(f"\\texttt{{{arm_tex}}} & {f(rb.get('b32_css'))} & {f(rl.get('l14_raw'))} & {f(rl.get('l14_ncm'))} & \\textbf{{{f(rl.get('l14_css'))}}} & {f(rb.get('b32_p34_css'))} / \\textbf{{{f(rl.get('l14_p34_css'))}}} \\\\")
         tex_p2.extend(["\\bottomrule", "\\end{tabular}", ""])
     if res_json["ood_scienceqa"]:
         tex_p2.extend(["% Piece 2B: ScienceQA-MM8 Out-of-Domain", "\\begin{tabular}{lrrrr}", "\\toprule", "Method & Raw & +NCM & CSS-CT & P3/P4 CSS-CT \\\\", "\\midrule"])
