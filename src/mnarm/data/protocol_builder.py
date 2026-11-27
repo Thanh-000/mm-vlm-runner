@@ -116,10 +116,16 @@ def build_p1_p4_contracts(
     protocol: str,
     allow_test: bool = False,
     seed: int = 11,
+    split_seed: int | None = None,
+    class_order_seed: int | None = None,
+    mnar_missing_rate: float = 1.0,
 ) -> dict[str, Any]:
     """Construct zero-leakage P1-P4 continual stages & MNAR modality contracts for any disaster dataset."""
     if protocol not in ("P1", "P2", "P3", "P4"):
         raise ValueError(f"Unsupported protocol: {protocol}")
+    miss_rate = float(mnar_missing_rate)
+    if not (0.0 <= miss_rate <= 1.0):
+        raise ValueError(f"mnar_missing_rate must be in [0.0, 1.0], got {mnar_missing_rate}")
     k_cls = len(class_names)
     if k_cls < 4:
         raise ValueError(f"Expected >= 4 classes, got {k_cls}")
@@ -140,14 +146,27 @@ def build_p1_p4_contracts(
             }
         )
 
-    tr_rows, dev_rows_raw, test_rows_raw = _group_stratified_split(norm_recs, k_cls, seed=seed)
+    sp_seed = int(seed if split_seed is None else split_seed)
+    tr_rows, dev_rows_raw, test_rows_raw = _group_stratified_split(norm_recs, k_cls, seed=sp_seed)
     overlap_audit = assert_zero_split_overlap({"train": tr_rows, "dev": dev_rows_raw, "test": test_rows_raw})
 
     num_stages = max(3, k_cls // 2)
-    stage_cls: list[list[int]] = [[] for _ in range(num_stages)]
-    for c in range(k_cls):
-        stage_cls[min(num_stages - 1, c // 2 if k_cls // 2 == num_stages else (c * num_stages) // k_cls)].append(c)
     n_early_st = 2 if num_stages >= 4 else 1
+    cls_order = list(range(k_cls))
+    if class_order_seed is not None and int(class_order_seed) != 11:
+        len_early = sum(
+            1
+            for c in range(k_cls)
+            if min(num_stages - 1, c // 2 if k_cls // 2 == num_stages else (c * num_stages) // k_cls) < n_early_st
+        )
+        rng_co = random.Random(int(class_order_seed) * 997 + k_cls)
+        rng_co.shuffle(cls_order)
+        if set(cls_order[:len_early]) == set(range(len_early)):
+            rng_co.shuffle(cls_order)
+
+    stage_cls: list[list[int]] = [[] for _ in range(num_stages)]
+    for idx, c in enumerate(cls_order):
+        stage_cls[min(num_stages - 1, idx // 2 if k_cls // 2 == num_stages else (idx * num_stages) // k_cls)].append(c)
     early_classes = [c for st_i in range(n_early_st) for c in stage_cls[st_i]]
     late_classes = [c for st_i in range(n_early_st, num_stages) for c in stage_cls[st_i]]
 
@@ -182,11 +201,19 @@ def build_p1_p4_contracts(
         for c in cls_list:
             c_fit = fit_by_cls[c]
             c_cal = cal_by_cls[c]
+            if miss_rate >= 1.0 - 1e-9:
+                miss_idx_f = set(range(len(c_fit)))
+                miss_idx_c = set(range(len(c_cal)))
+            else:
+                k_miss_f = int(round(miss_rate * len(c_fit)))
+                k_miss_c = int(round(miss_rate * len(c_cal)))
+                miss_idx_f = set(random.Random(int(seed) * 131 + int(c) * 17 + 1).sample(range(len(c_fit)), k_miss_f)) if k_miss_f > 0 else set()
+                miss_idx_c = set(random.Random(int(seed) * 131 + int(c) * 17 + 2).sample(range(len(c_cal)), k_miss_c)) if k_miss_c > 0 else set()
             for pos, r in enumerate(c_fit):
                 if protocol == "P3":
-                    msk = ["text"] if is_early else ["text", "image"]
+                    msk = ["text"] if (is_early and pos in miss_idx_f) else ["text", "image"]
                 elif protocol == "P4":
-                    msk = ["image"] if is_early else ["text", "image"]
+                    msk = ["image"] if (is_early and pos in miss_idx_f) else ["text", "image"]
                 elif protocol == "P1":
                     msk = ["text"] if (s_idx == 0 and pos % 2 == 0) else ["text", "image"]
                 else:
@@ -195,9 +222,9 @@ def build_p1_p4_contracts(
 
             for pos, r in enumerate(c_cal):
                 if protocol == "P3":
-                    cmsk = ["text"] if is_early else ["text", "image"]
+                    cmsk = ["text"] if (is_early and pos in miss_idx_c) else ["text", "image"]
                 elif protocol == "P4":
-                    cmsk = ["image"] if is_early else ["text", "image"]
+                    cmsk = ["image"] if (is_early and pos in miss_idx_c) else ["text", "image"]
                 else:
                     cmsk = ["text", "image"] if st_num >= 2 else (["text"] if (protocol == "P1" and pos % 2 == 0) else (["image"] if (protocol == "P2" and pos % 2 == 0) else ["text", "image"]))
                 cal_t_new.append({"uid": r["uid"], "label": int(r["label"]), "mask": cmsk})
@@ -243,6 +270,8 @@ def build_p1_p4_contracts(
         "class_names": list(class_names),
         "orig_prompts": list(orig_prompts),
         "unseen_prompts": list(unseen_prompts),
+        "class_order": cls_order,
+        "mnar_missing_rate": miss_rate,
         "early_classes": early_classes,
         "late_classes": late_classes,
         "stages": stage_plans,

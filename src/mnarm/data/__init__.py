@@ -21,6 +21,7 @@ from mnarm.data.disaster_suite import (
     prepare_dmd,
     prepare_incidents_vqa,
 )
+from mnarm.data.general_suite import SCIENCEQA_CLASSES, prepare_scienceqa_mm8, scan_scienceqa_mm8_records
 from mnarm.data.protocol_builder import build_p1_p4_contracts
 from mnarm.data.tensor_store import MaskedRowsDataset, PreprocessedTensorStore
 
@@ -29,6 +30,7 @@ __all__ = [
     "MaskedRowsDataset",
     "ORIGINAL_PROMPTS",
     "PreprocessedTensorStore",
+    "SCIENCEQA_CLASSES",
     "UNSEEN_PROMPTS",
     "aria2_download_file",
     "assert_zero_split_overlap",
@@ -42,5 +44,7 @@ __all__ = [
     "prepare_disaster_m3",
     "prepare_dmd",
     "prepare_incidents_vqa",
+    "prepare_scienceqa_mm8",
+    "scan_scienceqa_mm8_records",
     "uid_hash",
 ]

@@ -11,6 +11,12 @@ from typing import Any
 
 from mnarm.data.archive_ops import aria2_download_file, extract_archive_safe, hf_lfs_batch_download
 from mnarm.data.crisismmd import load_crisismmd_contracts
+from mnarm.data.general_suite import (
+    SCIENCEQA_CLASSES,
+    SCIENCEQA_ORIG_PROMPTS,
+    SCIENCEQA_UNSEEN_PROMPTS,
+    scan_scienceqa_mm8_records,
+)
 from mnarm.data.protocol_builder import build_p1_p4_contracts
 
 INCIDENTS_HF_SHA = "f341ce34814a93bad8abfe73da898a309116a59e"
@@ -284,25 +290,39 @@ def _scan_disaster_m3_records(root: Path) -> list[dict[str, Any]]:
 
 
 def load_benchmark_contracts(
-    dataset_name: str, seq_inputs_dir: Path, images_dir: Path, protocol: str, allow_test: bool = False, seed: int = 11
+    dataset_name: str,
+    seq_inputs_dir: Path,
+    images_dir: Path,
+    protocol: str,
+    allow_test: bool = False,
+    seed: int = 11,
+    split_seed: int | None = None,
+    class_order_seed: int | None = None,
+    mnar_missing_rate: float = 1.0,
 ) -> dict[str, Any]:
-    """Unified dispatcher loading CrisisMMD, DMD, DisasterVQA-Incidents, or DisasterM3."""
+    """Unified dispatcher loading CrisisMMD, DMD, DisasterVQA-Incidents, DisasterM3, or ScienceQA-MM8."""
     ds_key = str(dataset_name).strip().lower()
     if ds_key == "crisismmd":
         return load_crisismmd_contracts(seq_inputs_dir, images_dir, protocol, allow_test=allow_test)
+    kw_ext = {"split_seed": split_seed, "class_order_seed": class_order_seed, "mnar_missing_rate": float(mnar_missing_rate)}
     if ds_key == "dmd":
         return build_p1_p4_contracts(
             dataset_name="dmd", raw_records=_scan_dmd_records(images_dir), class_names=DMD_CLASSES,
-            orig_prompts=DMD_ORIG_PROMPTS, unseen_prompts=DMD_UNSEEN_PROMPTS, protocol=protocol, allow_test=allow_test, seed=seed,
+            orig_prompts=DMD_ORIG_PROMPTS, unseen_prompts=DMD_UNSEEN_PROMPTS, protocol=protocol, allow_test=allow_test, seed=seed, **kw_ext,
         )
     if ds_key == "incidents_vqa":
         return build_p1_p4_contracts(
             dataset_name="incidents_vqa", raw_records=_scan_incidents_vqa_records(images_dir), class_names=INCIDENTS_CLASSES,
-            orig_prompts=INCIDENTS_ORIG_PROMPTS, unseen_prompts=INCIDENTS_UNSEEN_PROMPTS, protocol=protocol, allow_test=allow_test, seed=seed,
+            orig_prompts=INCIDENTS_ORIG_PROMPTS, unseen_prompts=INCIDENTS_UNSEEN_PROMPTS, protocol=protocol, allow_test=allow_test, seed=seed, **kw_ext,
         )
     if ds_key == "disaster_m3":
         return build_p1_p4_contracts(
             dataset_name="disaster_m3", raw_records=_scan_disaster_m3_records(images_dir), class_names=M3_CLASSES,
-            orig_prompts=M3_ORIG_PROMPTS, unseen_prompts=M3_UNSEEN_PROMPTS, protocol=protocol, allow_test=allow_test, seed=seed,
+            orig_prompts=M3_ORIG_PROMPTS, unseen_prompts=M3_UNSEEN_PROMPTS, protocol=protocol, allow_test=allow_test, seed=seed, **kw_ext,
+        )
+    if ds_key == "scienceqa_mm8":
+        return build_p1_p4_contracts(
+            dataset_name="scienceqa_mm8", raw_records=scan_scienceqa_mm8_records(images_dir), class_names=SCIENCEQA_CLASSES,
+            orig_prompts=SCIENCEQA_ORIG_PROMPTS, unseen_prompts=SCIENCEQA_UNSEEN_PROMPTS, protocol=protocol, allow_test=allow_test, seed=seed, **kw_ext,
         )
     raise ValueError(f"Unsupported dataset={dataset_name!r}")

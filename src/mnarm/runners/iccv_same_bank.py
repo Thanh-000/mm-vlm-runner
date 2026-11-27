@@ -70,9 +70,13 @@ def run_single_protocol_same_bank(
     seed_everything(seed, deterministic=bool(config.get("deterministic", True)))
     use_amp = bool(config.get("use_amp", True)) and vlm.device == "cuda"
     vram_bytes = torch.cuda.get_device_properties(0).total_memory if (vlm.device == "cuda" and torch.cuda.is_available()) else 0
-    eff_eval_bs = max(int(config["eval_batch_size"]), 1024 if vram_bytes >= 40 * (1024 ** 3) else (512 if vram_bytes >= 22 * (1024 ** 3) else int(config["eval_batch_size"])))
+    auto_eval_cap = 512 if str(config.get("backbone", "")).endswith("_l14") else 1024
+    eff_eval_bs = max(int(config["eval_batch_size"]), auto_eval_cap if vram_bytes >= 40 * (1024 ** 3) else (512 if vram_bytes >= 22 * (1024 ** 3) else int(config["eval_batch_size"])))
     b0_cache = base0_cache if base0_cache is not None else {"text": {}, "image": {}}
-    ds = load_benchmark_contracts(str(config.get("dataset", "crisismmd")), seq_inputs, images_dir, config["protocol"], allow_test=allow_test, seed=seed)
+    ds = load_benchmark_contracts(
+        str(config.get("dataset", "crisismmd")), seq_inputs, images_dir, config["protocol"], allow_test=allow_test, seed=seed,
+        split_seed=config.get("split_seed"), class_order_seed=config.get("class_order_seed"), mnar_missing_rate=float(config.get("mnar_missing_rate", 1.0)),
+    )
     lock_cfg = {**config, "allow_test": allow_test, **({"method_freeze": "CSS-CT-v2.2-fair"} if allow_test else {})}
     out_dir.mkdir(parents=True, exist_ok=True)
     write_json_atomic(out_dir / "RUN_LOCK.json", build_run_lock(lock_cfg, repo_root=Path(__file__).resolve().parents[3], dataset_hashes=ds["hashes"]))
@@ -231,7 +235,10 @@ def run_iccv_same_bank(
     protos = [str(p).upper() for p in (protocols or ("P4", "P3", "P2", "P1"))]
     device, backbone = str(config.get("device", "cuda" if torch.cuda.is_available() else "cpu")), str(config["backbone"])
     out_dir.mkdir(parents=True, exist_ok=True)
-    base_ds = load_benchmark_contracts(str(config.get("dataset", "crisismmd")), seq_inputs, images_dir, "P4", allow_test=allow_test, seed=int(config.get("seed", 11)))
+    base_ds = load_benchmark_contracts(
+        str(config.get("dataset", "crisismmd")), seq_inputs, images_dir, "P4", allow_test=allow_test, seed=int(config.get("seed", 11)),
+        split_seed=config.get("split_seed"), class_order_seed=config.get("class_order_seed"), mnar_missing_rate=float(config.get("mnar_missing_rate", 1.0)),
+    )
     vlm = vlm or MultimodalVLM(backbone, model_override or config["model_id"], device=device, rank=int(config["lora_rank"]), alpha=int(config["lora_alpha"]), revision=None if model_override else config.get("revision"), local_files_only=bool(model_override))
     protos_full, unseen_protos = vlm.encode_prompts(base_ds["orig_prompts"]), vlm.encode_prompts(base_ds["unseen_prompts"])
     store = store or PreprocessedTensorStore(base_ds["lookup"], vlm, max_cached_images=int(config.get("max_cached_images", 25000)), workers=int(config.get("workers", 0)))
@@ -277,8 +284,17 @@ def main() -> None:
     ap.add_argument("--skip-suite-summary", action="store_true")
     ap.add_argument("--confirm-freeze", action="store_true")
     ap.add_argument("--model-path", type=str, default=None)
+    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--split-seed", type=int, default=None)
+    ap.add_argument("--class-order-seed", type=int, default=None)
+    ap.add_argument("--mnar-missing-rate", type=float, default=None)
     args = ap.parse_args()
-    summary = run_iccv_same_bank(load_yaml(args.config), args.seq_inputs, args.images, args.out, protocols=args.protocols, resume=args.resume, model_override=args.model_path, write_suite=not args.skip_suite_summary, confirm_freeze=args.confirm_freeze)
+    cfg = load_yaml(args.config)
+    for k_arg, k_cfg in (("seed", "seed"), ("split_seed", "split_seed"), ("class_order_seed", "class_order_seed"), ("mnar_missing_rate", "mnar_missing_rate")):
+        val = getattr(args, k_arg)
+        if val is not None:
+            cfg[k_cfg] = val
+    summary = run_iccv_same_bank(cfg, args.seq_inputs, args.images, args.out, protocols=args.protocols, resume=args.resume, model_override=args.model_path, write_suite=not args.skip_suite_summary, confirm_freeze=args.confirm_freeze)
     p_done = list(summary["protocols"].keys()) if isinstance(summary["protocols"], dict) else list(summary["protocols"])
     print(f"[ICCV SAME-BANK DONE] {summary['backbone']} -> {p_done}")
 

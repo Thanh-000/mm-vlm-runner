@@ -149,12 +149,12 @@ class MultimodalVLM:
             proc_kw["revision"] = revision
 
         fast_proc = bool(torch.cuda.is_available() and device == "cuda")
-        if backbone_key == "clip_b16":
+        if backbone_key.startswith("clip_"):
             self.clip = _load_hf_model(CLIPModel, model_path, revision, local_files_only)
             self.processor = _load_processor(CLIPProcessor, model_path, prefer_fast=fast_proc, **proc_kw)
             self.is_siglip = False
             self.tok_kwargs = {"padding": "max_length", "truncation": True, "max_length": 77}
-        elif backbone_key == "siglip_b16":
+        elif backbone_key.startswith("siglip_"):
             self.clip = _load_hf_model(SiglipModel, model_path, revision, local_files_only)
             self.processor = _load_processor(AutoProcessor, model_path, prefer_fast=True, **proc_kw)
             self.is_siglip = True
