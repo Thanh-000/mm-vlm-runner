@@ -106,21 +106,24 @@ def _reservoir_buffer(records: list[dict[str, Any]], cap: int, seed: int) -> lis
     return out
 
 
-def build_p1_p4_contracts(
+def build_stages_from_splits(
     *,
     dataset_name: str,
-    raw_records: list[dict[str, Any]],
+    tr_rows: list[dict[str, Any]],
+    dev_rows_raw: list[dict[str, Any]],
+    test_rows_raw: list[dict[str, Any]],
     class_names: list[str],
     orig_prompts: list[str],
     unseen_prompts: list[str],
     protocol: str,
     allow_test: bool = False,
     seed: int = 11,
-    split_seed: int | None = None,
     class_order_seed: int | None = None,
     mnar_missing_rate: float = 1.0,
+    overlap_audit: dict[str, int] | None = None,
+    lookup_override: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Construct zero-leakage P1-P4 continual stages & MNAR modality contracts for any disaster dataset."""
+    """Build P1-P4 continual stages & MNAR masks from fixed train/dev/test splits."""
     if protocol not in ("P1", "P2", "P3", "P4"):
         raise ValueError(f"Unsupported protocol: {protocol}")
     miss_rate = float(mnar_missing_rate)
@@ -129,26 +132,7 @@ def build_p1_p4_contracts(
     k_cls = len(class_names)
     if k_cls < 4:
         raise ValueError(f"Expected >= 4 classes, got {k_cls}")
-
-    norm_recs: list[dict[str, Any]] = []
-    for r in raw_records:
-        txt = str(r["text"]).strip()
-        uid = str(r.get("uid") or uid_hash(dataset_name, str(r["image"]), txt))
-        norm_recs.append(
-            {
-                "uid": uid,
-                "sample_id": uid,
-                "group_id": str(r.get("group_id") or uid),
-                "label": int(r["label"]),
-                "text": txt,
-                "text_sha256": sha256_bytes(txt.encode("utf8")),
-                "image": Path(r["image"]),
-            }
-        )
-
-    sp_seed = int(seed if split_seed is None else split_seed)
-    tr_rows, dev_rows_raw, test_rows_raw = _group_stratified_split(norm_recs, k_cls, seed=sp_seed)
-    overlap_audit = assert_zero_split_overlap({"train": tr_rows, "dev": dev_rows_raw, "test": test_rows_raw})
+    ov_audit = overlap_audit if overlap_audit is not None else assert_zero_split_overlap({"train": tr_rows, "dev": dev_rows_raw, "test": test_rows_raw})
 
     num_stages = max(3, k_cls // 2)
     n_early_st = 2 if num_stages >= 4 else 1
@@ -256,10 +240,11 @@ def build_p1_p4_contracts(
         buf_before = buf_after
 
     active_rows = tr_rows + dev_rows_raw + (test_rows_raw if allow_test else [])
-    lookup = {r["uid"]: {"uid": r["uid"], "label": int(r["label"]), "text": r["text"], "image": r["image"]} for r in active_rows}
+    lookup = lookup_override if lookup_override is not None else {r["uid"]: {"uid": r["uid"], "label": int(r["label"]), "text": r["text"], "image": r["image"]} for r in active_rows}
     dev_out = [{"uid": r["uid"], "label": int(r["label"]), "mask": ["text", "image"]} for r in dev_rows_raw]
     test_out = [{"uid": r["uid"], "label": int(r["label"]), "mask": ["text", "image"]} for r in test_rows_raw] if allow_test else None
-    manifest_sig = sha256_bytes(json.dumps([(r["uid"], r["label"], r["text_sha256"]) for r in sorted(norm_recs, key=lambda x: x["uid"])]).encode("utf8"))
+    all_rows = tr_rows + dev_rows_raw + test_rows_raw
+    manifest_sig = sha256_bytes(json.dumps([(r["uid"], r["label"], r["text_sha256"]) for r in sorted(all_rows, key=lambda x: x["uid"])]).encode("utf8"))
 
     return {
         "name": dataset_name,
@@ -278,5 +263,44 @@ def build_p1_p4_contracts(
         "dev": dev_out,
         "test": test_out,
         "lookup": lookup,
-        "hashes": {"dataset_manifest_sha256": manifest_sig, **overlap_audit},
+        "hashes": {"dataset_manifest_sha256": manifest_sig, **ov_audit},
     }
+
+
+def build_p1_p4_contracts(
+    *,
+    dataset_name: str,
+    raw_records: list[dict[str, Any]],
+    class_names: list[str],
+    orig_prompts: list[str],
+    unseen_prompts: list[str],
+    protocol: str,
+    allow_test: bool = False,
+    seed: int = 11,
+    split_seed: int | None = None,
+    class_order_seed: int | None = None,
+    mnar_missing_rate: float = 1.0,
+) -> dict[str, Any]:
+    """Construct zero-leakage P1-P4 continual stages & MNAR modality contracts for any disaster dataset."""
+    k_cls = len(class_names)
+    if k_cls < 4:
+        raise ValueError(f"Expected >= 4 classes, got {k_cls}")
+    norm_recs = [
+        {
+            "uid": str(r.get("uid") or uid_hash(dataset_name, str(r["image"]), str(r["text"]).strip())),
+            "sample_id": str(r.get("uid") or uid_hash(dataset_name, str(r["image"]), str(r["text"]).strip())),
+            "group_id": str(r.get("group_id") or str(r.get("uid") or uid_hash(dataset_name, str(r["image"]), str(r["text"]).strip()))),
+            "label": int(r["label"]),
+            "text": str(r["text"]).strip(),
+            "text_sha256": sha256_bytes(str(r["text"]).strip().encode("utf8")),
+            "image": Path(r["image"]),
+        }
+        for r in raw_records
+    ]
+    sp_seed = int(seed if split_seed is None else split_seed)
+    tr_rows, dev_rows_raw, test_rows_raw = _group_stratified_split(norm_recs, k_cls, seed=sp_seed)
+    return build_stages_from_splits(
+        dataset_name=dataset_name, tr_rows=tr_rows, dev_rows_raw=dev_rows_raw, test_rows_raw=test_rows_raw,
+        class_names=class_names, orig_prompts=orig_prompts, unseen_prompts=unseen_prompts,
+        protocol=protocol, allow_test=allow_test, seed=seed, class_order_seed=class_order_seed, mnar_missing_rate=mnar_missing_rate,
+    )

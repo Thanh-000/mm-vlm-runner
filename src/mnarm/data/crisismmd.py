@@ -157,6 +157,9 @@ def load_crisismmd_contracts(
     images_dir: Path,
     protocol: str,
     allow_test: bool = False,
+    seed: int = 11,
+    class_order_seed: int | None = None,
+    mnar_missing_rate: float = 1.0,
 ) -> dict[str, Any]:
     """Load CrisisMMD P1-P4 stage contracts with zero split leakage and hard test isolation."""
     if protocol not in ("P1", "P2", "P3", "P4"):
@@ -199,6 +202,47 @@ def load_crisismmd_contracts(
     )
 
     tr_by_uid = {r["sample_id"]: r for r in manifest["rows"]["train"]}
+    is_frozen_default = (int(seed) == 11) and (class_order_seed is None or int(class_order_seed) == 11) and (float(mnar_missing_rate) >= 1.0 - 1e-9)
+    if not is_frozen_default:
+        from mnarm.data.protocol_builder import build_stages_from_splits
+
+        def _norm_split(rows_raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [
+                {
+                    "uid": r["sample_id"],
+                    "sample_id": r["sample_id"],
+                    "group_id": r["sample_id"],
+                    "label": int(r["label"]),
+                    "text": lookup[r["sample_id"]]["text"] if r["sample_id"] in lookup else "",
+                    "text_sha256": r["text_sha256"],
+                    "image": images_dir / r["image"],
+                }
+                for r in rows_raw
+            ]
+
+        dyn = build_stages_from_splits(
+            dataset_name="crisismmd",
+            tr_rows=_norm_split(manifest["rows"]["train"]),
+            dev_rows_raw=_norm_split(manifest["rows"]["dev"]),
+            test_rows_raw=_norm_split(manifest["rows"]["test"]) if allow_test else [],
+            class_names=CRISISMMD_CLASSES,
+            orig_prompts=ORIGINAL_PROMPTS,
+            unseen_prompts=UNSEEN_PROMPTS,
+            protocol=protocol,
+            allow_test=allow_test,
+            seed=int(seed),
+            class_order_seed=class_order_seed,
+            mnar_missing_rate=float(mnar_missing_rate),
+            overlap_audit=overlap_audit,
+            lookup_override=lookup,
+        )
+        dyn["hashes"] = {
+            "manifest_sha256": sha256_bytes(manifest_bytes),
+            "plans_sha256": sha256_bytes(plans_bytes),
+            "partition_contract_sha256": sha256_bytes(pc_bytes),
+            **overlap_audit,
+        }
+        return dyn
     stage_plans: list[dict[str, Any]] = []
     joint_so_far: dict[str, dict[str, Any]] = {}
     for t_idx in range(4):

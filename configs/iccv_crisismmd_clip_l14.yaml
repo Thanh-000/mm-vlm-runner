@@ -1,0 +1,26 @@
+schema: mnarm-config-v1
+experiment: iccv_crisismmd_clip_l14
+dataset: crisismmd
+protocol: P4
+allow_test: false
+
+backbone: clip_l14
+model_id: openai/clip-vit-large-patch14
+revision: 32bd64288804d66eefd0ccbe215aa642df71cc41
+
+seed: 11
+deterministic: true
+use_amp: true
+lora_rank: 8
+lora_alpha: 16
+epochs: 5
+effective_batch_size: 64
+micro_batch_size: 32
+eval_batch_size: 256
+lr: 3.0e-4
+mg_clip_lr: 5.0e-4
+weight_decay: 1.0e-4
+max_cached_images: 25000
+workers: 4
+shrinkage: null
+include_mg_clip: true

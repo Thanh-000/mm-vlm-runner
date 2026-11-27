@@ -303,7 +303,10 @@ def load_benchmark_contracts(
     """Unified dispatcher loading CrisisMMD, DMD, DisasterVQA-Incidents, DisasterM3, or ScienceQA-MM8."""
     ds_key = str(dataset_name).strip().lower()
     if ds_key == "crisismmd":
-        return load_crisismmd_contracts(seq_inputs_dir, images_dir, protocol, allow_test=allow_test)
+        return load_crisismmd_contracts(
+            seq_inputs_dir, images_dir, protocol, allow_test=allow_test,
+            seed=int(seed), class_order_seed=class_order_seed, mnar_missing_rate=float(mnar_missing_rate),
+        )
     kw_ext = {"split_seed": split_seed, "class_order_seed": class_order_seed, "mnar_missing_rate": float(mnar_missing_rate)}
     if ds_key == "dmd":
         return build_p1_p4_contracts(

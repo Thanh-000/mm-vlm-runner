@@ -111,3 +111,48 @@ def test_scienceqa_mm8_loader_and_supplementary_aggregator(tmp_path: Path) -> No
     assert (supp_root / "ICCV_SUPP_PIECE3_MNAR_SWEEP.tex").is_file()
     assert (supp_root / "figures" / "fig_mnar_severity_sweep.png").is_file()
     assert (supp_root / "figures" / "fig_mnar_severity_sweep.pdf").is_file()
+
+
+def test_crisismmd_multiseed_class_order_keeps_splits_fixed(tmp_path: Path) -> None:
+    import csv, io, zipfile
+    from mnarm.data.crisismmd import CRISISMMD_CLASSES, load_crisismmd_contracts, uid_hash
+
+    seq_dir, img_dir = tmp_path / "seq", tmp_path / "imgs"
+    seq_dir.mkdir(parents=True); (img_dir / "data_image").mkdir(parents=True)
+    rows_sp = {"train": [], "dev": [], "test": []}
+    plans_p4 = [{"stage": s + 1, "buffer": [], "calibration_latest_views": []} for s in range(4)]
+    pc_stages = []
+    for sp, per_cls in (("train", 6), ("dev", 2), ("test", 2)):
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=["tweet_id", "image_id", "tweet_text"], delimiter="\t")
+        writer.writeheader()
+        for c in range(8):
+            for i in range(per_cls):
+                tid, iid = f"{sp}_{c}_{i}", f"img_{sp}_{c}_{i}"
+                txt = f"disaster tweet class {CRISISMMD_CLASSES[c]} sample {sp} {i}"
+                sid = uid_hash(tid, iid)
+                rel = f"data_image/f_{sid[:12]}.jpg"
+                Image.new("RGB", (16, 16), color=(c * 25 % 255, i * 40 % 255, 60)).save(img_dir / rel)
+                writer.writerow({"tweet_id": tid, "image_id": iid, "tweet_text": txt})
+                from mnarm.core.io import sha256_bytes
+                rec = {"sample_id": sid, "label": c, "image": rel, "text_sha256": sha256_bytes(txt.encode("utf8"))}
+                rows_sp[sp].append(rec)
+                if sp == "train" and len(pc_stages) <= c // 2:
+                    pc_stages.append({"train_ids": [], "modalities": ["image"] if c // 2 < 2 else ["text", "image"]})
+                if sp == "train":
+                    pc_stages[c // 2]["train_ids"].append(sid)
+                    plans_p4[c // 2]["calibration_latest_views"].append({"uid": sid, "label": c, "mask": ["image"] if c // 2 < 2 else ["text", "image"]})
+        with zipfile.ZipFile(seq_dir / "splits.zip", "a") as zf:
+            zf.writestr(f"task_humanitarian_text_img_{sp}.tsv", buf.getvalue())
+    for st_i in range(4):
+        plans_p4[st_i]["seen_classes"] = list(range((st_i + 1) * 2))
+    (seq_dir / "manifest.json").write_text(json.dumps({"rows": rows_sp}), encoding="utf8")
+    (seq_dir / "PLANS.json").write_text(json.dumps({"P4": plans_p4}), encoding="utf8")
+    (seq_dir / "partition_contract.json").write_text(json.dumps({"protocols": {"P4": pc_stages}}), encoding="utf8")
+
+    c11 = load_crisismmd_contracts(seq_dir, img_dir, "P4", allow_test=True, seed=11)
+    c22 = load_crisismmd_contracts(seq_dir, img_dir, "P4", allow_test=True, seed=22, class_order_seed=22)
+    assert [r["uid"] for r in c22["dev"]] == [r["uid"] for r in c11["dev"]]
+    assert [r["uid"] for r in c22["test"]] == [r["uid"] for r in c11["test"]]
+    assert set(c22["early_classes"]) != set(c11["early_classes"])
+    assert len(c22["stages"]) == 4

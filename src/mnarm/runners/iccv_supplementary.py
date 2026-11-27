@@ -128,35 +128,49 @@ def _summarize_piece1(ms_root: Path, out_dir: Path) -> dict[str, Any]:
     return summary_json
 
 
+def _collect_seeded_jsons(supp_root: Path) -> dict[tuple[int, str, str, str], dict[str, Any]]:
+    seeded: dict[tuple[int, str, str, str], dict[str, Any]] = {}
+    ms_root = supp_root / "multiseed"
+    if ms_root.is_dir():
+        for sd in sorted(p for p in ms_root.glob("*/seed_*") if p.is_dir()):
+            m = re.match(r"seed_(\d+)$", sd.name)
+            if not m:
+                continue
+            s_id = int(m.group(1))
+            for (ds, bb, pr), d in _collect_proto_jsons(sd).items():
+                seeded[(s_id, ds, bb, pr)] = d
+    for sub in ("scaling_b32", "scaling_l14", "ood_general"):
+        for (ds, bb, pr), d in _collect_proto_jsons(supp_root / sub).items():
+            seeded.setdefault((11, ds, bb, pr), d)
+    return seeded
+
+
 def _summarize_piece2(supp_root: Path, out_dir: Path) -> dict[str, Any]:
-    b32_map = _collect_proto_jsons(supp_root / "scaling_b32")
-    l14_map = _collect_proto_jsons(supp_root / "scaling_l14")
-    b16_map = {k: v for k, v in _collect_proto_jsons(supp_root / "multiseed").items() if k[1] == "clip_b16"}
-    # Keep only seed_11 for B/16 scaling match when available
-    s11_paths = list((supp_root / "multiseed").glob("*/seed_11")) if (supp_root / "multiseed").is_dir() else []
-    if s11_paths:
-        b16_map = {}
-        for sp in s11_paths:
-            b16_map.update({k: v for k, v in _collect_proto_jsons(sp).items() if k[1] == "clip_b16"})
-    ood_map = _collect_proto_jsons(supp_root / "ood_general")
-    if not b32_map and not l14_map and not ood_map:
+    seeded = _collect_seeded_jsons(supp_root)
+    b32_rows = {k: v for k, v in seeded.items() if k[2] == "clip_b32"}
+    b16_rows = {k: v for k, v in seeded.items() if k[2] == "clip_b16"}
+    l14_rows = {k: v for k, v in seeded.items() if k[2] == "clip_l14"}
+    sig_rows = {k: v for k, v in seeded.items() if k[2] == "siglip_b16"}
+    ood_rows = {k: v for k, v in seeded.items() if k[1] == "scienceqa_mm8"}
+    if not b32_rows and not l14_rows and not ood_rows:
         return {}
 
-    lines = ["# Piece 2: Architecture Diversity (`CLIP ViT-B/32`, `ViT-B/16`, `ViT-L/14`) & Out-of-Domain (`ScienceQA-MM8`)\n"]
+    lines = ["# Piece 2: Architecture Diversity (`CLIP ViT-B/32`, `ViT-B/16`, `ViT-L/14`, `SigLIP-B/16`) & Out-of-Domain (`ScienceQA-MM8`)\n"]
     res_json: dict[str, Any] = {"scaling_b32": {}, "scaling_l14": {}, "ood_scienceqa": {}}
-    if b32_map or l14_map:
-        lines.append("## 2A. Architecture Diversity & Scaling: CLIP-B/32 vs. CLIP-B/16 vs. CLIP-L/14 (Paired Macro-F1 %)\n")
-        lines.append("| Arm | B/32 Raw / +NCM / **CSS-CT** | B/16 Raw / +NCM / **CSS-CT** | L/14 Raw / +NCM / **CSS-CT** | P3/P4 CSS-CT (B/32 / B/16 / L/14) |")
-        lines.append("|---|---|---|---|---|")
-        matched_ds = sorted({k[0] for k in l14_map} | {k[0] for k in b32_map})
+    if b32_rows or l14_rows:
+        lines.append("## 2A. Architecture Diversity & Scaling across Matched Datasets (Paired Macro-F1 %)\n")
+        lines.append("| Arm | B/32 Raw / +NCM / **CSS-CT** | B/16 Raw / +NCM / **CSS-CT** | L/14 Raw / +NCM / **CSS-CT** | SigLIP CSS-CT | P3/P4 CSS-CT (B/32 / B/16 / L/14 / Sig) |")
+        lines.append("|---|---|---|---|---:|---|")
+        matched_ds = sorted({k[1] for k in l14_rows} | {k[1] for k in b32_rows})
         for arm in SUPP_ARMS:
-            def _m(src: dict[tuple[str, str, str], dict[str, Any]], prs: tuple[str, ...], rg: str) -> float:
-                vs = [_cell_val(r, arm, rg) for (ds, _, pr), r in src.items() if ds in matched_ds and pr in prs]
+            def _m(src: dict[tuple[int, str, str, str], dict[str, Any]], prs: tuple[str, ...], rg: str) -> float:
+                vs = [_cell_val(r, arm, rg) for (_, ds, _, pr), r in src.items() if ds in matched_ds and pr in prs]
                 vc = [v for v in vs if v is not None]
                 return sum(vc) / float(len(vc)) if vc else float("nan")
-            a_r, a_n, a_c, a34 = _m(b32_map, ("P1", "P2", "P3", "P4"), "raw"), _m(b32_map, ("P1", "P2", "P3", "P4"), "ncm"), _m(b32_map, ("P1", "P2", "P3", "P4"), "zero_mnar"), _m(b32_map, ("P3", "P4"), "zero_mnar")
-            b_r, b_n, b_c, b34 = _m(b16_map, ("P1", "P2", "P3", "P4"), "raw"), _m(b16_map, ("P1", "P2", "P3", "P4"), "ncm"), _m(b16_map, ("P1", "P2", "P3", "P4"), "zero_mnar"), _m(b16_map, ("P3", "P4"), "zero_mnar")
-            l_r, l_n, l_c, l34 = _m(l14_map, ("P1", "P2", "P3", "P4"), "raw"), _m(l14_map, ("P1", "P2", "P3", "P4"), "ncm"), _m(l14_map, ("P1", "P2", "P3", "P4"), "zero_mnar"), _m(l14_map, ("P3", "P4"), "zero_mnar")
+            a_r, a_n, a_c, a34 = _m(b32_rows, ("P1", "P2", "P3", "P4"), "raw"), _m(b32_rows, ("P1", "P2", "P3", "P4"), "ncm"), _m(b32_rows, ("P1", "P2", "P3", "P4"), "zero_mnar"), _m(b32_rows, ("P3", "P4"), "zero_mnar")
+            b_r, b_n, b_c, b34 = _m(b16_rows, ("P1", "P2", "P3", "P4"), "raw"), _m(b16_rows, ("P1", "P2", "P3", "P4"), "ncm"), _m(b16_rows, ("P1", "P2", "P3", "P4"), "zero_mnar"), _m(b16_rows, ("P3", "P4"), "zero_mnar")
+            l_r, l_n, l_c, l34 = _m(l14_rows, ("P1", "P2", "P3", "P4"), "raw"), _m(l14_rows, ("P1", "P2", "P3", "P4"), "ncm"), _m(l14_rows, ("P1", "P2", "P3", "P4"), "zero_mnar"), _m(l14_rows, ("P3", "P4"), "zero_mnar")
+            s_c, s34 = _m(sig_rows, ("P1", "P2", "P3", "P4"), "zero_mnar"), _m(sig_rows, ("P3", "P4"), "zero_mnar")
             res_json["scaling_b32"][arm] = {
                 k: (round(v, 4) if v == v else None)
                 for k, v in (("b32_raw", a_r), ("b32_ncm", a_n), ("b32_css", a_c), ("b32_p34_css", a34))
@@ -168,15 +182,15 @@ def _summarize_piece2(supp_root: Path, out_dir: Path) -> dict[str, Any]:
             fmt = lambda x: f"{x:.2f}" if x == x else "--"
             lines.append(
                 f"| `{arm}` | {fmt(a_r)} / {fmt(a_n)} / **{fmt(a_c)}** | {fmt(b_r)} / {fmt(b_n)} / **{fmt(b_c)}** | "
-                f"{fmt(l_r)} / {fmt(l_n)} / **{fmt(l_c)}** | **{fmt(a34)}** / **{fmt(b34)}** / **{fmt(l34)}** |"
+                f"{fmt(l_r)} / {fmt(l_n)} / **{fmt(l_c)}** | **{fmt(s_c)}** | **{fmt(a34)}** / **{fmt(b34)}** / **{fmt(l34)}** / **{fmt(s34)}** |"
             )
-    if ood_map:
-        lines.append("\n## 2B. Out-of-Domain Generalization on ScienceQA-MM8 (CLIP-B/16 + SigLIP-B/16)\n")
+    if ood_rows:
+        lines.append("\n## 2B. Out-of-Domain Generalization on ScienceQA-MM8 (All Available Backbones & Seeds)\n")
         lines.append("| Arm | All P1-P4 Raw | +GR-CLIP | +NCM | +cal | **CSS-CT** | P3/P4 (+NCM -> **CSS-CT**) | 3-View CSS | P3/P4 ErRec (Raw -> CSS) |")
         lines.append("|---|---:|---:|---:|---:|---:|---|---:|---|")
         for arm in SUPP_ARMS:
             def _mo(prs: tuple[str, ...], rg: str, mt: str = "macro_f1") -> float:
-                vs = [_cell_val(r, arm, rg, mt) for (_, _, pr), r in ood_map.items() if pr in prs]
+                vs = [_cell_val(r, arm, rg, mt) for (_, _, _, pr), r in ood_rows.items() if pr in prs]
                 vc = [v for v in vs if v is not None]
                 return sum(vc) / float(len(vc)) if vc else float("nan")
             r_all, gr_all, n_all, c_all, z_all = _mo(("P1", "P2", "P3", "P4"), "raw"), _mo(("P1", "P2", "P3", "P4"), "gr_clip"), _mo(("P1", "P2", "P3", "P4"), "ncm"), _mo(("P1", "P2", "P3", "P4"), "cal_bias"), _mo(("P1", "P2", "P3", "P4"), "zero_mnar")

@@ -1,4 +1,4 @@
-"""Build standalone Colab Web notebook for the 3-piece ICCV supplementary suite."""
+"""Build standalone Colab Web notebook for Level-3 Full-Matrix ICCV evaluation (5 Datasets x 4 Backbones x 4 Protocols x 5 Seeds + MNAR Sweep)."""
 
 from __future__ import annotations
 
@@ -24,32 +24,38 @@ def build() -> None:
     cells = [
         _cell(
             """
-            # ICCV Supplementary 3-Piece Verification Suite (`CSS-CT v2.2-fair`)
+            # ICCV Level-3 Full-Matrix Verification Suite (`5 Datasets × 4 Backbones × 4 Protocols × 5 Seeds` + `MNAR Sweep`)
 
-            Runs **3 targeted, reviewer-proofing experiments** (~75–85 min total on A100-80GB with 5 seeds + 3 ViT tiers) cleanly separated from the frozen main-benchmark results:
-            1. **Piece 1 — Multi-Seed & Class-Order Permutation (`seeds = 11, 22, 33, 44, 55`):** Fixed `dev`/`test` splits with 5 independent continual class-order permutations -> `Mean ± Std` (set `SEEDS = "11,22,33"` for ~55 min 3-seed mode).
-            2. **Piece 2 — Backbone Diversity & Scaling (`CLIP ViT-B/32`, `CLIP ViT-L/14` + `ScienceQA-MM8` Out-of-Domain):** Auto-fetched via `aria2c` / HF snapshots alongside `ViT-B/16` & `SigLIP-B/16`.
-            3. **Piece 3 — Continuous MNAR Missingness Severity Sweep (`0%, 25%, 50%, 75%, 90%, 100%` on `DMD` `P3/P4`):** Quantifies phase-transition degradation and plots `fig_mnar_severity_sweep.pdf/.png`.
+            Runs the complete cross-architecture, multi-seed, out-of-domain, and missingness-severity benchmark suite cleanly in **Seed-Major Order (`Seed 11 -> 22 -> 33 -> 44 -> 55`)** inside `[VRAM-QUEUE]`:
+            - **5 Datasets:** `CrisisMMD` (18k), `DMD` (5.8k), `DisasterM3` (2.3k), `IncidentsVQA` (368), and out-of-domain **`ScienceQA-MM8`** (~10.3k, auto-fetched via `aria2c`).
+            - **4 Backbones in Parallel:** `CLIP ViT-B/32`, `CLIP ViT-B/16`, `CLIP ViT-L/14` (428M), `SigLIP ViT-B/16`.
+            - **5 Seeds (`11, 22, 33, 44, 55`):** Fixed `dev`/`test` splits with permuted continual class order (`Mean ± Std`), plus `DMD` MNAR severity sweep (`0%, 25%, 50%, 75%, 90%, 100%`).
+            - **Zero-Loss Resume & Seed-11 Import:** Auto-imports `/content/ICCV_SUPP_CHECKPOINT_LATEST.zip`, optional Google Drive checkpoint (`SAVE_CHECKPOINT_TO_GDRIVE`), or uploaded `/content/ICCV_FINAL_DEV_AND_TEST_RESULTS*.zip` for instant `seed=11` `B/16+SigLIP` reuse!
             """,
             kind="markdown",
             cid="supp-cell-0",
         ),
         _cell(
             f"""
-            #@title Supplementary Suite Configuration {{ display-mode: "form" }}
+            #@title Level-3 Full-Matrix Configuration {{ display-mode: "form" }}
             REPO_GIT_URL = {DEFAULT_GIT_URL!r}  # @param {{type:"string"}}
             REPO_BRANCH = "main"  # @param {{type:"string"}}
             CONFIRM_FREEZE_TEST = True  # @param {{type:"boolean"}}
-            RUN_PIECE1_MULTISEED = True  # @param {{type:"boolean"}}
             SEEDS = "11,22,33,44,55"  # @param {{type:"string"}}
-            INCLUDE_CRISISMMD_MULTISEED = False  # @param {{type:"boolean"}}
-            RUN_PIECE2A_CLIP_B32 = True  # @param {{type:"boolean"}}
-            RUN_PIECE2A_CLIP_L14 = True  # @param {{type:"boolean"}}
-            RUN_PIECE2B_SCIENCEQA_OOD = True  # @param {{type:"boolean"}}
-            RUN_PIECE3_MNAR_SWEEP = True  # @param {{type:"boolean"}}
+            RUN_CRISISMMD = True  # @param {{type:"boolean"}}
+            RUN_DMD = True  # @param {{type:"boolean"}}
+            RUN_DISASTER_M3 = True  # @param {{type:"boolean"}}
+            RUN_INCIDENTS_VQA = True  # @param {{type:"boolean"}}
+            RUN_SCIENCEQA_OOD = True  # @param {{type:"boolean"}}
+            RUN_CLIP_B32 = True  # @param {{type:"boolean"}}
+            RUN_CLIP_B16 = True  # @param {{type:"boolean"}}
+            RUN_CLIP_L14 = True  # @param {{type:"boolean"}}
+            RUN_SIGLIP_B16 = True  # @param {{type:"boolean"}}
+            RUN_MNAR_SWEEP = True  # @param {{type:"boolean"}}
             SWEEP_RATES = "0.0,0.25,0.50,0.75,0.90,1.0"  # @param {{type:"string"}}
             PARALLEL_WORKERS = True  # @param {{type:"boolean"}}
             RESUME_COMPLETED = True  # @param {{type:"boolean"}}
+            SAVE_CHECKPOINT_TO_GDRIVE = False  # @param {{type:"boolean"}}
             CRISISMMA_TAR_URL = "https://drive.google.com/uc?id=1wOJzIezlrH-o2LmWHtcxv8KdAKL6a7K6&export=download"  # @param {{type:"string"}}
             DMD_ARCHIVE_URL = "https://drive.google.com/uc?id=1_1Bn0dHKqZ7sk4r2mVcShoQlvgZXcPL0&export=download"  # @param {{type:"string"}}
             INCIDENTS_VQA_ARCHIVE_URL = "https://drive.google.com/uc?id=1WUMyBQ68cMkhW3ONCzvPl2W1KpV1QPO5&export=download"  # @param {{type:"string"}}
@@ -65,7 +71,7 @@ def build() -> None:
             import torch
 
             if not torch.cuda.is_available():
-                raise RuntimeError("Enable GPU runtime in Colab before executing ICCV Supplementary Suite.")
+                raise RuntimeError("Enable GPU runtime in Colab before executing ICCV Level-3 Full-Matrix Suite.")
 
             WS = Path("/content/mnarm_ws")
             CODE_DIR = WS / "repo"
@@ -123,7 +129,7 @@ def build() -> None:
         ),
         _cell(
             """
-            import concurrent.futures, html, json, os, re, shutil, site, subprocess, sys, tarfile, urllib.parse, zipfile
+            import concurrent.futures, html, json, os, re, shutil, site, subprocess, sys, tarfile, urllib.parse
             from pathlib import Path
             import requests
 
@@ -161,12 +167,14 @@ def build() -> None:
                 try:
                     from huggingface_hub import snapshot_download
                     sk = ["*.msgpack", "*.h5", "*.ot", "tf_model*"]
-                    snapshot_download("openai/clip-vit-base-patch16", revision="57c216476eefef5ab752ec549e440a49ae4ae5f3", ignore_patterns=sk)
-                    snapshot_download("google/siglip-base-patch16-224", revision="7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed", ignore_patterns=sk)
-                    if RUN_PIECE2A_CLIP_B32:
+                    if RUN_CLIP_B32:
                         snapshot_download("openai/clip-vit-base-patch32", revision="3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268", ignore_patterns=sk)
-                    if RUN_PIECE2A_CLIP_L14:
+                    if RUN_CLIP_B16:
+                        snapshot_download("openai/clip-vit-base-patch16", revision="57c216476eefef5ab752ec549e440a49ae4ae5f3", ignore_patterns=sk)
+                    if RUN_CLIP_L14:
                         snapshot_download("openai/clip-vit-large-patch14", revision="32bd64288804d66eefd0ccbe215aa642df71cc41", ignore_patterns=sk)
+                    if RUN_SIGLIP_B16:
+                        snapshot_download("google/siglip-base-patch16-224", revision="7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed", ignore_patterns=sk)
                 except Exception as exc_hf:
                     print(f"[WARN] HF snapshot pre-warm skipped: {exc_hf}", flush=True)
 
@@ -225,18 +233,7 @@ def build() -> None:
                 return out_d
 
             DATASET_PATHS = {}
-            need_dis = bool(RUN_PIECE1_MULTISEED or RUN_PIECE2A_CLIP_B32 or RUN_PIECE2A_CLIP_L14 or RUN_PIECE3_MNAR_SWEEP)
-            if need_dis:
-                dmd_d = _prep_ds("dmd", str(DMD_ARCHIVE_URL), prepare_dmd, lambda d: any(d.rglob("*.txt")) and any(d.rglob("*.jpg")))
-                DATASET_PATHS["dmd"] = (dmd_d, dmd_d)
-                print("[READY] dmd:", dmd_d, flush=True)
-            if RUN_PIECE1_MULTISEED or RUN_PIECE2A_CLIP_B32 or RUN_PIECE2A_CLIP_L14:
-                inc_d = _prep_ds("incidents_vqa", str(INCIDENTS_VQA_ARCHIVE_URL), prepare_incidents_vqa, lambda d: any(d.rglob("disastervqa_annotations.jsonl")) and any(d.rglob("*.jpg")))
-                m3_d = _prep_ds("disaster_m3", str(DISASTER_M3_ARCHIVE_URL), prepare_disaster_m3, lambda d: any(d.rglob("benchmark_release.json")) and any(d.rglob("*.png")))
-                DATASET_PATHS["incidents_vqa"] = (inc_d, inc_d)
-                DATASET_PATHS["disaster_m3"] = (m3_d, m3_d)
-                print("[READY] incidents_vqa & disaster_m3", flush=True)
-            if RUN_PIECE1_MULTISEED and INCLUDE_CRISISMMD_MULTISEED:
+            if RUN_CRISISMMD:
                 SEQ_DIR = WS / "crisismmd_seq_inputs"; SEQ_DIR.mkdir(parents=True, exist_ok=True)
                 with tarfile.open(CODE_DIR / "assets" / "crisismmd_contracts_json.tar.xz", mode="r:xz") as tf:
                     tf.extractall(SEQ_DIR)
@@ -245,15 +242,46 @@ def build() -> None:
                 manifest = json.loads((SEQ_DIR / "manifest.json").read_bytes())
                 active_sp = ("train", "dev", "test") if CONFIRM_FREEZE_TEST else ("train", "dev")
                 req_set = {r["image"] for sp in active_sp for r in manifest["rows"][sp]}
-                if any(not (IMG_DIR / p).is_file() for p in req_set):
-                    arc = _dl_arc(str(CRISISMMA_TAR_URL), Path("/content/crisismmd_archive.dl"), min_b=100_000_000)
-                    subprocess.run(["tar", "-xf", str(arc), "-C", str(IMG_DIR)], check=True)
-                    arc.unlink(missing_ok=True)
-                    if (IMG_DIR / "CrisisMMD_v2.0" / "data_image").is_dir():
-                        IMG_DIR = IMG_DIR / "CrisisMMD_v2.0"
+                has_sp = (SEQ_DIR / "splits.zip").is_file() or (IMG_DIR / "crisismmd_datasplit_all.zip").is_file() or (IMG_DIR.parent / "CrisisMMD_v2.0" / "crisismmd_datasplit_all.zip").is_file()
+                if (not has_sp) or any(not (IMG_DIR / p).is_file() for p in req_set):
+                    arc = next((p for p in (Path("/content/crisismmd_v2.tar"), Path("/content/CrisisMMD_v2.0.tar.gz"), Path("/content/CrisisMMD_v2.0.zip")) if p.is_file() and p.stat().st_size > 100_000_000), None)
+                    if arc is None and str(CRISISMMA_TAR_URL).strip():
+                        try:
+                            arc = _dl_arc(str(CRISISMMA_TAR_URL), Path("/content/crisismmd_archive.dl"), min_b=100_000_000)
+                        except Exception as exc_cm:
+                            print(f"[WARN] CrisisMMD Drive link failed ({exc_cm}); trying QCRI/HF mirror.", flush=True)
+                    if arc is None and shutil.which("aria2c"):
+                        dl_q = Path("/content/crisismmd_qcri.tar.gz")
+                        subprocess.run(["aria2c", "-x16", "-s16", "-k4M", "--connect-timeout=15", "--timeout=30", "--max-tries=2", "--allow-overwrite=true", "https://crisisnlp.qcri.org/data/crisismmd/CrisisMMD_v2.0.tar.gz", "-d", "/content", "-o", dl_q.name], check=False)
+                        if is_valid_binary_archive(dl_q, 100_000_000):
+                            arc = dl_q
+                    if arc is not None:
+                        subprocess.run(["tar", "-xf", str(arc), "-C", str(IMG_DIR)], check=True)
+                        arc.unlink(missing_ok=True)
+                        if (IMG_DIR / "CrisisMMD_v2.0" / "data_image").is_dir():
+                            IMG_DIR = IMG_DIR / "CrisisMMD_v2.0"
+                if not (SEQ_DIR / "splits.zip").is_file():
+                    sp_src = next((p for p in (IMG_DIR / "crisismmd_datasplit_all.zip", IMG_DIR.parent / "crisismmd_datasplit_all.zip", IMG_DIR.parent / "CrisisMMD_v2.0" / "crisismmd_datasplit_all.zip") if p.is_file()), None)
+                    if sp_src is not None:
+                        shutil.copy2(sp_src, SEQ_DIR / "splits.zip")
+                req_imgs = sorted(p for p in req_set if not (IMG_DIR / p).is_file())
+                if req_imgs:
+                    hf_lfs_batch_download("QCRI/CrisisMMD", "10a5626ba112ab9c50369c473a2062bcf205d708", req_imgs, IMG_DIR, hf_token=hf_tok)
                 DATASET_PATHS["crisismmd"] = (SEQ_DIR, IMG_DIR)
                 print("[READY] crisismmd:", IMG_DIR, flush=True)
-            if RUN_PIECE2B_SCIENCEQA_OOD:
+            if RUN_DMD or RUN_MNAR_SWEEP:
+                dmd_d = _prep_ds("dmd", str(DMD_ARCHIVE_URL), prepare_dmd, lambda d: any(d.rglob("*.txt")) and any(d.rglob("*.jpg")))
+                DATASET_PATHS["dmd"] = (dmd_d, dmd_d)
+                print("[READY] dmd:", dmd_d, flush=True)
+            if RUN_INCIDENTS_VQA:
+                inc_d = _prep_ds("incidents_vqa", str(INCIDENTS_VQA_ARCHIVE_URL), prepare_incidents_vqa, lambda d: any(d.rglob("disastervqa_annotations.jsonl")) and any(d.rglob("*.jpg")))
+                DATASET_PATHS["incidents_vqa"] = (inc_d, inc_d)
+                print("[READY] incidents_vqa:", inc_d, flush=True)
+            if RUN_DISASTER_M3:
+                m3_d = _prep_ds("disaster_m3", str(DISASTER_M3_ARCHIVE_URL), prepare_disaster_m3, lambda d: any(d.rglob("benchmark_release.json")) and any(d.rglob("*.png")))
+                DATASET_PATHS["disaster_m3"] = (m3_d, m3_d)
+                print("[READY] disaster_m3:", m3_d, flush=True)
+            if RUN_SCIENCEQA_OOD:
                 sqa_d = prepare_scienceqa_mm8(DATA_ROOT / "scienceqa_mm8")
                 DATASET_PATHS["scienceqa_mm8"] = (sqa_d, sqa_d)
                 print("[READY] scienceqa_mm8:", sqa_d, flush=True)
@@ -274,9 +302,9 @@ def build() -> None:
             import torch
             from IPython.display import Image as IPyImage, Markdown, display
             try:
-                from google.colab import files as colab_files
+                from google.colab import drive as colab_drive, files as colab_files
             except ImportError:
-                colab_files = None
+                colab_drive, colab_files = None, None
 
             SUPP_OUT = WS / "outputs_iccv_supplementary"
             SUPP_OUT.mkdir(parents=True, exist_ok=True)
@@ -288,7 +316,45 @@ def build() -> None:
                 "PYTHONPATH": str(CODE_DIR / "src") + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else ""),
             }
             print_lock = threading.Lock()
+            from mnarm.runners.iccv_same_bank import _is_v21_valid
             from mnarm.runners.iccv_supplementary import write_supplementary_suite
+
+            CKPT_ZIP = Path("/content/ICCV_SUPP_CHECKPOINT_LATEST.zip")
+            DRIVE_CKPT = None
+            if SAVE_CHECKPOINT_TO_GDRIVE and colab_drive is not None:
+                colab_drive.mount("/content/drive", force_remount=False)
+                DRIVE_CKPT = Path("/content/drive/MyDrive/ICCV_FULL_MATRIX_CHECKPOINT.zip")
+
+            def _restore_zip_into(zp: Path, dst_root: Path, tag_label: str) -> None:
+                if zp.is_file() and zipfile.is_zipfile(zp):
+                    with zipfile.ZipFile(zp, "r") as zin:
+                        zin.extractall(dst_root)
+                    print(f"[RESTORED CHECKPOINT] {tag_label}: {zp}", flush=True)
+
+            if RESUME_COMPLETED:
+                for z_cand in (DRIVE_CKPT, CKPT_ZIP):
+                    if z_cand is not None:
+                        _restore_zip_into(z_cand, SUPP_OUT, "FULL-MATRIX")
+                for main_z in (Path("/content/ICCV_FINAL_DEV_AND_TEST_RESULTS.zip"), Path("/content/ICCV_FINAL_DEV_AND_TEST_RESULTS (1).zip")):
+                    if main_z.is_file() and zipfile.is_zipfile(main_z):
+                        imported = 0
+                        with zipfile.ZipFile(main_z, "r") as zin:
+                            for nm in zin.namelist():
+                                if nm.endswith(".json") and ("_same_bank/" in nm):
+                                    parts = nm.split("/")
+                                    if parts[0] in ("clip_same_bank", "siglip_same_bank"):
+                                        ds_m, bb_f, rest_p = "crisismmd", ("clip_b16_same_bank" if parts[0] == "clip_same_bank" else "siglip_b16_same_bank"), "/".join(parts[1:])
+                                    elif len(parts) >= 3 and parts[1] in ("clip_same_bank", "siglip_same_bank"):
+                                        ds_m, bb_f, rest_p = parts[0], ("clip_b16_same_bank" if parts[1] == "clip_same_bank" else "siglip_b16_same_bank"), "/".join(parts[2:])
+                                    else:
+                                        continue
+                                    out_f = SUPP_OUT / "multiseed" / ds_m / "seed_11" / bb_f / rest_p
+                                    if not out_f.is_file():
+                                        out_f.parent.mkdir(parents=True, exist_ok=True)
+                                        out_f.write_bytes(zin.read(nm))
+                                        imported += 1
+                        if imported:
+                            print(f"[IMPORTED SEED-11] Reused {imported} JSONs from {main_z.name}", flush=True)
 
             def _pack_zip(target: Path) -> None:
                 tmp = target.with_suffix(".tmp.zip")
@@ -297,6 +363,10 @@ def build() -> None:
                         if fp.is_file():
                             zout.write(fp, fp.relative_to(SUPP_OUT).as_posix())
                 tmp.replace(target)
+                if DRIVE_CKPT is not None and target == CKPT_ZIP:
+                    dtmp = DRIVE_CKPT.with_suffix(".tmp.zip")
+                    shutil.copy2(target, dtmp)
+                    dtmp.replace(DRIVE_CKPT)
 
             def _run_job(tag, cfg_rel, seq_p, img_p, out_dir_sub, protos, extra_flags, skip_suite=False):
                 out_p = SUPP_OUT / out_dir_sub
@@ -330,64 +400,68 @@ def build() -> None:
             max_slots = 1 if not PARALLEL_WORKERS else (8 if (vram_gib >= 88 and sys_ram_gib >= 60) else (6 if (vram_gib >= 68 and sys_ram_gib >= 44) else (4 if (vram_gib >= 36 and sys_ram_gib >= 28) else (2 if vram_gib >= 20 else 1))))
             cpu_th = str(max(2, min(6, (os.cpu_count() or 8) // max(max_slots, 1))))
             run_env["OMP_NUM_THREADS"] = cpu_th; run_env["MKL_NUM_THREADS"] = cpu_th
-            budget_gib = max(10.5, vram_gib * 0.88)
+            budget_gib = max(12.5, vram_gib * 0.88)
 
+            vram_tbl = {
+                "clip_b32": {"crisismmd": 6.5, "scienceqa_mm8": 5.5, "dmd": 4.5, "disaster_m3": 3.5, "incidents_vqa": 2.2},
+                "clip_b16": {"crisismmd": 10.2, "scienceqa_mm8": 8.2, "dmd": 6.5, "disaster_m3": 4.5, "incidents_vqa": 2.5},
+                "siglip_b16": {"crisismmd": 10.2, "scienceqa_mm8": 8.2, "dmd": 6.5, "disaster_m3": 4.5, "incidents_vqa": 2.5},
+                "clip_l14": {"crisismmd": 12.8, "scienceqa_mm8": 11.2, "dmd": 9.2, "disaster_m3": 7.5, "incidents_vqa": 5.5},
+            }
+            bb_specs = [
+                (flag, bb_id, cfg_suf)
+                for flag, bb_id, cfg_suf in (
+                    (RUN_CLIP_B32, "clip_b32", "clip_b32"),
+                    (RUN_CLIP_B16, "clip_b16", "clip"),
+                    (RUN_CLIP_L14, "clip_l14", "clip_l14"),
+                    (RUN_SIGLIP_B16, "siglip_b16", "siglip"),
+                )
+                if flag
+            ]
+            ds_order = [d for d in ("crisismmd", "dmd", "scienceqa_mm8", "disaster_m3", "incidents_vqa") if d in DATASET_PATHS]
             seeds = [int(x.strip()) for x in str(SEEDS).split(",") if x.strip()]
             rates = [float(x.strip()) for x in str(SWEEP_RATES).split(",") if x.strip()]
-            tasks, grp_rem, grp_info = [], {}, {}
+            tasks, grp_rem, grp_info, skipped_n = [], {}, {}, 0
 
-            def _add_group(grp_key, cfg_rel, sp, ip, out_sub, protos, flags, vram_cost):
+            def _proto_done(out_sub: str, bb_id: str, pr: str) -> bool:
+                if not RESUME_COMPLETED:
+                    return False
+                p_dir = SUPP_OUT / out_sub / f"{bb_id}_{pr.lower()}"
+                ok_d = _is_v21_valid(p_dir / "ICCV_PROTOCOL_RESULTS.json") is not None
+                ok_t = (not CONFIRM_FREEZE_TEST) or (_is_v21_valid(p_dir / "ICCV_PROTOCOL_TEST_RESULTS.json") is not None)
+                return ok_d and ok_t
+
+            def _add_group(grp_key, cfg_rel, sp, ip, out_sub, bb_id, protos, flags, vram_cost):
+                nonlocal skipped_n
+                rem = [pr for pr in protos if not _proto_done(out_sub, bb_id, pr)]
+                skipped_n += len(protos) - len(rem)
+                if not rem:
+                    return
                 grp_info[grp_key] = (cfg_rel, sp, ip, out_sub, protos, flags)
-                grp_rem[grp_key] = len(protos)
-                for pr in protos:
+                grp_rem[grp_key] = len(rem)
+                for pr in rem:
                     tasks.append({"group": grp_key, "vram": vram_cost, "args": (f"{grp_key}:{pr}", cfg_rel, sp, ip, out_sub, [pr], flags, len(protos) > 1)})
 
-            if RUN_PIECE1_MULTISEED:
-                ms_ds = ["dmd", "disaster_m3", "incidents_vqa"] + (["crisismmd"] if INCLUDE_CRISISMMD_MULTISEED else [])
-                for s in seeds:
-                    for ds in ms_ds:
-                        if ds not in DATASET_PATHS:
+            for idx_s, s in enumerate(seeds):
+                for ds in ds_order:
+                    sp, ip = DATASET_PATHS[ds]
+                    for bb_id, cfg_suf in bb_specs:
+                        fl = ["--seed", str(s), "--split-seed", "11", "--class-order-seed", str(s), "--mnar-missing-rate", "1.0"]
+                        _add_group(f"s{s}_{ds}_{bb_id}", f"configs/iccv_{ds}_{cfg_suf}.yaml", sp, ip, f"multiseed/{ds}/seed_{s}/{bb_id}_same_bank", bb_id, ["P4", "P3", "P2", "P1"], fl, vram_tbl[bb_id][ds])
+                if idx_s == 0 and RUN_MNAR_SWEEP and "dmd" in DATASET_PATHS:
+                    sp_d, ip_d = DATASET_PATHS["dmd"]
+                    for r in rates:
+                        if abs(r - 1.0) < 1e-6 and (11 in seeds) and RUN_DMD:
                             continue
-                        sp, ip = DATASET_PATHS[ds]
-                        vc = 10.2 if ds == "crisismmd" else (6.5 if ds == "dmd" else (4.5 if ds == "disaster_m3" else 2.5))
-                        for bb, bs in (("clip", "clip_b16"), ("siglip", "siglip_b16")):
-                            fl = ["--seed", str(s), "--split-seed", "11", "--class-order-seed", str(s), "--mnar-missing-rate", "1.0"]
-                            _add_group(f"p1_{ds}_s{s}_{bs}", f"configs/iccv_{ds}_{bb}.yaml", sp, ip, f"multiseed/{ds}/seed_{s}/{bs}_same_bank", ["P4", "P3", "P2", "P1"], fl, vc)
+                        r_tag = f"rho_{int(round(r * 100)):03d}"
+                        for sw_bb, sw_suf in (("clip_b16", "clip"), ("siglip_b16", "siglip")):
+                            fl = ["--seed", "11", "--split-seed", "11", "--mnar-missing-rate", f"{r:.4f}"]
+                            _add_group(f"sweep_dmd_{r_tag}_{sw_bb}", f"configs/iccv_dmd_{sw_suf}.yaml", sp_d, ip_d, f"mnar_sweep/dmd/{r_tag}/{sw_bb}_same_bank", sw_bb, ["P4", "P3"], fl, 6.5)
 
-            if RUN_PIECE2A_CLIP_B32:
-                for ds in ("dmd", "disaster_m3", "incidents_vqa"):
-                    if ds not in DATASET_PATHS:
-                        continue
-                    sp, ip = DATASET_PATHS[ds]
-                    vc = 4.5 if ds == "dmd" else (3.5 if ds == "disaster_m3" else 2.2)
-                    _add_group(f"p2a_{ds}_b32", f"configs/iccv_{ds}_clip_b32.yaml", sp, ip, f"scaling_b32/{ds}/clip_b32_same_bank", ["P4", "P3", "P2", "P1"], ["--seed", "11", "--split-seed", "11"], vc)
-
-            if RUN_PIECE2A_CLIP_L14:
-                for ds in ("dmd", "disaster_m3", "incidents_vqa"):
-                    if ds not in DATASET_PATHS:
-                        continue
-                    sp, ip = DATASET_PATHS[ds]
-                    vc = 9.5 if ds == "dmd" else (7.5 if ds == "disaster_m3" else 5.5)
-                    _add_group(f"p2a_{ds}_l14", f"configs/iccv_{ds}_clip_l14.yaml", sp, ip, f"scaling_l14/{ds}/clip_l14_same_bank", ["P4", "P3", "P2", "P1"], ["--seed", "11", "--split-seed", "11"], vc)
-
-            if RUN_PIECE2B_SCIENCEQA_OOD and "scienceqa_mm8" in DATASET_PATHS:
-                sp, ip = DATASET_PATHS["scienceqa_mm8"]
-                for bb, bs in (("clip", "clip_b16"), ("siglip", "siglip_b16")):
-                    _add_group(f"p2b_sqa_{bs}", f"configs/iccv_scienceqa_mm8_{bb}.yaml", sp, ip, f"ood_general/scienceqa_mm8/{bs}_same_bank", ["P4", "P3", "P2", "P1"], ["--seed", "11", "--split-seed", "11"], 6.8)
-
-            if RUN_PIECE3_MNAR_SWEEP and "dmd" in DATASET_PATHS:
-                sp, ip = DATASET_PATHS["dmd"]
-                for r in rates:
-                    if abs(r - 1.0) < 1e-6 and RUN_PIECE1_MULTISEED and (11 in seeds):
-                        continue
-                    r_tag = f"rho_{int(round(r * 100)):03d}"
-                    for bb, bs in (("clip", "clip_b16"), ("siglip", "siglip_b16")):
-                        fl = ["--seed", "11", "--split-seed", "11", "--mnar-missing-rate", f"{r:.4f}"]
-                        _add_group(f"p3_dmd_{r_tag}_{bs}", f"configs/iccv_dmd_{bb}.yaml", sp, ip, f"mnar_sweep/dmd/{r_tag}/{bs}_same_bank", ["P4", "P3"], fl, 6.5)
-
-            CKPT_ZIP = Path("/content/ICCV_SUPP_CHECKPOINT_LATEST.zip")
+            if skipped_n:
+                print(f"[RESUME] Skipped {skipped_n} already-verified protocol jobs.", flush=True)
             if max_slots >= 2 and len(tasks) > 1:
-                print(f"[VRAM-QUEUE] {len(tasks)} supp tasks | slots={max_slots} budget={budget_gib:.1f}/{vram_gib:.1f} GiB CPU_threads={cpu_th}", flush=True)
+                print(f"[VRAM-QUEUE] {len(tasks)} pending tasks | slots={max_slots} budget={budget_gib:.1f}/{vram_gib:.1f} GiB CPU_threads={cpu_th}", flush=True)
                 pending, in_flight, used = deque(tasks), {}, 0.0
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_slots) as pool:
                     while pending or in_flight:
@@ -408,14 +482,16 @@ def build() -> None:
                                 cfg_rel, sp, ip, out_sub, protos, flags = grp_info[gk]
                                 if len(protos) > 1:
                                     _run_job(f"{gk}:SUMMARY", cfg_rel, sp, ip, out_sub, protos, flags, False)
+                                write_supplementary_suite(SUPP_OUT)
                                 _pack_zip(CKPT_ZIP)
-                                print(f"[SUPP CHECKPOINT] {gk} -> {CKPT_ZIP} ({CKPT_ZIP.stat().st_size} B)", flush=True)
+                                print(f"[CHECKPOINT SAVED] {gk} -> {CKPT_ZIP} ({CKPT_ZIP.stat().st_size} B)", flush=True)
             else:
                 for gk, (cfg_rel, sp, ip, out_sub, protos, flags) in grp_info.items():
                     _run_job(gk, cfg_rel, sp, ip, out_sub, protos, flags, False)
+                    write_supplementary_suite(SUPP_OUT)
                     _pack_zip(CKPT_ZIP)
 
-            if RUN_PIECE3_MNAR_SWEEP and any(abs(r - 1.0) < 1e-6 for r in rates) and RUN_PIECE1_MULTISEED and (11 in seeds):
+            if RUN_MNAR_SWEEP and any(abs(r - 1.0) < 1e-6 for r in rates) and (11 in seeds):
                 for bs in ("clip_b16", "siglip_b16"):
                     for pr in ("p3", "p4"):
                         src_d = SUPP_OUT / "multiseed" / "dmd" / "seed_11" / f"{bs}_same_bank" / f"{bs}_{pr}"
@@ -430,7 +506,7 @@ def build() -> None:
             if fig_png.is_file():
                 display(IPyImage(filename=str(fig_png)))
 
-            RES_ZIP = Path("/content/ICCV_SUPPLEMENTARY_3PIECE_RESULTS.zip")
+            RES_ZIP = Path("/content/ICCV_FULL_MATRIX_DEV_AND_TEST_RESULTS.zip")
             _pack_zip(RES_ZIP)
             print("[PACKAGED]", RES_ZIP, RES_ZIP.stat().st_size, "bytes", flush=True)
             if AUTO_DOWNLOAD and colab_files is not None:
@@ -446,7 +522,7 @@ def build() -> None:
     }
     nb_json = json.dumps(nb, indent=2, ensure_ascii=False)
     if "$" in nb_json:
-        raise AssertionError("Forbidden dollar character in ICCV Supplementary notebook")
+        raise AssertionError("Forbidden dollar character in ICCV Level-3 notebook")
     for idx, c in enumerate(cells):
         if c["cell_type"] == "code":
             with warnings.catch_warnings(record=True) as w:
