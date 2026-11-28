@@ -7,6 +7,7 @@ from mnarm.eval.metrics import (
     eval_classification_metrics,
     eval_retrieval_r1,
     eval_view_suite,
+    holm_bonferroni_adjust,
     measure_cone_drift,
     paired_bootstrap_diff,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "eval_retrieval_r1",
     "eval_view_suite",
     "generate_iccv_suite_figures",
+    "holm_bonferroni_adjust",
     "measure_cone_drift",
     "paired_bootstrap_diff",
 ]

@@ -49,17 +49,8 @@ def _tsvm_merge_matrix(mats: list[torch.Tensor], rank_per_task: int = 8) -> torc
         return (((uu @ uhu) * torch.cat(s_parts, dim=0).unsqueeze(0)) @ (uv @ uhv).T).float().cpu()
 
 
-def _norm_cap(out: torch.Tensor, active: list[torch.Tensor], only_overshoot: bool = True) -> torch.Tensor:
-    avg_norm = sum(float(m.norm().item()) for m in active) / float(len(active))
-    cur_norm = float(out.norm().item())
-    thresh = max(avg_norm, 1e-12) if only_overshoot else 1e-12
-    if cur_norm > thresh and avg_norm > 1e-12:
-        out = out * (avg_norm / cur_norm)
-    return out.float().cpu()
-
-
 def _iso_c_matrix(mats: list[torch.Tensor], rank_per_task: int = 8) -> torch.Tensor:
-    """Verbatim ISO-C (ICML 2025) for low-rank LoRA with overshoot energy cap."""
+    """Verbatim ISO-C (ICML 2025) for low-rank LoRA without artificial norm distortion."""
     active, fallback = _prep_active(mats)
     if fallback is not None:
         return fallback
@@ -70,11 +61,11 @@ def _iso_c_matrix(mats: list[torch.Tensor], rank_per_task: int = 8) -> torch.Ten
         pos = int((s > 1e-6).sum().item())
         r_act = max(1, min(len(active) * max(1, int(rank_per_task)), pos, int(s.numel())))
         s_bar = float(s[:r_act].mean().item())
-        return _norm_cap((u[:, :r_act] * s_bar) @ vh[:r_act, :], active, only_overshoot=True)
+        return ((u[:, :r_act] * s_bar) @ vh[:r_act, :]).float().cpu()
 
 
 def _iso_cts_matrix(mats: list[torch.Tensor], rank_per_task: int = 8, k_frac: float = 0.8) -> torch.Tensor:
-    """Verbatim ISO-CTS (ICML 2025 & DC-Merge LoRA) with overshoot energy cap."""
+    """Verbatim ISO-CTS (ICML 2025 & DC-Merge LoRA) preserving true author scale."""
     active, fallback = _prep_active(mats)
     if fallback is not None:
         return fallback
@@ -105,7 +96,7 @@ def _iso_cts_matrix(mats: list[torch.Tensor], rank_per_task: int = 8, k_frac: fl
         u_u, _, vh_u = torch.linalg.svd(torch.cat([*u_ts_list, u_cm], dim=1), full_matrices=False)
         u_v, _, vh_v = torch.linalg.svd(torch.cat([*vh_ts_list, vh_cm], dim=0), full_matrices=False)
         s_bar = float(torch.cat([*s_ts_list, s_cm], dim=0).mean().item())
-        return _norm_cap(((u_u @ vh_u) * s_bar) @ (u_v @ vh_v), active, only_overshoot=True)
+        return (((u_u @ vh_u) * s_bar) @ (u_v @ vh_v)).float().cpu()
 
 
 def _knots_merge(
@@ -193,7 +184,7 @@ def _dc_lora_matrix(mats: list[torch.Tensor], rank_per_task: int = 8) -> torch.T
         mask_m = torch.zeros_like(agg)
         for i in range(n):
             mask_m[i * lr : (i + 1) * lr, i * lr : (i + 1) * lr] = 1.0
-        return _norm_cap(cover_u @ (agg * mask_m) @ cover_vt, active, only_overshoot=False)
+        return (cover_u @ (agg * mask_m) @ cover_vt).float().cpu()
 
 
 __all__ = [

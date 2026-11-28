@@ -118,6 +118,7 @@ def build_stages_from_splits(
     protocol: str,
     allow_test: bool = False,
     seed: int = 11,
+    split_seed: int | None = None,
     class_order_seed: int | None = None,
     mnar_missing_rate: float = 1.0,
     overlap_audit: dict[str, int] | None = None,
@@ -154,7 +155,8 @@ def build_stages_from_splits(
     early_classes = [c for st_i in range(n_early_st) for c in stage_cls[st_i]]
     late_classes = [c for st_i in range(n_early_st, num_stages) for c in stage_cls[st_i]]
 
-    rng = random.Random(int(seed) + 71)
+    cal_seed = int(split_seed if split_seed is not None else seed) + 71
+    rng = random.Random(cal_seed)
     by_cls_tr: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for r in tr_rows:
         by_cls_tr[int(r["label"])].append(r)
@@ -302,5 +304,5 @@ def build_p1_p4_contracts(
     return build_stages_from_splits(
         dataset_name=dataset_name, tr_rows=tr_rows, dev_rows_raw=dev_rows_raw, test_rows_raw=test_rows_raw,
         class_names=class_names, orig_prompts=orig_prompts, unseen_prompts=unseen_prompts,
-        protocol=protocol, allow_test=allow_test, seed=seed, class_order_seed=class_order_seed, mnar_missing_rate=mnar_missing_rate,
+        protocol=protocol, allow_test=allow_test, seed=seed, split_seed=sp_seed, class_order_seed=class_order_seed, mnar_missing_rate=mnar_missing_rate,
     )

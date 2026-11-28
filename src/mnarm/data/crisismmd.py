@@ -158,6 +158,7 @@ def load_crisismmd_contracts(
     protocol: str,
     allow_test: bool = False,
     seed: int = 11,
+    split_seed: int | None = None,
     class_order_seed: int | None = None,
     mnar_missing_rate: float = 1.0,
 ) -> dict[str, Any]:
@@ -202,7 +203,7 @@ def load_crisismmd_contracts(
     )
 
     tr_by_uid = {r["sample_id"]: r for r in manifest["rows"]["train"]}
-    is_frozen_default = (int(seed) == 11) and (class_order_seed is None or int(class_order_seed) == 11) and (float(mnar_missing_rate) >= 1.0 - 1e-9)
+    is_frozen_default = (int(seed) == 11) and (class_order_seed is None) and (split_seed is None) and (float(mnar_missing_rate) >= 1.0 - 1e-9)
     if not is_frozen_default:
         from mnarm.data.protocol_builder import build_stages_from_splits
 
@@ -231,6 +232,7 @@ def load_crisismmd_contracts(
             protocol=protocol,
             allow_test=allow_test,
             seed=int(seed),
+            split_seed=split_seed,
             class_order_seed=class_order_seed,
             mnar_missing_rate=float(mnar_missing_rate),
             overlap_audit=overlap_audit,

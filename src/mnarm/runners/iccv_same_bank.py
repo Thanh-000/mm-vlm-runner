@@ -94,12 +94,14 @@ def run_single_protocol_same_bank(
     seq_ft_state = seq_mm_state = seq_lmnar_state = seq_rep_state = mg_state = None
     mg_heads: dict[str, Any] = {}
     seen_so_far: list[int] = []
+    fit_mask_hist: list[dict[str, Any]] = []
     t0 = time.perf_counter()
     for st in ds["stages"]:
         t = int(st["stage"])
         new_c = [int(c) for c in st["new_classes"]]
         old_c = [c for c in seen_so_far if c not in set(new_c)]
         seen_so_far = [int(c) for c in st["seen_classes"]]
+        fit_mask_hist.extend({"label": int(r["label"]), "mask": list(r["mask"])} for r in st["fit"])
 
         exp_s, _ = train_lora_stage(
             vlm=vlm, init_lora=None, records=st["fit"], protos_full=protos_full, seen_classes=new_c,
@@ -139,6 +141,7 @@ def run_single_protocol_same_bank(
             objective="l_mnar", stage_idx=t, epochs=int(config["epochs"]),
             effective_batch_size=int(config["effective_batch_size"]), micro_batch_size=int(config["micro_batch_size"]),
             lr=float(config["lr"]), weight_decay=float(config["weight_decay"]), seed=seed + 1500, use_amp=use_amp, tensor_store=store,
+            graph_records=fit_mask_hist,
         )
         tf_slm = collect_train_features_by_modality(vlm=vlm, kind="lora", payload=seq_lmnar_state, records=st["fit"], tensor_store=store, batch_size=eff_eval_bs, use_amp=use_amp)
         seq_lmnar_bank.update_stage(u_expert_t=tf_slm["text_x"], u_base_t=tf_b0["text_x"], y_t=tf_slm["text_y"], u_expert_i=tf_slm["image_x"], u_base_i=tf_b0["image_x"], y_i=tf_slm["image_y"], paired_base_t=tf_b0["paired_t"], paired_base_i=tf_b0["paired_i"])
@@ -150,9 +153,8 @@ def run_single_protocol_same_bank(
             effective_batch_size=int(config["effective_batch_size"]), micro_batch_size=int(config["micro_batch_size"]),
             lr=float(config["lr"]), weight_decay=float(config["weight_decay"]), seed=seed + 2000, use_amp=use_amp, tensor_store=store,
         )
-        tf_sr = collect_train_features_by_modality(vlm=vlm, kind="lora", payload=seq_rep_state, records=rep_recs, tensor_store=store, batch_size=eff_eval_bs, use_amp=use_amp)
-        tf_b0_rep = _cached_base0_features(vlm, rep_recs, store, eff_eval_bs, use_amp, b0_cache)
-        seq_rep_bank.update_stage(u_expert_t=tf_sr["text_x"], u_base_t=tf_b0_rep["text_x"], y_t=tf_sr["text_y"], u_expert_i=tf_sr["image_x"], u_base_i=tf_b0_rep["image_x"], y_i=tf_sr["image_y"], paired_base_t=tf_b0_rep["paired_t"], paired_base_i=tf_b0_rep["paired_i"])
+        tf_sr = collect_train_features_by_modality(vlm=vlm, kind="lora", payload=seq_rep_state, records=st["fit"], tensor_store=store, batch_size=eff_eval_bs, use_amp=use_amp)
+        seq_rep_bank.update_stage(u_expert_t=tf_sr["text_x"], u_base_t=tf_b0["text_x"], y_t=tf_sr["text_y"], u_expert_i=tf_sr["image_x"], u_base_i=tf_b0["image_x"], y_i=tf_sr["image_y"], paired_base_t=tf_b0["paired_t"], paired_base_i=tf_b0["paired_i"])
 
         if bool(config.get("include_mg_clip", True)):
             mg_lr = float(config.get("mg_clip_lr", max(float(config["lr"]), 5e-4)))
@@ -212,7 +214,7 @@ def _is_v21_valid(p_json: Path) -> dict[str, Any] | None:
     arms = cached_p.get("arms", {})
     tsvm_rg = arms.get("tsvm", {}).get("regimes", {})
     ok = (
-        cached_p.get("schema") == "mnarm-iccv-protocol-v2"
+        cached_p.get("schema") == "mnarm-iccv-protocol-v3"
         and "seq_magmax" in arms
         and "ncm" in tsvm_rg
         and "oas_lda" in tsvm_rg
@@ -270,7 +272,7 @@ def run_iccv_same_bank(
         if allow_test and per_proto_test:
             write_same_bank_suite_outputs({**config, "allow_test": True}, per_proto_test, out_dir, split_name="test")
         return write_same_bank_suite_outputs(config, per_proto, out_dir, split_name="dev")
-    return {"schema": "mnarm-iccv-same-bank-v2", "backbone": backbone, "allow_test": allow_test, "protocols": list(per_proto.keys())}
+    return {"schema": "mnarm-iccv-same-bank-v3", "backbone": backbone, "allow_test": allow_test, "protocols": list(per_proto.keys())}
 
 
 def main() -> None:

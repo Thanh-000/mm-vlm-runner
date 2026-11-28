@@ -86,10 +86,10 @@ def _safe_precision_from_cov(
 ) -> torch.Tensor:
     """Prevent precision nullspace explosion and over-anisotropy on partial towers (S_m != Y)."""
     d = cov.shape[0]
-    if not is_partial or partial_cov_mode == "raw_oas":
-        return torch.cholesky_inverse(torch.linalg.cholesky(cov))
     if partial_cov_mode == "isotropic_vmf":
         return torch.eye(d, dtype=torch.float64)
+    if not is_partial or partial_cov_mode == "raw_oas":
+        return torch.cholesky_inverse(torch.linalg.cholesky(cov))
     tr = max(float(torch.trace(cov).item()), 1e-12)
     lam_eff = max(float(cov.square().sum().item()) / tr, tr / float(d), 1e-6)
     eigvals, eigvecs = torch.linalg.eigh(cov)
@@ -211,16 +211,16 @@ def _fit_stat_oof_tau(
         iso_std = math.sqrt(max(1.0 - mean_norm * mean_norm, 1e-4) / float(d))
         sqrt_cov = iso_std * torch.eye(d, dtype=torch.float64)
 
-    tot_n = max(sum(max(int(counts.get(c, 1)), 1) for c in obs), k_cls)
-    target_m = min(max(tot_n, 48 * k_cls), 960)
-    m_per = {c: max(n_folds, int(round(target_m * max(int(counts.get(c, 1)), 1) / float(tot_n)))) for c in obs}
+    eff_w = {c: math.sqrt(max(float(counts.get(c, 1)), 1.0)) for c in obs}
+    tot_eff = max(sum(eff_w.values()), 1.0)
+    target_m = min(max(sum(max(int(counts.get(c, 1)), 1) for c in obs), 48 * k_cls), 960)
+    m_per = {c: max(n_folds, int(round(target_m * eff_w[c] / tot_eff))) for c in obs}
     m_extra = max(n_folds, int(round(float(target_m) / float(k_cls))))
     oof_scores, oof_y, obs_rng = [], [], list(range(k_cls))
     for _ in range(n_folds):
         mu_fold = [
             centroids[c].to(dtype=torch.float64, device="cpu")
-            + (torch.randn(d, dtype=torch.float64, generator=g) @ sqrt_cov.T)
-            / math.sqrt(max(float(counts.get(c, 10)) * float(n_folds - 1) / float(n_folds), 1.0))
+            + (torch.randn(d, dtype=torch.float64, generator=g) @ sqrt_cov.T) / math.sqrt(max(float(counts.get(c, 10)) * float(n_folds - 1) / float(n_folds), 1.0))
             for c in obs
         ] + [ec.to(dtype=torch.float64, device="cpu") for ec in extra]
         mu_f = torch.stack(mu_fold, dim=0)
@@ -230,15 +230,18 @@ def _fit_stat_oof_tau(
         b_f = -0.5 * (mu_f * w_f).sum(dim=-1)
         xs_f, ys_f = [], []
         for idx_c, c in enumerate(obs):
-            mc = max(1, m_per[c] // n_folds)
+            mc, mu_c = max(1, m_per[c] // n_folds), centroids[c].to(dtype=torch.float64, device="cpu")
+            u_c = _dir(mu_c)
             z = torch.randn(mc, d, dtype=torch.float64, generator=g) @ sqrt_cov.T
-            xs_f.append(l2_normalize((centroids[c].to(dtype=torch.float64, device="cpu").unsqueeze(0) + z).float()).to(torch.float64))
+            z = z - (z @ u_c).unsqueeze(-1) * u_c.unsqueeze(0)
+            xs_f.append(l2_normalize((mu_c.unsqueeze(0) + z).float()).to(torch.float64))
             ys_f.append(torch.full((mc,), idx_c, dtype=torch.long))
         for idx_e, ec in enumerate(extra):
-            me = max(1, m_extra // n_folds)
-            ec64 = ec.to(dtype=torch.float64, device="cpu")
+            me, ec64 = max(1, m_extra // n_folds), ec.to(dtype=torch.float64, device="cpu")
             true_ec = _scale_to_norm(ec64 + torch.randn(d, dtype=torch.float64, generator=g) * float(trans_std), mean_norm) if trans_std > 0.0 else ec64
+            u_e = _dir(true_ec)
             z = torch.randn(me, d, dtype=torch.float64, generator=g) @ sqrt_cov.T
+            z = z - (z @ u_e).unsqueeze(-1) * u_e.unsqueeze(0)
             xs_f.append(l2_normalize((true_ec.unsqueeze(0) + z).float()).to(torch.float64))
             ys_f.append(torch.full((me,), k_cls + idx_e, dtype=torch.long))
         oof_scores.append(torch.cat(xs_f, dim=0) @ w_f.T + b_f.unsqueeze(0))
@@ -255,49 +258,43 @@ def _cone_aperture_scale(src: torch.Tensor, dst: torch.Tensor) -> float:
     if src.shape[0] < 2 or dst.shape[0] < 2:
         return 1.0
     s64, d64 = src.to(dtype=torch.float64, device="cpu"), dst.to(dtype=torch.float64, device="cpu")
-    sn = float((s64 - s64.mean(dim=0, keepdim=True)).norm().item())
-    dn = float((d64 - d64.mean(dim=0, keepdim=True)).norm().item())
+    sn, dn = float((s64 - s64.mean(dim=0, keepdim=True)).norm().item()), float((d64 - d64.mean(dim=0, keepdim=True)).norm().item())
     return min(max(dn / sn, 0.1), 2.5) if (sn >= 1e-8 and dn >= 1e-8) else 1.0
 
 
 def _estimate_conjugate_weights(
-    obs: list[int],
-    centroids_m: dict[int, torch.Tensor],
-    p_all: torch.Tensor,
-    other_centroids: dict[int, torch.Tensor],
-    cross_map: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
-    anchor_weight: float = 1.0,
+    obs: list[int], centroids_m: dict[int, torch.Tensor], p_all: torch.Tensor, other_centroids: dict[int, torch.Tensor],
+    cross_map: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None, anchor_weight: float = 1.0,
 ) -> dict[str, float]:
-    """Estimate cone-aperture-matched vMF sensor reliability weights (w_P, w_CM) and sigma^2_trans."""
+    """Estimate unbiased LOO cone-aperture vMF sensor reliability weights (w_P, w_CM) and sigma^2_trans."""
     if not obs:
         return {"w_p": 1.0, "w_cm": 0.0, "r_p_eff": 0.0, "r_cm_eff": 0.0, "base_cos": 0.0, "sigma2_trans": 1e-4, "cone_scale_p": 1.0, "cone_scale_cm": 1.0}
     d = int(p_all.shape[-1])
     mean_norm = sum(float(centroids_m[c].norm().item()) for c in obs) / float(len(obs))
     obs_mat = torch.stack([centroids_m[c].to(dtype=torch.float64, device="cpu") for c in obs], dim=0)
     p_obs = torch.stack([p_all[c].to(dtype=torch.float64, device="cpu") for c in obs], dim=0)
-    m_all_bar = obs_mat.mean(dim=0)
     obs_dirs = torch.stack([_dir(centroids_m[c]) for c in obs], dim=0)
     base_cos = float(((obs_dirs @ obs_dirs.T).sum().item() - len(obs)) / float(len(obs) * (len(obs) - 1))) if len(obs) >= 2 else 0.0
     gam_p = _cone_aperture_scale(p_obs, obs_mat)
 
     cos_p_list: list[float] = []
     for cj in obs:
-        tgt_c = _dir(centroids_m[cj].to(dtype=torch.float64, device="cpu") - m_all_bar)
+        mu_cj = centroids_m[cj].to(dtype=torch.float64, device="cpu")
         if len(obs) >= 3:
             sub = [c for c in obs if c != cj]
             ps, ms = torch.stack([p_all[c] for c in sub], dim=0), torch.stack([centroids_m[c] for c in sub], dim=0)
             rp_l, pb_l, mb_l = _identity_anchored_procrustes(ps, ms, anchor_weight=max(anchor_weight, 1.0))
-            pred_v = _scale_to_norm(mb_l + _cone_aperture_scale(ps, ms) * (rp_l @ (p_all[cj] - pb_l)), mean_norm)
-            cos_p_list.append(float((_dir(pred_v - m_all_bar) @ tgt_c).item()))
+            pred_d = _cone_aperture_scale(ps, ms) * (rp_l @ (p_all[cj].to(dtype=torch.float64, device="cpu") - pb_l))
+            cos_p_list.append(float((_dir(pred_d) @ _dir(mu_cj - mb_l)).item()))
         elif len(obs) == 2:
             oc = obs[1] if cj == obs[0] else obs[0]
             u_o, _, vh_o = torch.linalg.svd(max(anchor_weight, 1.0) * torch.eye(d, dtype=torch.float64) + torch.outer(centroids_m[oc], p_all[oc]), full_matrices=False)
             pred_d = _dir((u_o @ vh_o) @ p_all[cj])
-            cos_p_list.append(float(((pred_d @ _dir(centroids_m[cj])).item() - base_cos) / max(1.0 - base_cos, 1e-4)))
+            cos_p_list.append(float(((pred_d @ _dir(mu_cj)).item() - base_cos) / max(1.0 - base_cos, 1e-4)))
         else:
             cos_p_list.append(0.0)
     r_p_eff = min(max(sum(cos_p_list) / float(len(cos_p_list)), 0.0), 0.995)
-    w_p = max(r_p_eff / (1.0 - r_p_eff * r_p_eff), 1e-3)
+    w_p = max(r_p_eff / (1.0 - r_p_eff * r_p_eff), 1e-2)
 
     co_obs = [c for c in obs if c in other_centroids]
     w_cm, r_cm_eff, gam_cm = 0.0, 0.0, 1.0
@@ -305,23 +302,23 @@ def _estimate_conjugate_weights(
         rot_cm, src_m, dst_m = cross_map
         oc_mat = torch.stack([other_centroids[c].to(dtype=torch.float64, device="cpu") for c in co_obs], dim=0)
         mc_mat = torch.stack([centroids_m[c].to(dtype=torch.float64, device="cpu") for c in co_obs], dim=0)
-        gam_cm, mc_bar = _cone_aperture_scale(oc_mat, mc_mat), mc_mat.mean(dim=0)
+        gam_cm = _cone_aperture_scale(oc_mat, mc_mat)
         cos_cm_list: list[float] = []
         for cj in co_obs:
-            tgt_c = _dir(centroids_m[cj].to(dtype=torch.float64, device="cpu") - mc_bar)
-            c_map = _scale_to_norm(dst_m + gam_cm * (rot_cm @ (other_centroids[cj] - src_m)), mean_norm)
+            mu_cj = centroids_m[cj].to(dtype=torch.float64, device="cpu")
             if len(co_obs) >= 3:
                 sub = [c for c in co_obs if c != cj]
                 os_s, ms_s = torch.stack([other_centroids[c] for c in sub], dim=0), torch.stack([centroids_m[c] for c in sub], dim=0)
                 rl, sl, dl = _identity_anchored_procrustes(os_s, ms_s, anchor_weight=max(anchor_weight, 1.0))
-                c_loo = _scale_to_norm(dl + _cone_aperture_scale(os_s, ms_s) * (rl @ (other_centroids[cj] - sl)), mean_norm)
-                cos_cm_list.append(0.5 * float((_dir(c_map - mc_bar) @ tgt_c).item()) + 0.5 * float((_dir(c_loo - mc_bar) @ tgt_c).item()))
+                pred_cm_d = _cone_aperture_scale(os_s, ms_s) * (rl @ (other_centroids[cj].to(dtype=torch.float64, device="cpu") - sl))
+                cos_cm_list.append(float((_dir(pred_cm_d) @ _dir(mu_cj - dl)).item()))
             elif len(co_obs) == 2:
-                cos_cm_list.append(float(((_dir(c_map) @ _dir(centroids_m[cj])).item() - base_cos) / max(1.0 - base_cos, 1e-4)))
+                c_map = _scale_to_norm(dst_m + gam_cm * (rot_cm @ (other_centroids[cj] - src_m)), mean_norm)
+                cos_cm_list.append(float(((_dir(c_map) @ _dir(mu_cj)).item() - base_cos) / max(1.0 - base_cos, 1e-4)))
             else:
                 cos_cm_list.append(0.0)
         r_cm_eff = min(max(sum(cos_cm_list) / float(len(cos_cm_list)), 0.0), 0.995)
-        w_cm = max(r_cm_eff / (1.0 - r_cm_eff * r_cm_eff), 1e-3)
+        w_cm = max(r_cm_eff / (1.0 - r_cm_eff * r_cm_eff), 1e-2)
 
     rp_f, pb_f, mb_f = _identity_anchored_procrustes(p_obs, obs_mat, anchor_weight=max(anchor_weight, 1.0))
     sq_errs: list[float] = []

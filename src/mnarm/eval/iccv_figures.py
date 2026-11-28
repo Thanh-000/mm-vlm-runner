@@ -158,7 +158,7 @@ def _plot_encoder_preservation(backbone: str, anchor_name: str, anchor: dict[str
         ax.axhline(ry0, color="#0072B2", linestyle=":", linewidth=0.9, alpha=0.55)
         ax.annotate("theta_0", (rx0, ry0), xytext=(5, -10), textcoords="offset points", fontsize=8.0, color="#0072B2", fontweight="bold")
     ax.set_xlabel("Zero-Shot Cross-Modal Retrieval I->T R@1 (%)")
-    ax.set_ylabel("Unseen-Prompt OOD Paired Macro-F1 (%)")
+    ax.set_ylabel("Prompt-Paraphrase Transfer Paired Macro-F1 (%)")
     ax.set_title(f"{backbone} ({anchor_name}): Isometric O(d) Frame Re-Anchoring Preservation")
     ax.legend(loc="best", frameon=True)
     return _save_pair(fig, fig_dir / f"fig3_encoder_preservation_pareto_{backbone}")

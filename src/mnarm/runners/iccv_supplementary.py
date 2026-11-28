@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import re
+import shutil
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,7 @@ SWEEP_TRACKS = (
     ("seq_magmax", "ncm", "Seq-MagMax + NCM", "v", "#CC79A7", 1.7),
     ("seq_replay256", "raw", "Seq-Replay256 (Raw)", "P", "#333333", 1.6),
     ("mg_clip", "raw", "MG-CLIP (ICCV'25)", "d", "#D55E00", 1.8),
-    ("pal_rls", "raw", "PAL-RLS (2025)", "p", "#8C564B", 1.8),
+    ("pal_rls", "raw", "PAL-RLS (Analytic, 2025)", "p", "#8C564B", 1.8),
 )
 
 
@@ -50,15 +51,13 @@ def _fmt_ms(m: float, s: float, tex: bool = False) -> str:
     return f"{m:.2f}{sep}{s:.2f}"
 
 
-def _collect_proto_jsons(root: Path) -> dict[tuple[str, str, str], dict[str, Any]]:
+def _collect_proto_jsons(root: Path, prefer_test: bool = True) -> dict[tuple[str, str, str], dict[str, Any]]:
     if not root.is_dir():
         return {}
-    selected: dict[Path, Path] = {}
-    for fn in ("ICCV_PROTOCOL_RESULTS.json", "ICCV_PROTOCOL_TEST_RESULTS.json"):
-        for p in sorted(root.rglob(fn)):
-            selected[p.parent] = p
+    tests_l = sorted(root.rglob("ICCV_PROTOCOL_TEST_RESULTS.json"))
+    files = tests_l if (prefer_test and tests_l) else sorted(root.rglob("ICCV_PROTOCOL_RESULTS.json"))
     out: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for p in selected.values():
+    for p in files:
         d = json.loads(p.read_text(encoding="utf8"))
         c = d["config"]
         out[(str(c.get("dataset", "crisismmd")), str(c["backbone"]), str(c["protocol"]))] = d
@@ -76,25 +75,29 @@ def _cell_val(rec: dict[str, Any], arm: str, reg: str, metric: str = "macro_f1")
 def _summarize_piece1(ms_root: Path, out_dir: Path) -> dict[str, Any]:
     seed_dirs = sorted(p for p in ms_root.glob("*/seed_*") if p.is_dir()) if ms_root.is_dir() else []
     by_seed: dict[int, dict[tuple[str, str, str], dict[str, Any]]] = defaultdict(dict)
+    has_test = any(ms_root.rglob("ICCV_PROTOCOL_TEST_RESULTS.json"))
     for sd in seed_dirs:
         m = re.match(r"seed_(\d+)$", sd.name)
         if m:
-            by_seed[int(m.group(1))].update(_collect_proto_jsons(sd))
+            by_seed[int(m.group(1))].update(_collect_proto_jsons(sd, prefer_test=has_test))
     if not by_seed:
         return {}
     seeds = sorted(by_seed)
+    common_cells = set.intersection(*(set(by_seed[s].keys()) for s in seeds))
+    is_balanced = bool(common_cells)
+    warn = "" if is_balanced else f"> [UNBALANCED PARTIAL CHECKPOINT] Per-seed counts={ {s: len(by_seed[s]) for s in seeds} }; wait for full matrix convergence.\n\n"
     lines = [
-        f"# Piece 1: Multi-Seed & Class-Order Permutation ({len(seeds)} seeds: {', '.join(map(str, seeds))})\n",
-        "| Arm | All P1-P4 Raw | All P1-P4 +NCM | All P1-P4 +cal | **All P1-P4 CSS-CT** | P3/P4 Raw | P3/P4 +NCM | **P3/P4 CSS-CT** |",
+        f"# Piece 1: Multi-Seed & Class-Order Permutation ({len(seeds)} seeds: {', '.join(map(str, seeds))}; balanced={is_balanced}, n_cells={len(common_cells)})\n",
+        warn + "| Arm | All P1-P4 Raw | All P1-P4 +NCM | All P1-P4 +cal | **All P1-P4 CSS-CT** | P3/P4 Raw | P3/P4 +NCM | **P3/P4 CSS-CT** |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     tex_rows: list[str] = []
-    summary_json: dict[str, Any] = {"seeds": seeds, "arms": {}}
+    summary_json: dict[str, Any] = {"seeds": seeds, "balanced": is_balanced, "n_common_cells": len(common_cells), "per_seed_counts": {str(s): len(by_seed[s]) for s in seeds}, "arms": {}}
     for arm in SUPP_ARMS:
         def _agg(protos: tuple[str, ...], reg: str) -> tuple[float, float]:
             per_s = []
             for s in seeds:
-                vs = [_cell_val(r, arm, reg) for (_, _, pr), r in by_seed[s].items() if pr in protos]
+                vs = [_cell_val(r, arm, reg) for k_cell, r in by_seed[s].items() if k_cell[2] in protos and (not is_balanced or k_cell in common_cells)]
                 vs_c = [v for v in vs if v is not None]
                 if vs_c:
                     per_s.append(sum(vs_c) / float(len(vs_c)))
@@ -131,6 +134,7 @@ def _summarize_piece1(ms_root: Path, out_dir: Path) -> dict[str, Any]:
 
 def _collect_seeded_jsons(supp_root: Path) -> dict[tuple[int, str, str, str], dict[str, Any]]:
     seeded: dict[tuple[int, str, str, str], dict[str, Any]] = {}
+    has_test = any(supp_root.rglob("ICCV_PROTOCOL_TEST_RESULTS.json"))
     ms_root = supp_root / "multiseed"
     if ms_root.is_dir():
         for sd in sorted(p for p in ms_root.glob("*/seed_*") if p.is_dir()):
@@ -138,10 +142,10 @@ def _collect_seeded_jsons(supp_root: Path) -> dict[tuple[int, str, str, str], di
             if not m:
                 continue
             s_id = int(m.group(1))
-            for (ds, bb, pr), d in _collect_proto_jsons(sd).items():
+            for (ds, bb, pr), d in _collect_proto_jsons(sd, prefer_test=has_test).items():
                 seeded[(s_id, ds, bb, pr)] = d
     for sub in ("scaling_b32", "scaling_l14", "ood_general"):
-        for (ds, bb, pr), d in _collect_proto_jsons(supp_root / sub).items():
+        for (ds, bb, pr), d in _collect_proto_jsons(supp_root / sub, prefer_test=has_test).items():
             seeded.setdefault((11, ds, bb, pr), d)
     return seeded
 
@@ -162,10 +166,12 @@ def _summarize_piece2(supp_root: Path, out_dir: Path) -> dict[str, Any]:
         lines.append("## 2A. Architecture Diversity & Scaling across Matched Datasets (Paired Macro-F1 %)\n")
         lines.append("| Arm | B/32 Raw / +NCM / **CSS-CT** | B/16 Raw / +NCM / **CSS-CT** | L/14 Raw / +NCM / **CSS-CT** | SigLIP CSS-CT | P3/P4 CSS-CT (B/32 / B/16 / L/14 / Sig) |")
         lines.append("|---|---|---|---|---:|---|")
-        matched_ds = sorted({k[1] for k in l14_rows} | {k[1] for k in b32_rows})
+        active_bbs = [d for d in (b32_rows, b16_rows, l14_rows, sig_rows) if d]
+        common_2a = set.intersection(*({(s, ds, pr) for (s, ds, _, pr) in d} for d in active_bbs)) if active_bbs else set()
+        matched_ds = sorted({ds for (_, ds, _) in common_2a}) if common_2a else sorted(set.intersection(*({k[1] for k in d} for d in active_bbs)) or (set.union(*({k[1] for k in d} for d in active_bbs)) if active_bbs else set()))
         for arm in SUPP_ARMS:
             def _m(src: dict[tuple[int, str, str, str], dict[str, Any]], prs: tuple[str, ...], rg: str) -> float:
-                vs = [_cell_val(r, arm, rg) for (_, ds, _, pr), r in src.items() if ds in matched_ds and pr in prs]
+                vs = [_cell_val(r, arm, rg) for (s, ds, _, pr), r in src.items() if ds in matched_ds and pr in prs and (not common_2a or (s, ds, pr) in common_2a)]
                 vc = [v for v in vs if v is not None]
                 return sum(vc) / float(len(vc)) if vc else float("nan")
             a_r, a_n, a_c, a34 = _m(b32_rows, ("P1", "P2", "P3", "P4"), "raw"), _m(b32_rows, ("P1", "P2", "P3", "P4"), "ncm"), _m(b32_rows, ("P1", "P2", "P3", "P4"), "zero_mnar"), _m(b32_rows, ("P3", "P4"), "zero_mnar")
@@ -233,10 +239,11 @@ def _summarize_piece3(sweep_root: Path, out_dir: Path) -> dict[str, Any]:
     if not sweep_root.is_dir():
         return {}
     by_rate: dict[int, dict[tuple[str, str, str], dict[str, Any]]] = defaultdict(dict)
+    has_test = any(sweep_root.rglob("ICCV_PROTOCOL_TEST_RESULTS.json"))
     for rd in sorted(sweep_root.glob("*/rho_*")):
         m = re.match(r"rho_(\d+)$", rd.name)
         if m:
-            by_rate[int(m.group(1))].update(_collect_proto_jsons(rd))
+            by_rate[int(m.group(1))].update(_collect_proto_jsons(rd, prefer_test=has_test))
     if not by_rate:
         return {}
     rates = sorted(by_rate)
@@ -294,6 +301,12 @@ def _summarize_piece3(sweep_root: Path, out_dir: Path) -> dict[str, Any]:
 def write_supplementary_suite(supp_root: Path) -> Path:
     """Aggregate all 3 supplementary pieces into Markdown, LaTeX, JSON, and sweep figures."""
     supp_root.mkdir(parents=True, exist_ok=True)
+    for bs in ("clip_b16", "siglip_b16"):
+        for pr in ("p3", "p4"):
+            src_d = supp_root / "multiseed" / "dmd" / "seed_11" / f"{bs}_same_bank" / f"{bs}_{pr}"
+            dst_d = supp_root / "mnar_sweep" / "dmd" / "rho_100" / f"{bs}_same_bank" / f"{bs}_{pr}"
+            if src_d.is_dir() and not (dst_d / "ICCV_PROTOCOL_RESULTS.json").is_file():
+                shutil.copytree(src_d, dst_d, dirs_exist_ok=True)
     p1 = _summarize_piece1(supp_root / "multiseed", supp_root)
     p2 = _summarize_piece2(supp_root, supp_root)
     p3 = _summarize_piece3(supp_root / "mnar_sweep", supp_root)

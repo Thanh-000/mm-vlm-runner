@@ -7,7 +7,7 @@ from typing import Any
 import torch
 
 from mnarm.data import PreprocessedTensorStore
-from mnarm.eval import Profiler, eval_retrieval_r1, eval_view_suite, paired_bootstrap_diff
+from mnarm.eval import Profiler, eval_retrieval_r1, eval_view_suite, holm_bonferroni_adjust, paired_bootstrap_diff
 from mnarm.methods import (
     ALL_MERGE_METHODS,
     PALRLSClassifier,
@@ -222,9 +222,9 @@ def evaluate_protocol_splits(
             ("tsvm:zero_mnar_vs_seq_magmax:ncm", boot_map.get("seq_magmax", {}).get("ncm")), ("tsvm:zero_mnar_vs_seq_lmnar:raw", boot_map["seq_lmnar"].get("raw")),
             ("tsvm:zero_mnar_vs_mg_clip:raw", boot_map.get("mg_clip", {}).get("raw")), ("tsvm:zero_mnar_vs_pal_rls:raw", boot_map["pal_rls"].get("raw")),
         ]
-        bootstrap = {lbl: paired_bootstrap_diff(anchor, ref, st["y"], seen, seed=int(cfg["seed"])) for lbl, ref in boot_refs if ref is not None}
+        bootstrap = holm_bonferroni_adjust({lbl: paired_bootstrap_diff(anchor, ref, st["y"], seen, seed=int(cfg["seed"])) for lbl, ref in boot_refs if ref is not None})
         out_by_split[sp_name] = {
-            "schema": "mnarm-iccv-protocol-v2", "split": sp_name, "config": cfg, "arms": st["arms"],
+            "schema": "mnarm-iccv-protocol-v3", "split": sp_name, "config": cfg, "arms": st["arms"],
             "ablation_tsvm": st["ablation"], "bootstrap": bootstrap, "theta0_preservation": dict(pal_rec["encoder_preservation"]), "profiling": st["prof"].records,
         }
     return out_by_split

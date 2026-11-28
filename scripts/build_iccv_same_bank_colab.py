@@ -113,7 +113,7 @@ def build() -> None:
             sys_ram_gb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9) if hasattr(os, "sysconf") else 32.0
             shm_free_gb = (shutil.disk_usage("/dev/shm").free / 1e9) if Path("/dev/shm").exists() else 0.0
             vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-            DATA_ROOT = Path("/dev/shm/mnarm_data") if shm_free_gb >= 12.0 else (WS / "data")
+            DATA_ROOT = Path("/dev/shm/mnarm_data") if shm_free_gb >= 15.0 else (WS / "data")
             IMG_DIR = Path("/dev/shm/crisismmd_v2") if (Path("/dev/shm/crisismmd_v2").is_dir() and any(Path("/dev/shm/crisismmd_v2").rglob("*.jpg"))) else (DATA_ROOT / "crisismmd_v2")
             print(f"[ENV] GPU={torch.cuda.get_device_name(0)} VRAM={vram_gb:.1f}GB RAM={sys_ram_gb:.1f}GB SHM_FREE={shm_free_gb:.1f}GB DATA_ROOT={DATA_ROOT}", flush=True)
             for d in (WS, DATA_ROOT, IMG_DIR):
@@ -178,7 +178,7 @@ def build() -> None:
             WS = Path("/content/mnarm_ws")
             CODE_DIR = WS / "repo"
             shm_free_gb = (shutil.disk_usage("/dev/shm").free / 1e9) if Path("/dev/shm").exists() else 0.0
-            DATA_ROOT = Path("/dev/shm/mnarm_data") if shm_free_gb >= 12.0 else (WS / "data")
+            DATA_ROOT = Path("/dev/shm/mnarm_data") if shm_free_gb >= 15.0 else (WS / "data")
             IMG_DIR = Path("/dev/shm/crisismmd_v2") if (Path("/dev/shm/crisismmd_v2").is_dir() and any(Path("/dev/shm/crisismmd_v2").rglob("*.jpg"))) else (DATA_ROOT / "crisismmd_v2")
             IMG_DIR.mkdir(parents=True, exist_ok=True)
             site.addsitedir(str(CODE_DIR / "src"))
@@ -438,6 +438,8 @@ def build() -> None:
             }
 
             print_lock = threading.Lock()
+            proc_lock = threading.Lock()
+            active_procs = set()
             sel_protos = [p for flag, p in ((RUN_P4, "P4"), (RUN_P3, "P3"), (RUN_P2, "P2"), (RUN_P1, "P1")) if flag]
             if not sel_protos or not DATASET_PATHS:
                 raise RuntimeError("Enable at least one dataset and one protocol.")
@@ -458,6 +460,7 @@ def build() -> None:
                     "--config", str(CODE_DIR / cfg_rel),
                     "--seq-inputs", str(seq_p), "--images", str(img_p),
                     "--out", str(out_path), "--protocols", *p_args,
+                    "--seed", "11", "--split-seed", "11", "--class-order-seed", "11",
                 ]
                 if CONFIRM_FREEZE_TEST:
                     cmd.append("--confirm-freeze")
@@ -468,12 +471,18 @@ def build() -> None:
                 tail = deque(maxlen=80)
                 with log_path.open("w", encoding="utf8") as lf:
                     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=run_env)
-                    assert proc.stdout is not None
-                    for line in proc.stdout:
-                        lf.write(line); tail.append(line.rstrip("\\n"))
-                        with print_lock:
-                            print(f"[{tag}] {line}", end="", flush=True)
-                    rc = proc.wait()
+                    with proc_lock:
+                        active_procs.add(proc)
+                    try:
+                        assert proc.stdout is not None
+                        for line in proc.stdout:
+                            lf.write(line); tail.append(line.rstrip("\\n"))
+                            with print_lock:
+                                print(f"[{tag}] {line}", end="", flush=True)
+                        rc = proc.wait()
+                    finally:
+                        with proc_lock:
+                            active_procs.discard(proc)
                 if rc != 0:
                     tail_msg = "\\n".join(tail)
                     is_oom = any(k in tail_msg for k in ("OutOfMemoryError", "CUDA out of memory", "CUBLAS_STATUS_ALLOC_FAILED", "memory mapping failed with OOM"))
@@ -486,8 +495,11 @@ def build() -> None:
                 tmp_z = target_zip.with_suffix(".tmp.zip")
                 with zipfile.ZipFile(tmp_z, "w", compression=zipfile.ZIP_DEFLATED) as zout:
                     for fp in sorted(OUT_DIR.rglob("*")):
-                        if fp.is_file():
-                            zout.write(fp, fp.relative_to(OUT_DIR).as_posix())
+                        if fp.is_file() and not (fp.name.endswith(".tmp") or fp.name.endswith(".tmp.zip")):
+                            try:
+                                zout.write(fp, fp.relative_to(OUT_DIR).as_posix())
+                            except FileNotFoundError:
+                                continue
                 tmp_z.replace(target_zip)
 
             vram_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
@@ -582,6 +594,16 @@ def build() -> None:
                         _pack_results_zip(CKPT_ZIP)
                         print(f"[CHECKPOINT SAVED] {ds_name} -> {CKPT_ZIP} ({CKPT_ZIP.stat().st_size} bytes)", flush=True)
             finally:
+                with proc_lock:
+                    dangling = list(active_procs)
+                for dp in dangling:
+                    try:
+                        dp.terminate(); dp.wait(timeout=3)
+                    except Exception:
+                        try:
+                            dp.kill()
+                        except Exception:
+                            pass
                 if any(OUT_DIR.rglob("ICCV_PROTOCOL*RESULTS.json")):
                     try:
                         write_ecosystem_master_summary(OUT_DIR)

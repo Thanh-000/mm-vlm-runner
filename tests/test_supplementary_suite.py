@@ -238,6 +238,8 @@ def test_part_a_and_part_b_cell4_dry_run_executes_cleanly(tmp_path: Path) -> Non
         }
         exec(compile(c1, f"{nb_name}:cell_1", "exec"), ns)
         ns["SEEDS"] = seed_over
+        ns["SHARD_SPLIT"] = "1/1"
+        ns["RUN_MNAR_SWEEP"] = exp_sweep
         ns["SAVE_CHECKPOINT_TO_GDRIVE"] = False
         ns["AUTO_DOWNLOAD"] = False
         c4_safe = c4.replace('Path("/content/', f'Path(r"{td_sub.as_posix()}/').replace('Path(f"/content/', f'Path(f"{td_sub.as_posix()}/')
@@ -294,6 +296,8 @@ def test_vram_queue_oom_auto_retry_and_calibrated_vram(tmp_path: Path) -> None:
     }
     exec(compile(c1, "part_b:cell_1", "exec"), ns)
     ns["SEEDS"] = "33"
+    ns["SHARD_SPLIT"] = "1/1"
+    ns["RUN_MNAR_SWEEP"] = False
     ns["SAVE_CHECKPOINT_TO_GDRIVE"] = False
     ns["AUTO_DOWNLOAD"] = False
     c4_safe = c4.replace('Path("/content/', f'Path(r"{td_sub.as_posix()}/').replace('Path(f"/content/', f'Path(f"{td_sub.as_posix()}/')
@@ -301,3 +305,24 @@ def test_vram_queue_oom_auto_retry_and_calibrated_vram(tmp_path: Path) -> None:
         exec(compile(c4_safe, "part_b:cell_4", "exec"), ns)
     assert attempts[("iccv_crisismmd_clip_l14.yaml", "P4")] >= 2
     assert len(ns["tasks"]) == 80
+
+    # Also verify default 3-seed + sweep Part A (1/2) & Part B (2/2) partition all 260 tasks with 0 overlap
+    part_tasks: dict[str, set[str]] = {}
+    for nb_name in ("ICCV_FullMatrix_PartA_ColabWeb.ipynb", "ICCV_FullMatrix_PartB_ColabWeb.ipynb"):
+        nb_p = json.loads((repo_root / "colab" / nb_name).read_text(encoding="utf8"))
+        c1_p, c4_p = "".join(nb_p["cells"][1]["source"]), "".join(nb_p["cells"][4]["source"])
+        td_p = tmp_path / ("sh_" + nb_name.split(".")[0])
+        ns_p = {
+            "WS": td_p / "ws",
+            "CODE_DIR": repo_root,
+            "DATASET_PATHS": {ds: (td_p / ds, td_p / ds) for ds in ("crisismmd", "dmd", "scienceqa_mm8", "disaster_m3", "incidents_vqa")},
+        }
+        exec(compile(c1_p, f"{nb_name}:cell_1", "exec"), ns_p)
+        ns_p["SAVE_CHECKPOINT_TO_GDRIVE"] = False
+        ns_p["AUTO_DOWNLOAD"] = False
+        c4_p_safe = c4_p.replace('Path("/content/', f'Path(r"{td_p.as_posix()}/').replace('Path(f"/content/', f'Path(f"{td_p.as_posix()}/')
+        with patch("torch.cuda.get_device_properties", return_value=fake_prop), patch("torch.cuda.get_device_name", return_value="Mock G4"), patch("subprocess.Popen", side_effect=_FakeOOMOnceProc), patch("IPython.display.display"):
+            exec(compile(c4_p_safe, f"{nb_name}:cell_4", "exec"), ns_p)
+        part_tasks[nb_name] = {t["args"][0] for t in ns_p["tasks"]}
+    ta, tb = part_tasks["ICCV_FullMatrix_PartA_ColabWeb.ipynb"], part_tasks["ICCV_FullMatrix_PartB_ColabWeb.ipynb"]
+    assert len(ta) == 130 and len(tb) == 130 and not (ta & tb) and len(ta | tb) == 260

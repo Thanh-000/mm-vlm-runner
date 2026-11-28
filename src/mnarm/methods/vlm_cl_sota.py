@@ -32,7 +32,7 @@ class PALRLSClassifier:
         self.num_classes = int(num_classes)
         self.lam = float(lam)
         self.auto_lam = bool(auto_lam)
-        self.expand_dim = int(expand_dim) if expand_dim is not None else min(max(4 * self.embed_dim, 64), 2048)
+        self.expand_dim = int(expand_dim) if expand_dim is not None else min(max(6 * self.embed_dim, 64), 4096)
         gen = torch.Generator().manual_seed(int(seed))
         self.w_up = torch.randn(2 * self.embed_dim, self.expand_dim, dtype=torch.float64, generator=gen) / math.sqrt(float(2 * self.embed_dim))
         self.gram = torch.zeros((self.expand_dim, self.expand_dim), dtype=torch.float64)
@@ -223,16 +223,15 @@ def train_mg_clip_stage(
     scaler = torch.amp.GradScaler("cuda", enabled=(amp_on and amp_dtype == torch.float16))
     can_fuse = bool(vlm.device == "cuda" and (not scaler.is_enabled()))
 
-    saved_state = vlm.lora_state()
-    vlm.zero_lora()
-    neg0 = _measure_mean_neg_by_mask(vlm, eval_specs, tensor_store, p_ord, cls_lut, len(cls_ord), amp_dtype, amp_on)
-    vlm.load_lora_state(saved_state)
-
+    p_start = l2_normalize(vlm.encode_prompts_current([orig_prompts[c] for c in cls_ord])) if orig_prompts is not None else p_ord
+    neg0 = _measure_mean_neg_by_mask(vlm, eval_specs, tensor_store, p_start, cls_lut, len(cls_ord), amp_dtype, amp_on)
     opt = _make_adam(vlm.lora_parameters(), lr=float(lr), weight_decay=float(weight_decay), use_fused=can_fuse)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, int(epochs)), eta_min=float(lr) * 0.01)
     rng = random.Random(int(seed) + stage_idx * 23)
     train_specs = list(specs)
-    for _ in range(int(epochs)):
+    best_lora: dict[str, torch.Tensor] | None = None
+    stopped_ep, best_drift = int(epochs), 0.0
+    for ep_i in range(int(epochs)):
         vlm.clip.train()
         rng.shuffle(train_specs)
         for gs in range(0, len(train_specs), accum_steps):
@@ -250,17 +249,15 @@ def train_mg_clip_stage(
                     loss_c = F.cross_entropy(z, y_loc) if (stage_idx == 1 or not old_ord) else _intra_cls_loss(z, y_loc, len(old_ord))
                     loss = loss_c / denom
                 scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
+            scaler.step(opt); scaler.update()
         sched.step()
-    p_fin = l2_normalize(vlm.encode_prompts_current([orig_prompts[c] for c in cls_ord])) if orig_prompts is not None else p_ord
-    neg_ep = _measure_mean_neg_by_mask(vlm, eval_specs, tensor_store, p_fin, cls_lut, len(cls_ord), amp_dtype, amp_on)
-    rel_drift = max((abs(neg_ep[vw] - neg0[vw]) / max(abs(neg0[vw]), 1e-6) for vw in neg_ep), default=0.0)
-    mg_heads["text"].mgp_trace[int(stage_idx)] = {
-        "neg0": {"+".join(vw): round(val, 4) for vw, val in neg0.items()},
-        "rel_drift": round(float(rel_drift), 5),
-        "stopped_epoch": int(epochs),
-    }
+        p_ep = l2_normalize(vlm.encode_prompts_current([orig_prompts[c] for c in cls_ord])) if orig_prompts is not None else p_ord
+        neg_ep = _measure_mean_neg_by_mask(vlm, eval_specs, tensor_store, p_ep, cls_lut, len(cls_ord), amp_dtype, amp_on)
+        rel_drift = max((abs(neg_ep[vw] - neg0[vw]) / max(abs(neg0[vw]), 1e-6) for vw in neg_ep), default=0.0)
+        if ep_i >= 1 and rel_drift > float(gap_alpha) and best_lora is not None:
+            vlm.load_lora_state(best_lora); stopped_ep = ep_i; break
+        best_lora, stopped_ep, best_drift = vlm.lora_state(), ep_i + 1, rel_drift
+    mg_heads["text"].mgp_trace[int(stage_idx)] = {"neg0": {"+".join(vw): round(val, 4) for vw, val in neg0.items()}, "rel_drift": round(float(best_drift), 5), "stopped_epoch": int(stopped_ep)}
 
     vlm.clip.eval()
     trained_state = vlm.lora_state()
@@ -329,14 +326,14 @@ def mg_clip_eval_logits(
     out: dict[str, torch.Tensor] = {}
     for vw in ("text", "image"):
         if vw in cross_scores and vw in active_intra and cross_scores[vw].shape[0] == active_intra[vw].shape[0]:
-            p_c = F.softmax(F.softmax(cross_scores[vw].float(), dim=-1), dim=-1)
+            p_c = F.softmax(cross_scores[vw].float(), dim=-1)
             p_i = F.softmax(active_intra[vw].float(), dim=-1)
             out[vw] = torch.log(((float(a_weight) * p_c + float(b_weight) * p_i) / denom).clamp_min(1e-12))
     if "paired" in cross_scores:
         n_p = int(cross_scores["paired"].shape[0])
         intra_p = [F.softmax(active_intra[tw].float(), dim=-1) for tw in ("text", "image") if tw in active_intra and int(active_intra[tw].shape[0]) == n_p]
         if intra_p:
-            p_cp = F.softmax(F.softmax(cross_scores["paired"].float(), dim=-1), dim=-1)
+            p_cp = F.softmax(cross_scores["paired"].float(), dim=-1)
             p_ip = torch.stack(intra_p, dim=0).mean(dim=0)
             out["paired"] = torch.log(((float(a_weight) * p_cp + float(b_weight) * p_ip) / denom).clamp_min(1e-12))
     return out

@@ -39,6 +39,10 @@ class StreamingClassBank:
                 tot += int(ten.numel())
         return tot
 
+    def memory_bytes(self, bytes_per_float: int = 8) -> int:
+        """Exact byte footprint of stored float64/float32 moments."""
+        return self.memory_floats() * int(bytes_per_float)
+
     def update_stage(
         self,
         *,
@@ -50,6 +54,8 @@ class StreamingClassBank:
         y_i: torch.Tensor | None,
         paired_base_t: torch.Tensor | None = None,
         paired_base_i: torch.Tensor | None = None,
+        protos_0: torch.Tensor | None = None,
+        protos_m: torch.Tensor | None = None,
     ) -> None:
         """Align stage expert features isometrically (O(d)) onto theta_0 and accumulate O(|Y|d + d^2) moments."""
         for tw, ue, ub, y in (
@@ -60,7 +66,9 @@ class StreamingClassBank:
                 continue
             ue64 = l2_normalize(ue).to(dtype=torch.float64, device="cpu")
             ub64 = l2_normalize(ub).to(dtype=torch.float64, device="cpu")
-            q_mat = fit_canonical_reanchor(ub64, ue64, anchor_weight=0.05)["q_mat"].to(dtype=torch.float64, device="cpu")
+            p0 = protos_0 if tw == "text" else None
+            pm = protos_m if tw == "text" else None
+            q_mat = fit_canonical_reanchor(ub64, ue64, protos_0=p0, protos_m=pm, anchor_weight=0.05)["q_mat"].to(dtype=torch.float64, device="cpu")
             aligned = ue64 @ q_mat.T
             y_cpu = y.detach().cpu().long()
 
@@ -72,21 +80,27 @@ class StreamingClassBank:
                 mat = torch.stack(vecs, dim=0)
                 n_new = int(mat.shape[0])
                 mean_new = mat.mean(dim=0)
+                res = mat - mean_new.unsqueeze(0)
+                sc_new = res.T @ res
                 if cls in self.class_centroids[tw]:
                     n_old = self.class_counts[tw][cls]
                     mean_old = self.class_centroids[tw][cls]
-                    self.class_centroids[tw][cls] = (n_old * mean_old + n_new * mean_new) / float(n_old + n_new)
-                    self.class_counts[tw][cls] = n_old + n_new
+                    n_tot = n_old + n_new
+                    delta = mean_new - mean_old
+                    sc_add = sc_new + (float(n_old * n_new) / float(n_tot)) * torch.outer(delta, delta)
+                    dof_add = n_new
+                    self.class_centroids[tw][cls] = (n_old * mean_old + n_new * mean_new) / float(n_tot)
+                    self.class_counts[tw][cls] = n_tot
                 else:
                     self.class_centroids[tw][cls] = mean_new
                     self.class_counts[tw][cls] = n_new
+                    sc_add = sc_new
+                    dof_add = n_new - 1
 
-                if n_new >= 2:
-                    res = mat - mean_new.unsqueeze(0)
-                    sc = res.T @ res
+                if dof_add > 0 or self.within_scatter[tw] is not None:
                     prev_sc = self.within_scatter[tw]
-                    self.within_scatter[tw] = sc if prev_sc is None else (prev_sc + sc)
-                    self.scatter_dof[tw] += n_new - 1
+                    self.within_scatter[tw] = sc_add if prev_sc is None else (prev_sc + sc_add)
+                    self.scatter_dof[tw] += dof_add
                 self.total_samples[tw] += n_new
 
         if paired_base_t is not None and paired_base_i is not None and paired_base_t.shape[0] > 0:

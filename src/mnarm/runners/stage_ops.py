@@ -45,6 +45,7 @@ def train_lora_stage(
     seed: int,
     use_amp: bool,
     tensor_store: PreprocessedTensorStore,
+    graph_records: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     """Train LoRA Q/V adapters with gradient accumulation preserving exact effective-batch steps."""
     if objective not in ("std_ce", "l_mnar"):
@@ -56,7 +57,7 @@ def train_lora_stage(
     else:
         vlm.load_lora_state(init_lora)
 
-    graph_info = analyze_co_observation_graph(records, seen_classes)
+    graph_info = analyze_co_observation_graph(graph_records if graph_records is not None else records, seen_classes)
     eff_bs = max(1, int(effective_batch_size))
     micro_bs = min(eff_bs, max(1, int(micro_batch_size)))
     if eff_bs % micro_bs != 0:

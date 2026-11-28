@@ -1,4 +1,4 @@
-"""Isometric O(d) canonical frame re-anchoring and projection weight folding (zero hubness)."""
+"""Isometric O(d) canonical frame re-anchoring and projection weight folding (norm-preserving)."""
 
 from __future__ import annotations
 

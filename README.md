@@ -4,11 +4,11 @@ Official clean-room research repository for **`CSS-CT` (Canonical Spherical Suff
 
 For full mathematical contracts, see [docs/FRAMEWORK_SPECIFICATION.md](docs/FRAMEWORK_SPECIFICATION.md), [docs/METHOD_FREEZE_ICCV.md](docs/METHOD_FREEZE_ICCV.md), and [docs/AUTHOR_CODE_PARITY_ICCV.md](docs/AUTHOR_CODE_PARITY_ICCV.md).
 
-## Core Architecture (`CSS-CT` v2)
+## Core Architecture (`CSS-CT` v3)
 
-1. **Canonical `O(|Y|d + d^2)` Sufficient Bank (`Pillar 1`):** Aligns each stage adapter isometrically (`O(d)`) onto the frozen pretrained reference frame `theta_0` on `S^{d-1}`, maintaining exact class centroids, pooled scatter, and `O(d^2)` paired cross-moments `(N_TI, s_T, s_I, C_TI)` with **`0` stored exemplars**.
-2. **Single Isometric `O(d)` Frame Re-Anchoring (`Pillar 2`):** Solves one uncentered orthogonal Procrustes map `Q*_{m->0} in O(d)` from unlabeled anchors (`P U U_cal`, `0` labels) to map adapted/merged towers back to `theta_0` with zero hubness collapse, zero extra inference weights (`weight folding`), and full restoration of Open-Vocabulary OOD & `I->T R@1`.
-3. **Conjugate Empirical-Bayes Transport & All-`|Y|` Stat-OOF `tau_m` (`Pillar 3`):** Synthesizes missing `(m, y)` centroids from cone-adjusted prompt and cross-modal moment bridges, applies trace-preserving epistemic covariance shrinkage `alpha_m` on partial towers plus unconditional spherical Mahalanobis norm equalization, and calibrates `tau_m` against all `|Y|` centroids purely from canonical bank statistics (`0` Stage-4 probes, immune to `P4` overconfidence and unimodal `P1/P2` stages).
+1. **Canonical `O(|Y|d + d^2)` Sufficient Bank (`Pillar 1`):** Aligns each stage adapter isometrically (`O(d)`) onto the frozen pretrained reference frame `theta_0` on `S^{d-1}`, maintaining exact Chan-Golub-LeVeque class centroids, pooled scatter, and `O(d^2)` paired cross-moments `(N_TI, s_T, s_I, C_TI)` with **`0` stored exemplars**.
+2. **Single Isometric `O(d)` Frame Re-Anchoring (`Pillar 2`):** Solves one uncentered orthogonal Procrustes map `Q*_{m->0} in O(d)` from unlabeled anchors (`P U U_cal`, `0` labels) to map adapted/merged towers back to `theta_0` with isometric norm preservation (avoiding hubness collapse), zero extra inference weights (`weight folding`), and partial cross-modal `I->T R@1` recovery without retraining.
+3. **Conjugate Empirical-Bayes Transport & All-`|Y|` Stat-OOF `tau_m` (`Pillar 3`):** Synthesizes missing `(m, y)` centroids from unbiased cone-adjusted prompt and cross-modal moment bridges, applies trace-preserving epistemic covariance shrinkage `alpha_m` on partial towers plus unconditional spherical Mahalanobis norm equalization, and calibrates `tau_m` against all `|Y|` centroids purely from canonical bank sufficient statistics.
 4. **Strict `dev`-Only Falsification Hygiene:** `allow_test=false` is enforced across all configs, runners, and Colab bundles prior to final pre-registered confirmatory evaluation.
 
 ## Quickstart (Local Verification)

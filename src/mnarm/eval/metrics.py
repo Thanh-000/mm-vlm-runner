@@ -223,8 +223,8 @@ def paired_bootstrap_diff(
     boot_t = torch.tensor(boot_diffs, dtype=torch.float64).sort().values
     ci_lo = float(torch.quantile(boot_t, 0.025).item())
     ci_hi = float(torch.quantile(boot_t, 0.975).item())
-    p_pos = float((boot_t <= 0.0).float().mean().item())
-    p_neg = float((boot_t >= 0.0).float().mean().item())
+    p_pos = float(((boot_t <= 0.0).sum().item() + 1.0) / float(n_resamples + 1))
+    p_neg = float(((boot_t >= 0.0).sum().item() + 1.0) / float(n_resamples + 1))
     p_two = min(1.0, 2.0 * min(p_pos, p_neg))
     return {
         "delta_macro_f1": float(point_diff),
@@ -233,6 +233,21 @@ def paired_bootstrap_diff(
         "p_value": float(p_two),
         "n_resamples": int(n_resamples),
     }
+
+
+def holm_bonferroni_adjust(boot_map: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
+    """Apply step-down Holm-Bonferroni correction across a family of bootstrap comparisons."""
+    if not boot_map:
+        return boot_map
+    m = len(boot_map)
+    ordered = sorted(boot_map.items(), key=lambda kv: float(kv[1].get("p_value", 1.0)))
+    running_max = 0.0
+    for rank_i, (_, rec) in enumerate(ordered):
+        raw_p = float(rec.get("p_value", 1.0))
+        adj = min(1.0, max(running_max, raw_p * float(m - rank_i)))
+        running_max = adj
+        rec["p_value_holm"] = float(adj)
+    return boot_map
 
 
 def eval_retrieval_r1(feats_t: torch.Tensor, feats_i: torch.Tensor) -> dict[str, float]:

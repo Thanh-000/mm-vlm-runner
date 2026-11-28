@@ -36,6 +36,7 @@ ABLATION_SPECS = (
     ("cm_sfloor", "cross_modal_transport", "spectral_floor", False),
     ("cm_vmf", "cross_modal_transport", "isotropic_vmf", False),
     ("hybrid_vmf", "hybrid_bridge", "isotropic_vmf", False),
+    ("css_no_reanchor", "conjugate_bayes", "marginal_epistemic", False),
     ("css_ct", "conjugate_bayes", "marginal_epistemic", True),
 )
 

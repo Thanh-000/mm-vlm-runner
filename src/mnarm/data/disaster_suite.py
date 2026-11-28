@@ -305,7 +305,7 @@ def load_benchmark_contracts(
     if ds_key == "crisismmd":
         return load_crisismmd_contracts(
             seq_inputs_dir, images_dir, protocol, allow_test=allow_test,
-            seed=int(seed), class_order_seed=class_order_seed, mnar_missing_rate=float(mnar_missing_rate),
+            seed=int(seed), split_seed=split_seed, class_order_seed=class_order_seed, mnar_missing_rate=float(mnar_missing_rate),
         )
     kw_ext = {"split_seed": split_seed, "class_order_seed": class_order_seed, "mnar_missing_rate": float(mnar_missing_rate)}
     if ds_key == "dmd":

@@ -314,13 +314,16 @@ def test_dc_lora_small_n_knots_global_opcm_tower_and_mg_clip_p4_cal() -> None:
     from mnarm.methods.subspace_merging import _knots_merge
 
     torch.manual_seed(29)
-    # 1. DC-LoRA with N=3, r=8 keeps >= 8 active components and preserves avg_norm
+    # 1. Verbatim DC-Merge LoRA (N=3, r=8) without artificial _norm_cap keeps >= 8 active components and rank <= 24
     d3 = [(torch.randn(64, 8) @ torch.randn(8, 64)) * 0.05 for _ in range(3)]
     out_dc = merge_task_deltas([{"vision_model.l0": m} for m in d3], "dc_lora", rank_per_task=8)["vision_model.l0"]
     s_dc = torch.linalg.svdvals(out_dc)
     assert int((s_dc > 1e-4).sum().item()) >= 8
-    avg_n = sum(float(m.norm().item()) for m in d3) / 3.0
-    assert abs(float(out_dc.norm().item()) - avg_n) < 1e-4
+    assert float(s_dc[24:].max().item()) < 1e-5
+    # Verify relative Frobenius scaling across two distinct-norm layers is NOT equalized by artificial _norm_cap
+    d3_scaled = [{"v_big": 3.0 * m, "v_small": m} for m in d3]
+    out_scaled = merge_task_deltas(d3_scaled, "dc_lora", rank_per_task=8)
+    assert float((out_scaled["v_big"] - 3.0 * out_scaled["v_small"]).abs().max().item()) < 1e-4
 
     # 2. KnOTS global cross-layer TIES pruning per active tower
     kd = [

@@ -18,7 +18,7 @@ ARM_REGIME_TAG = {
     "seq_lmnar": "Sequential L_MNAR (0 Replay)",
     "seq_replay256": "Sequential (Buffer<=256)",
     "mg_clip": "VLM-CL SOTA (ICCV'25)",
-    "pal_rls": "Analytic MMCIL (2025)",
+    "pal_rls": "PAL-RLS (Analytic Head, 2025)",
     "joint_oracle": "Offline Joint Oracle",
 }
 
@@ -33,11 +33,11 @@ def render_protocol_report(results: dict[str, Any], out_path: Path) -> None:
     cfg = results["config"]
     ds_name = str(cfg.get("dataset", "crisismmd"))
     split_name = str(results.get("split", "dev"))
-    split_tag = "Confirmatory Test, Frozen CSS-CT v2.2-fair" if split_name == "test" else "dev-Only, Strict Layer Isolation"
+    split_tag = "Confirmatory Test, Frozen CSS-CT v3" if split_name == "test" else "dev-Only, Strict Layer Isolation"
     lines = [
         f"# ICCV Same-Bank Report — {ds_name} {cfg['backbone']} {cfg['protocol']} ({split_tag})\n",
         "- **Regimes:** `raw` · `gr_clip` (NeurIPS'25, 0-label) · `unlab_center` (0-label) · `ncm` / `oas_lda` (0 D_cal fair head) · `zero_mnar` (**CSS-CT Ours: 0 D_cal labels, 0 exemplars**) · `cal_bias` (100% D_cal labels)\n",
-        "| Arm | Track / Privilege | Raw (P) | +GR-CLIP (P) | +unlab (P) | +NCM (P) | +OAS-LDA (P) | +cal (P) | **+CSS-CT (P)** | +CSS-CT 3-View | Early Rec (Raw->CSS) | ECE (CSS) | Unseen OOD (Raw->Re) | I->T R@1 (Raw->Re) | thT/thI |",
+        "| Arm | Track / Privilege | Raw (P) | +GR-CLIP (P) | +unlab (P) | +NCM (P) | +OAS-LDA (P) | +cal (P) | **+CSS-CT (P)** | +CSS-CT 3-View | Early Rec (Raw->CSS) | ECE (CSS) | Prompt-Transfer F1 (Raw->Re) | I->T R@1 (Raw->Re) | thT/thI |",
         "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---|---|---:|",
     ]
     for arm in list(ALL_MERGE_METHODS) + list(SEQ_ORACLE_ARMS):
@@ -72,9 +72,10 @@ def render_protocol_report(results: dict[str, Any], out_path: Path) -> None:
 
     lines.append("\n## Paired Bootstrap Comparisons (1,000 resamples)\n")
     for bkey, brec in results.get("bootstrap", {}).items():
+        p_h = brec.get("p_value_holm", brec["p_value"])
         lines.append(
             f"- `{bkey}`: delta = `{brec['delta_macro_f1']*100:+.2f}` pts, "
-            f"95% CI = `[{brec['ci95_low']*100:+.2f}, {brec['ci95_high']*100:+.2f}]`, p = `{brec['p_value']:.4f}`"
+            f"95% CI = `[{brec['ci95_low']*100:+.2f}, {brec['ci95_high']*100:+.2f}]`, p_raw = `{brec['p_value']:.4f}`, p_holm = `{p_h:.4f}`"
         )
     text = "\n".join(lines) + "\n"
     if "$" in text:

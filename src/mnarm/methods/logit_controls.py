@@ -62,11 +62,13 @@ def gr_clip_logits(
 ) -> dict[str, torch.Tensor]:
     """Compute verbatim GR-CLIP (MixedModalitySearch Alg. 1) 3-mean centered logits on all views."""
     cols = torch.tensor([int(c) for c in seen_classes], dtype=torch.long)
-    q_norm = l2_normalize(protos_full.detach().cpu().float().index_select(0, cols))
+    p_all_n = l2_normalize(protos_full.detach().cpu().float())
+    q_norm = p_all_n.index_select(0, cols)
     ut = l2_normalize(dev_t.detach().cpu().float())
     ui = l2_normalize(dev_i.detach().cpu().float())
     if gap_op.get("active", False):
-        q_gr = l2_normalize(q_norm - q_norm.mean(dim=0, keepdim=True))
+        q_mean = p_all_n.mean(dim=0, keepdim=True) if (len(seen_classes) <= 2 and p_all_n.shape[0] > 2) else q_norm.mean(dim=0, keepdim=True)
+        q_gr = l2_normalize(q_norm - q_mean)
         dt_c = ut - gap_op["doc_text_mean"].detach().cpu().float().unsqueeze(0) if gap_op.get("has_t", False) else ut
         di_c = ui - gap_op["doc_image_mean"].detach().cpu().float().unsqueeze(0) if gap_op.get("has_i", False) else ui
         e_t = l2_normalize(dt_c)

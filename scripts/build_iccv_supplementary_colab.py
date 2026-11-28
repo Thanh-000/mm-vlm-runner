@@ -22,16 +22,16 @@ def _cell(src: str, kind: str = "code", cid: str = "") -> dict:
     return {"id": cid, "cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": clean.splitlines(keepends=True)}
 
 
-def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_sweep: bool, subtitle: str) -> None:
+def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_sweep: bool, default_shard: str, subtitle: str) -> None:
     cells = [
         _cell(
             f"""
             # ICCV Level-3 Full-Matrix Suite — `{part_tag}` ({subtitle})
 
-            Runs a clean, collision-free shard of the complete **`5 Datasets × 4 Backbones × 4 Protocols × 5 Seeds` + `MNAR Sweep`** matrix inside `[VRAM-QUEUE]`:
+            Runs a balanced, collision-free shard of the complete **`5 Datasets × 4 Backbones × 4 Protocols × Seeds` + `MNAR Sweep`** matrix inside `[VRAM-QUEUE]`:
             - **5 Datasets:** `CrisisMMD` (18k), `DMD` (5.8k), `DisasterM3` (2.3k), `IncidentsVQA` (368), and out-of-domain **`ScienceQA-MM8`** (~10.3k, auto-fetched via `aria2c`).
             - **4 Backbones in Parallel:** `CLIP ViT-B/32`, `CLIP ViT-B/16`, `CLIP ViT-L/14` (428M), `SigLIP ViT-B/16`.
-            - **Shard Configuration:** `PART_TAG = {part_tag!r}` | `SEEDS = {default_seeds!r}` | `RUN_MNAR_SWEEP = {default_sweep!r}` (isolated Drive & local checkpoint names so Part A and Part B run simultaneously on 2 Colab tabs with zero conflicts).
+            - **Shard Configuration:** `PART_TAG = {part_tag!r}` | `SEEDS = {default_seeds!r}` | `SHARD_SPLIT = {default_shard!r}` | `RUN_MNAR_SWEEP = {default_sweep!r}` (disjoint compute-balanced groups + unified `mnarm-iccv-protocol-v3` schema so Part A and Part B run simultaneously on 2 Colab tabs within `< 200 CU` and merge cleanly via `merge_supplementary_zips`).
             """,
             kind="markdown",
             cid="supp-cell-0",
@@ -44,6 +44,7 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
             PART_TAG = {part_tag!r}  # @param {{type:"string"}}
             CONFIRM_FREEZE_TEST = True  # @param {{type:"boolean"}}
             SEEDS = {default_seeds!r}  # @param {{type:"string"}}
+            SHARD_SPLIT = {default_shard!r}  # @param {{type:"string"}}
             RUN_CRISISMMD = True  # @param {{type:"boolean"}}
             RUN_DMD = True  # @param {{type:"boolean"}}
             RUN_DISASTER_M3 = True  # @param {{type:"boolean"}}
@@ -79,7 +80,7 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
             CODE_DIR = WS / "repo"
             shm_free_gb = (shutil.disk_usage("/dev/shm").free / 1e9) if Path("/dev/shm").exists() else 0.0
             vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-            DATA_ROOT = Path("/dev/shm/mnarm_data") if shm_free_gb >= 12.0 else (WS / "data")
+            DATA_ROOT = Path("/dev/shm/mnarm_data") if shm_free_gb >= 22.0 else (WS / "data")
             IMG_DIR = Path("/dev/shm/crisismmd_v2") if (Path("/dev/shm/crisismmd_v2").is_dir() and any(Path("/dev/shm/crisismmd_v2").rglob("*.jpg"))) else (DATA_ROOT / "crisismmd_v2")
             for d in (WS, DATA_ROOT, IMG_DIR):
                 d.mkdir(parents=True, exist_ok=True)
@@ -138,7 +139,7 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
             WS = Path("/content/mnarm_ws")
             CODE_DIR = WS / "repo"
             shm_free_gb = (shutil.disk_usage("/dev/shm").free / 1e9) if Path("/dev/shm").exists() else 0.0
-            DATA_ROOT = Path("/dev/shm/mnarm_data") if shm_free_gb >= 12.0 else (WS / "data")
+            DATA_ROOT = Path("/dev/shm/mnarm_data") if shm_free_gb >= 22.0 else (WS / "data")
             IMG_DIR = Path("/dev/shm/crisismmd_v2") if (Path("/dev/shm/crisismmd_v2").is_dir() and any(Path("/dev/shm/crisismmd_v2").rglob("*.jpg"))) else (DATA_ROOT / "crisismmd_v2")
             site.addsitedir(str(CODE_DIR / "src"))
             os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
@@ -319,11 +320,14 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
                 "PYTHONPATH": str(CODE_DIR / "src") + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else ""),
             }
             print_lock = threading.Lock()
+            proc_lock = threading.Lock()
+            active_procs = set()
             from mnarm.runners.iccv_same_bank import _is_v21_valid
             from mnarm.runners.iccv_supplementary import write_supplementary_suite
 
             seeds = [int(x.strip()) for x in str(SEEDS).split(",") if x.strip()]
-            CKPT_ZIP = Path(f"/content/ICCV_SUPP_{part_tag_norm}_CHECKPOINT.zip")
+            CKPT_ZIP = Path(f"/content/ICCV_FULL_MATRIX_{part_tag_norm}_CHECKPOINT.zip")
+            LEGACY_CKPT = Path(f"/content/ICCV_SUPP_{part_tag_norm}_CHECKPOINT.zip")
             DRIVE_CKPT = None
             if SAVE_CHECKPOINT_TO_GDRIVE and colab_drive is not None:
                 colab_drive.mount("/content/drive", force_remount=False)
@@ -336,37 +340,19 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
                     print(f"[RESTORED CHECKPOINT] {tag_label}: {zp}", flush=True)
 
             if RESUME_COMPLETED:
-                for z_cand in (DRIVE_CKPT, CKPT_ZIP):
+                for z_cand in (DRIVE_CKPT, CKPT_ZIP, LEGACY_CKPT):
                     if z_cand is not None:
                         _restore_zip_into(z_cand, SUPP_OUT, part_tag_norm)
-                if 11 in seeds:
-                    for main_z in (Path("/content/ICCV_FINAL_DEV_AND_TEST_RESULTS.zip"), Path("/content/ICCV_FINAL_DEV_AND_TEST_RESULTS (1).zip")):
-                        if main_z.is_file() and zipfile.is_zipfile(main_z):
-                            imported = 0
-                            with zipfile.ZipFile(main_z, "r") as zin:
-                                for nm in zin.namelist():
-                                    if nm.endswith(".json") and ("_same_bank/" in nm):
-                                        parts = nm.split("/")
-                                        if parts[0] in ("clip_same_bank", "siglip_same_bank"):
-                                            ds_m, bb_f, rest_p = "crisismmd", ("clip_b16_same_bank" if parts[0] == "clip_same_bank" else "siglip_b16_same_bank"), "/".join(parts[1:])
-                                        elif len(parts) >= 3 and parts[1] in ("clip_same_bank", "siglip_same_bank"):
-                                            ds_m, bb_f, rest_p = parts[0], ("clip_b16_same_bank" if parts[1] == "clip_same_bank" else "siglip_b16_same_bank"), "/".join(parts[2:])
-                                        else:
-                                            continue
-                                        out_f = SUPP_OUT / "multiseed" / ds_m / "seed_11" / bb_f / rest_p
-                                        if not out_f.is_file():
-                                            out_f.parent.mkdir(parents=True, exist_ok=True)
-                                            out_f.write_bytes(zin.read(nm))
-                                            imported += 1
-                            if imported:
-                                print(f"[IMPORTED SEED-11] Reused {imported} JSONs from {main_z.name}", flush=True)
 
             def _pack_zip(target: Path) -> None:
                 tmp = target.with_suffix(".tmp.zip")
                 with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zout:
                     for fp in sorted(SUPP_OUT.rglob("*")):
-                        if fp.is_file():
-                            zout.write(fp, fp.relative_to(SUPP_OUT).as_posix())
+                        if fp.is_file() and not (fp.name.endswith(".tmp") or fp.name.endswith(".tmp.zip")):
+                            try:
+                                zout.write(fp, fp.relative_to(SUPP_OUT).as_posix())
+                            except FileNotFoundError:
+                                continue
                 tmp.replace(target)
                 if DRIVE_CKPT is not None and target == CKPT_ZIP:
                     dtmp = DRIVE_CKPT.with_suffix(".tmp.zip")
@@ -394,12 +380,18 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
                 tail = deque(maxlen=80)
                 with log_p.open("w", encoding="utf8") as lf:
                     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=run_env)
-                    assert proc.stdout is not None
-                    for ln in proc.stdout:
-                        lf.write(ln); tail.append(ln.rstrip("\\n"))
-                        with print_lock:
-                            print(f"[{tag}] {ln}", end="", flush=True)
-                    rc = proc.wait()
+                    with proc_lock:
+                        active_procs.add(proc)
+                    try:
+                        assert proc.stdout is not None
+                        for ln in proc.stdout:
+                            lf.write(ln); tail.append(ln.rstrip("\\n"))
+                            with print_lock:
+                                print(f"[{tag}] {ln}", end="", flush=True)
+                        rc = proc.wait()
+                    finally:
+                        with proc_lock:
+                            active_procs.discard(proc)
                 if rc != 0:
                     tail_msg = "\\n".join(tail)
                     is_oom = any(k in tail_msg for k in ("OutOfMemoryError", "CUDA out of memory", "CUBLAS_STATUS_ALLOC_FAILED", "memory mapping failed with OOM"))
@@ -452,12 +444,13 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
                 for pr in rem:
                     tasks.append({"group": grp_key, "vram": vram_cost, "retries": 0, "args": (f"{grp_key}:{pr}", cfg_rel, sp, ip, out_sub, [pr], flags, len(protos) > 1)})
 
+            raw_groups = []
             for idx_s, s in enumerate(seeds):
                 for ds in ds_order:
                     sp, ip = DATASET_PATHS[ds]
                     for bb_id, cfg_suf in bb_specs:
                         fl = ["--seed", str(s), "--split-seed", "11", "--class-order-seed", str(s), "--mnar-missing-rate", "1.0"]
-                        _add_group(f"s{s}_{ds}_{bb_id}", f"configs/iccv_{ds}_{cfg_suf}.yaml", sp, ip, f"multiseed/{ds}/seed_{s}/{bb_id}_same_bank", bb_id, ["P4", "P3", "P2", "P1"], fl, vram_tbl[bb_id][ds])
+                        raw_groups.append((f"s{s}_{ds}_{bb_id}", f"configs/iccv_{ds}_{cfg_suf}.yaml", sp, ip, f"multiseed/{ds}/seed_{s}/{bb_id}_same_bank", bb_id, ["P4", "P3", "P2", "P1"], fl, vram_tbl[bb_id][ds]))
                 if idx_s == 0 and RUN_MNAR_SWEEP and "dmd" in DATASET_PATHS:
                     sp_d, ip_d = DATASET_PATHS["dmd"]
                     for r in rates:
@@ -465,9 +458,21 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
                             continue
                         r_tag = f"rho_{int(round(r * 100)):03d}"
                         for sw_bb, sw_suf in (("clip_b16", "clip"), ("siglip_b16", "siglip")):
-                            fl = ["--seed", "11", "--split-seed", "11", "--mnar-missing-rate", f"{r:.4f}"]
-                            _add_group(f"sweep_dmd_{r_tag}_{sw_bb}", f"configs/iccv_dmd_{sw_suf}.yaml", sp_d, ip_d, f"mnar_sweep/dmd/{r_tag}/{sw_bb}_same_bank", sw_bb, ["P4", "P3"], fl, vram_tbl[sw_bb]["dmd"])
+                            fl = ["--seed", "11", "--split-seed", "11", "--class-order-seed", "11", "--mnar-missing-rate", f"{r:.4f}"]
+                            raw_groups.append((f"sweep_dmd_{r_tag}_{sw_bb}", f"configs/iccv_dmd_{sw_suf}.yaml", sp_d, ip_d, f"mnar_sweep/dmd/{r_tag}/{sw_bb}_same_bank", sw_bb, ["P4", "P3"], fl, vram_tbl[sw_bb]["dmd"]))
 
+            sh_str = str(globals().get("SHARD_SPLIT", "1/1")).strip()
+            sh_idx, sh_tot = (int(p) for p in sh_str.split("/", 1)) if "/" in sh_str else (1, 1)
+            if sh_tot > 1:
+                sorted_groups = sorted(raw_groups, key=lambda g: (-len(g[6]), -float(g[8]), g[0]))
+                sel_groups = [g for gi, g in enumerate(sorted_groups) if (gi % sh_tot) == (sh_idx - 1)]
+                print(f"[SHARD {sh_idx}/{sh_tot}] Selected {len(sel_groups)}/{len(raw_groups)} compute-balanced groups", flush=True)
+            else:
+                sel_groups = raw_groups
+            for g_spec in sel_groups:
+                _add_group(*g_spec)
+
+            done_since_ckpt = 0
             if skipped_cnt[0]:
                 print(f"[RESUME] Skipped {skipped_cnt[0]} already-verified protocol jobs.", flush=True)
             try:
@@ -498,20 +503,33 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
                                         pending.appendleft(dt)
                                         continue
                                     raise exc_oom
-                                gk = dt["group"]; grp_rem[gk] -= 1
+                                gk = dt["group"]; grp_rem[gk] -= 1; done_since_ckpt += 1
                                 if grp_rem[gk] == 0:
                                     cfg_rel, sp, ip, out_sub, protos, flags = grp_info[gk]
                                     if len(protos) > 1:
                                         _run_job(f"{gk}:SUMMARY", cfg_rel, sp, ip, out_sub, protos, flags, False)
                                     write_supplementary_suite(SUPP_OUT)
-                                    _pack_zip(CKPT_ZIP)
+                                    _pack_zip(CKPT_ZIP); done_since_ckpt = 0
                                     print(f"[CHECKPOINT SAVED] {gk} -> {CKPT_ZIP} ({CKPT_ZIP.stat().st_size} B)", flush=True)
+                                elif done_since_ckpt >= 4:
+                                    _pack_zip(CKPT_ZIP); done_since_ckpt = 0
+                                    print(f"[PERIODIC CHECKPOINT] -> {CKPT_ZIP} ({CKPT_ZIP.stat().st_size} B)", flush=True)
                 else:
                     for gk, (cfg_rel, sp, ip, out_sub, protos, flags) in grp_info.items():
                         _run_job(gk, cfg_rel, sp, ip, out_sub, protos, flags, False)
                         write_supplementary_suite(SUPP_OUT)
                         _pack_zip(CKPT_ZIP)
             finally:
+                with proc_lock:
+                    dangling = list(active_procs)
+                for dp in dangling:
+                    try:
+                        dp.terminate(); dp.wait(timeout=3)
+                    except Exception:
+                        try:
+                            dp.kill()
+                        except Exception:
+                            pass
                 if any(SUPP_OUT.rglob("ICCV_PROTOCOL*RESULTS.json")):
                     try:
                         write_supplementary_suite(SUPP_OUT)
@@ -566,9 +584,9 @@ def _build_notebook(out_nb: Path, *, part_tag: str, default_seeds: str, default_
 
 
 def build() -> None:
-    _build_notebook(OUT_NB_PART_A, part_tag="PART_A", default_seeds="11,22", default_sweep=True, subtitle="Seeds 11, 22 + MNAR Sweep")
-    _build_notebook(OUT_NB_PART_B, part_tag="PART_B", default_seeds="33,44,55", default_sweep=False, subtitle="Seeds 33, 44, 55")
-    _build_notebook(OUT_NB_ALL, part_tag="ALL", default_seeds="11,22,33,44,55", default_sweep=True, subtitle="Full 5-Seed Single Session")
+    _build_notebook(OUT_NB_PART_A, part_tag="PART_A", default_seeds="11,22,33", default_sweep=True, default_shard="1/2", subtitle="Balanced Shard 1/2: 3 Seeds + Sweep (~72 CU on G4)")
+    _build_notebook(OUT_NB_PART_B, part_tag="PART_B", default_seeds="11,22,33", default_sweep=True, default_shard="2/2", subtitle="Balanced Shard 2/2: 3 Seeds + Sweep (~72 CU on G4)")
+    _build_notebook(OUT_NB_ALL, part_tag="ALL", default_seeds="11,22,33", default_sweep=True, default_shard="1/1", subtitle="Full 3-Seed Single Session")
 
 
 if __name__ == "__main__":

@@ -90,10 +90,12 @@ def _opcm_merge_tower(deltas: list[dict[str, torch.Tensor]], keys: list[str], al
                     cleaned = task_m
                 elif prev_m.ndim == 2:
                     u, s, vh = torch.linalg.svd(prev_m, full_matrices=False)
+                    pos_rank = int((s > 1e-6).sum().item())
                     s_sum = s.sum().clamp_min(1e-12)
                     split_rank = int((s.cumsum(dim=0) / s_sum > float(alpha)).float().argmax().item())
                     proj = u.T @ task_m @ vh.T
-                    proj.diag().fill_(0.0)
+                    if pos_rank > 0:
+                        proj.diagonal()[:pos_rank].fill_(0.0)
                     proj[:split_rank, :split_rank] = 0.0
                     cleaned = u @ proj @ vh
                 else:

@@ -95,6 +95,8 @@ def build_run_lock(
         "schema": "mnarm-run-lock-v1",
         "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "allow_test": bool(config.get("allow_test", False)),
+        "turbo_kernels": os.environ.get("MNARM_TURBO_KERNELS", "0") == "1",
+        "effective_deterministic": bool(config.get("deterministic", True)) and (os.environ.get("MNARM_TURBO_KERNELS", "0") != "1"),
         "git_commit": git_info["git_commit"],
         "git_dirty": git_info["git_dirty"],
         "python_version": sys.version.split()[0],
